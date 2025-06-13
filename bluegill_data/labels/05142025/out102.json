@@ -1,0 +1,76 @@
+{
+  "version": "0.4.8",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "middle of caudal fin",
+      "text": "",
+      "points": [
+        [
+          939.7368421052631,
+          1571.3157894736842
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "mouth tip",
+      "text": "",
+      "points": [
+        [
+          994.6996466431095,
+          1445.2296819787985
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "caudal peduncle",
+      "text": "",
+      "points": [
+        [
+          956.578947368421,
+          1572.1052631578946
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "root of pelvic fin",
+      "text": "",
+      "points": [
+        [
+          1006.3157894736842,
+          1511.3157894736842
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "gill",
+      "text": "",
+      "points": [
+        [
+          981.3157894736842,
+          1490.0
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    }
+  ],
+  "imagePath": "out102.png",
+  "imageData": null,
+  "imageHeight": 1700,
+  "imageWidth": 1200,
+  "text": ""
+}

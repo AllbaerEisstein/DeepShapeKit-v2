@@ -1,0 +1,49 @@
+{
+  "version": "0.4.8",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "mouth tip",
+      "text": "",
+      "points": [
+        [
+          915.5038759689922,
+          1087.596899224806
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "gill",
+      "text": "",
+      "points": [
+        [
+          906.578947368421,
+          1048.9473684210525
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "root of pelvic fin",
+      "text": "",
+      "points": [
+        [
+          946.8421052631578,
+          1048.157894736842
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    }
+  ],
+  "imagePath": "out55.png",
+  "imageData": null,
+  "imageHeight": 1700,
+  "imageWidth": 1200
+}

@@ -1,0 +1,36 @@
+{
+  "version": "0.4.8",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "mouth tip",
+      "text": "",
+      "points": [
+        [
+          876.6773162939297,
+          922.3642172523962
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    },
+    {
+      "label": "root of pelvic fin",
+      "text": "",
+      "points": [
+        [
+          928.1150159744409,
+          932.9073482428115
+        ]
+      ],
+      "group_id": null,
+      "shape_type": "point",
+      "flags": {}
+    }
+  ],
+  "imagePath": "out38.png",
+  "imageData": null,
+  "imageHeight": 1700,
+  "imageWidth": 1200
+}
