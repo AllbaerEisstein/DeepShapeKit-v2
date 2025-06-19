@@ -38,7 +38,7 @@ def inference(model: YOLO, img_path: Path):
     return bboxes, masks
 
 
-def process_and_save(img_path: Path, bboxes, out_dir: Path):
+def process_and_save(img_path: Path, bboxes, out_dir: Path, padding):
     """
     Create an output image the same size as input but black everywhere
     except inside the bounding boxes, where the original content is kept.
@@ -52,8 +52,8 @@ def process_and_save(img_path: Path, bboxes, out_dir: Path):
     # Copy ROIs
     for (x1, y1, x2, y2) in bboxes:
         # Ensure coords within image
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        x1, y1 = max(0, x1-padding), max(0, y1-padding)
+        x2, y2 = min(w, x2+padding), min(h, y2+padding)
         canvas[y1:y2, x1:x2] = img[y1:y2, x1:x2]
 
     # Prepare output path
@@ -69,11 +69,13 @@ def main():
     p.add_argument('--indir', required=True, help="Directory with input images (.jpg, .png)")
     p.add_argument('--outdir', required=True, help="Directory to save output images")
     p.add_argument('--model', default="segment_bluegill.pt", help="Path to your YOLO .pt model")
+    p.add_argument('--padding', type=int, default=0, help="Area around bounding box in pixel that will be visible in the output additionally.")
     args = p.parse_args()
 
     indir = Path(args.indir)
     outdir = Path(args.outdir)
     model_path = args.model
+    padding = args.padding
 
     if not indir.is_dir():
         print(f"Error: {indir} is not a directory.")
@@ -90,7 +92,7 @@ def main():
             bboxes, masks = inference(model, img_path)
 
             # Process and save
-            process_and_save(img_path, bboxes, outdir)
+            process_and_save(img_path, bboxes, outdir, padding)
 
 
 if __name__ == '__main__':
