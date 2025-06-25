@@ -40,7 +40,7 @@ def inference(model: YOLO, img_path: Path):
 import cv2
 import numpy as np
 
-def create_discrete_color_map(kpt_names, cmap=cv2.COLORMAP_TWILIGHT_SHIFTED, RGB=False):
+def create_discrete_color_map(kpt_names, cmap=cv2.COLORMAP_RAINBOW, RGB=False):
     """
     From a pre-defined cv2-colormap and a list of keypoints, assign equally distributed colors from cmap to each keypoint.
     
@@ -76,7 +76,7 @@ def draw_kpts(img_path: Path, kpts, out_dir: Path, kpt_name_2_color, annot_radiu
         for i, (x, y, v) in enumerate(instance):
             if v and (x!=0 and y!=0):
                 kpt_name = kpt_names[i]
-                cv2.circle(img, center=(int(x),int(y)), radius=annot_radius, color=kpt_name_2_color[kpt_name])
+                cv2.circle(img, center=(int(x),int(y)), radius=annot_radius, color=kpt_name_2_color[kpt_name], lineType=-1)
 
     # Prepare output path
     out_path = out_dir / img_path.name
@@ -88,7 +88,10 @@ def draw_kpts(img_path: Path, kpts, out_dir: Path, kpt_name_2_color, annot_radiu
 def main():
     p = argparse.ArgumentParser(
         description="""
-        Annotate images with keypoints using a trained YOLO model. Example usage: python3 keypoints/infer_keypoints.py --indir=../data/bluegill_videos/05142025/4-cam-2/bbx_images/ --outdir=../data/bluegill_videos/05142025/4-cam-2/annotations/ --model=keypoints/bluegill_pose.pt --number=100 --kpts "mouth tip" "gill" "root of pelvic fin" "caudal peduncle" "middle of caudal fin" "root of pelvic fin" """
+        Annotate images with keypoints using a trained YOLO model. 
+        Example usage: 
+        python3 keypoints/infer_keypoints.py --indir=../data/bluegill_videos/05142025/4-cam-2/bbx_images/ --outdir=../data/bluegill_videos/05142025/4-cam-2/annotations/ --model=keypoints/bluegill_pose.pt --number=100 --kpts "mouth tip" "gill" "root of pelvic fin" "caudal peduncle" "middle of caudal fin" "lower tip of caudal fin"
+        """
     )
     p.add_argument('--indir', required=True, help="Directory with input images (.jpg, .png)")
     p.add_argument('--outdir', required=True, help="Directory to save output images")
