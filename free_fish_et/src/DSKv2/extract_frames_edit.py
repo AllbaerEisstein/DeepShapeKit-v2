@@ -17,6 +17,7 @@ import infer_mask_cli_wrapper
 import pathlib
 from pathlib import Path
 
+import pickle
 import subprocess
 
 def extract_from_video(videos, out_dir, out_folder='video_frames'):
@@ -36,6 +37,16 @@ def extract_from_video(videos, out_dir, out_folder='video_frames'):
                 └── files.csv
             └── <video_name_2>/
                 ...
+
+    files.csv:
+        Keeps track of the extracted frames.
+        One row per extracted frame.
+        Columns: 
+            - 'frame' - frame number
+            - 'file_loc' - relative path to the saved file ("{video_name}_{frame_number}.png"
+            - 'category' - field is always set to 'origin'
+            - 'sub_index' - field is always set to 0
+            - 'folder' - video name
     """
 
     if not os.path.exists(out_dir):
@@ -139,6 +150,9 @@ def process_input_folder(data_folder):
 
     📄 Files Created:
         - bottom/frame2video_1.csv: Maps original to new frame (1:1).
+            columns:
+                - 'origin_frame' - one frame number (int) per row
+                - 'new_frame' - each row the same entry as in 'origin_frame'
         - front/frame2video_1.csv: Same as above.
         - bottom/dlc_results/full_size.mp4: Reconstructed video from flipped frames.
         - front/dlc_results/full_size.mp4: Reconstructed video from undistorted frames.
@@ -287,7 +301,7 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
     Augment the dataset as follows:
 
     <dataset_path>/
-    ├── index.json          ← Summary file
+    ├── index.json          # Summary file already created in extract_frames()
     └── <frame_folder>/
         ├── origin/         # unchanged: all raw .png frames
         │   ├── ... N files of size HxWx3 (e.g., 2048x1040 RGB)
@@ -304,7 +318,9 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
         │   └── ... one full-frame mask per detection, size HxW (2048x1040)
         ├── bbox-masked_image/      # images at original size as but black everywhere
         │   │                         except inside the bounding boxes, where the original content is kept.
-        │   └── ... one full-frame bbox per detection, size HxW (2048x1040)
+        |   ├── image_0_1_bbox-masked.png
+        │   └── ... one full-frame bbox-masked image per detection, size HxW
+        ├── files.csv       ← unchanged; already created in extract_frames()
         └── files_crop.csv  # one CSV per folder
 
     files_crop.csv:
@@ -312,13 +328,12 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
         Columns:
             - frame — original frame number
             - file_loc — relative path to the saved file (cropped or mask)
-            - category — 'cropped' or 'mask'
-            - sub_index — detection index 0 or 1
+            - category — 'cropped', 'mask' or 'bbox-masked'
+            - sub_index — detection index (number of the instance detected)
             - folder — the <frame_folder> name
             - bbox — [xmin, ymin, xmax, ymax] from the mask
 
         Example files_crop.csv:
-
             frame,file_loc,category,sub_index,folder,bbox
             0,video1/cropped/image_0_0.png,cropped,0,video1,"[120, 200, 360, 450]"
             0,video1/mask/image_0_0_mask.png,mask,0,video1,"[120, 200, 360, 450]"
@@ -428,7 +443,7 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
             confs = res["confs"]
             return bboxes, masks, confs
 
-    def run_img2bbx(input_path: Path, bboxes, out_dir: Path, padding: int, is_dir=False):
+    def run_img2bbx(input_path: Path, bboxes, out_dir: Path, padding: int, is_dir=False, out_filename=None):
         cmd = [
             "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
             "img2bbx",
@@ -438,6 +453,8 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
             "--pad", str(padding),
             "--isdir", is_dir
         ]
+        if not is_dir:
+            cmd += ["--outfilename", out_filename]
         cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(cp.stdout)
 
@@ -461,40 +478,68 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
         csvwriters[folder] = csvwriter
         
         img_path2prediction = run_infer_mask(Path(dataset_path) / folder / "origin", is_dir=True)
-        # filter out low-confidence bounding-boxes
-        img_path2bbx = {
-            img_path: [
-                bbox
-                for bbox, conf in zip(pred["bboxes"], pred["confs"])
-                if conf >= conf_threshold
-            ]
-            for img_path, pred in img_path2prediction.items()
-        }
-        bbox_masked_csv_log = run_img2bbx(input_path=Path(dataset_path) / folder, bboxes=img_path2bbx, padding=20, out_dir=Path(dataset_path) / folder / "bbox-masked_image", is_dir=True)
-        # track the bbox-masked image files
-        csvwriter.writerows(bbox_masked_csv_log)
 
-        frame_counter = 0
-        for img_path, prediction in img_path2prediction.items():
-            bboxes   = prediction["bboxes"]
-            masks_xy = prediction["masks_xy"]
-            confs    = prediction["confs"]
-            for det_idx, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
-                if conf > conf_threshold:
-                    mask_img = polygon_to_binary_mask(mask_xy, image_size=image_size).
-                    crop_img, crop_mask = crop_and_pad(get_image_tensor(str(img_path), device=device), mask_img, bbox)
-                    # Save outputs
-                    save_crops(dataset_path, folder, frame_counter, det_idx,
-                            crop_img, crop_mask, mask_img)
-                    # Record CSV entries
-                    rel_crop       = f"{folder}/cropped/image_{frame_counter}_{det_idx}.png"
-                    rel_mask       = f"{folder}/mask/image_{frame_counter}_{det_idx}_mask.png"
-                    csvwriter.writerow([frame_counter, rel_crop, 'cropped', det_idx, folder, bbox])
-                    csvwriter.writerow([frame_counter, rel_mask, 'mask', det_idx, folder, bbox])
-                    csvwriter.writerow([frame_counter, rel_mask, 'mask', det_idx, folder, bbox])
-            frame_counter += 1
+        with open(dataset_path / "origin") as files_csv:
+            files_csv_reader = csv.DictReader(files_csv)
+            for img_path, prediction in img_path2prediction.items():
+                # set frame number based on frame number of original file:
+                frame_number = int([
+                    row["frame"] for row in files_csv_reader 
+                    if str(Path(row["file_loc"]).name) == img_path
+                ][0])
+                bboxes   = prediction["bboxes"]
+                masks_xy = prediction["masks_xy"]
+                confs    = prediction["confs"]
+                for det_idx, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
+                    if conf > conf_threshold:
+                        bbox_masked_image_fname = f"image_{frame_number}_{det_idx}_bbox-masked.png"
+                        run_img2bbx(
+                            input_path=Path(dataset_path) / folder / "origin" / img_path, 
+                            bboxes=bbox,
+                            padding=20, 
+                            out_dir=Path(dataset_path) / folder / "bbox-masked_image",
+                            out_filename=bbox_masked_image_fname,
+                            is_dir=False
+                        )
+                        mask_img = polygon_to_binary_mask(mask_xy, image_size=image_size)
+                        crop_img, crop_mask = crop_and_pad(get_image_tensor(str(img_path), device=device), mask_img, bbox)
+                        # Save outputs
+                        save_crops(dataset_path, folder, frame_number, det_idx,
+                                crop_img, crop_mask, mask_img)
+                        # Record CSV entries
+                        rel_crop       = f"{folder}/cropped/image_{frame_number}_{det_idx}.png"
+                        rel_mask       = f"{folder}/mask/image_{frame_number}_{det_idx}_mask.png"
+                        rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
+                        csvwriter.writerow([frame_number, rel_crop, 'cropped', det_idx, folder, bbox])
+                        csvwriter.writerow([frame_number, rel_mask, 'mask', det_idx, folder, bbox])
+                        csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', det_idx, folder, bbox])
 
 
+def detect_keypoints_yolo(dataset_path: str, model_path: str, yolo_env_name: str = "yolo", conf_threshold: float = 0.8):
+    """
+    ├── keypoint_results/
+    └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
+    """
+    def run_infer_kpts(input_path: Path, is_dir=False):
+        cmd = [
+            "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
+            "keypoints",
+            "--model", model_path,
+            "--input", str(input_path),
+            "--isdir", is_dir
+        ]
+        cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(cp.stdout)
+
+    dataset_path = Path(dataset_path)
+    views = [str(subdir) for subdir in dataset_path.listdir() if subdir.is_dir()]
+    for view in views:
+        os.makedirs(dataset_path / view / "keypoints_results", exist_ok=True)
+        img_path2prediction = run_infer_kpts(Path(dataset_path) / view / "bbox-masked_images", is_dir=True)
+        # low-confidence fish detections are already filtered out by mask detection!            
+        with open('keypoints_confs.pickle', 'wb') as handle:
+            # correspondence between keypoints and filename can later be established via files_crop.csv!
+            pickle.dump(img_path2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 def predict(dataset_path, model_path, device, num_classes=2):
     """
@@ -651,6 +696,7 @@ def predict(dataset_path, model_path, device, num_classes=2):
             pbar.update(1)
             k += 1
     print('\n finish')
+
 
 def detect_dlc(data_folder,
                front_config_path='/home/lab/Documents/fish_mesh_eye_public/models/trained_models/master2021demo_front-Ruiheng Wu-2021-06-02/config.yaml',

@@ -6,6 +6,10 @@ from ultralytics import YOLO
 import cv2
 
 
+def load_model(model_path: Path):
+    return YOLO(model_path)
+
+
 def inference(model: YOLO, img_path: Path):
     """
     Run inference on an image and return bounding boxes of the keypoints and keypoints.
@@ -16,7 +20,7 @@ def inference(model: YOLO, img_path: Path):
 
     Returns:
         bboxes (List[Tuple[int,int,int,int]]): List of bounding boxes (x1, y1, x2, y2).
-        kpts (List[List[np.ndarray]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
+        kpts (List[List[List[float, float, float]]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
     """
     # Run prediction
     results = model(str(img_path))
@@ -30,12 +34,13 @@ def inference(model: YOLO, img_path: Path):
             x1, y1, x2, y2 = map(int, box)
             bboxes.append((x1, y1, x2, y2))
 
-        # Extract kpt tuples (num_objects x 1 x 3)
+        # Extract keypoints
         if result.keypoints is not None and result.keypoints.has_visible:
-            for instance in result.keypoints:
-                kpts.append(instance.data.cpu().numpy())
+            keypoints_array = result.keypoints.data.cpu().numpy()  # shape: (num_instances, num_keypoints, 3)
+            for instance_kpts in keypoints_array:
+                kpts.append([[float(x), float(y), float(v)] for x, y, v in instance_kpts])
 
-    return bboxes, kpts[0] if len(kpts) > 0 else None
+    return bboxes, kpts #kpts[0] if len(kpts) > 0 else None
 
 
 def create_discrete_color_map(kpt_names, cmap=cv2.COLORMAP_RAINBOW, RGB=False):
@@ -115,12 +120,13 @@ def main():
     model = YOLO(model_path)
 
     # Iterate over images
-    img_counter = 1
+    img_counter = 0
     for img_path in indir.iterdir():
         if img_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
             img_counter += 1
-            if img_counter > number_of_images:
-                break
+            if number_of_images is not None:
+                if img_counter > number_of_images:
+                    break
             # Inference
             bboxes, kpts = inference(model, img_path)
 
