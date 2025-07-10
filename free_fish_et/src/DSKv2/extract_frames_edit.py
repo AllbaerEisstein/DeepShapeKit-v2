@@ -20,7 +20,7 @@ from pathlib import Path
 import pickle
 import subprocess
 
-def extract_from_video(videos, out_dir, out_folder='video_frames'):
+def extract_from_video(videos, out_dir, out_folder='dataset'):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
@@ -28,7 +28,7 @@ def extract_from_video(videos, out_dir, out_folder='video_frames'):
     
     Creates the following directory structure and contents:
         out_dir/
-        └── video_frames/
+        └── dataset/
             ├── index.json  ← Summary file
             └── <video_name_1>/
                 ├── origin/
@@ -82,8 +82,8 @@ def extract_from_video(videos, out_dir, out_folder='video_frames'):
 
         # cv2 extract frames
         capture = cv2.VideoCapture(video_path)
-        vwidth  = capture.get(cv2.cv.CV_CAP_PROP_FRAME_WIDTH)   # float `width`
-        vheight = capture.get(cv2.cv.CV_CAP_PROP_FRAME_HEIGHT)  # float `height`
+        vwidth  = capture.get(cv2.CAP_PROP_FRAME_WIDTH)   # float `width`
+        vheight = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float `height`
 
         image_count = 0
         frame_number = 0

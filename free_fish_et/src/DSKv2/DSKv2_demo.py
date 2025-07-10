@@ -19,7 +19,7 @@ if __name__ == '__main__':
     videos = ['data/videos/front.mp4',
               'data/videos/bottom.mp4']
 
-    model_path = 'models/trained_models/kn_segmentation_model_2022-01-12_50'
+    segmentation_model_path = 'models/trained_models/segment_bluegill.pt'
     out_path = 'data/input_frames'
     video_folder = 'video_frames'
 
@@ -30,11 +30,18 @@ if __name__ == '__main__':
     print('extracting frames from video...')
     extract_from_video(videos, out_path, video_folder)
 
-    print('processing frames from video...')
-    process_input_folder(input_folder)
+    # print('processing frames from video...')
+    # process_input_folder(input_folder)
 
     print('detecting fish masks...')
-    predict(input_folder, model_path, 'cuda')
+    predict_masks_yolo(
+        dataset_path    = input_folder, 
+        model_path      = segmentation_model_path, 
+        device          = 'cuda', 
+        num_classes     = 2, 
+        yolo_env_name   = "yolo", 
+        conf_threshold  = 0.8
+    )
 
     print('detecting fish keypoints...')
     detect_dlc(input_folder)
