@@ -67,7 +67,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
     def __init__(self, root: str):
         self.root = Path(root)
         # self.views = ['front', 'bottom']
-        self.views = [str(subdir) for subdir in root.listdir() if subdir.is_dir()]
+        self.views = [str(subdir.name) for subdir in self.root.iterdir() if subdir.is_dir()]
 
         # DLC outputs per view
         """
@@ -120,13 +120,13 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
         view_data = {}
         for view in self.views:
-            origin = self.frame_map[view][frame_key]
+            origin_frame_number = self.frame_map[view][frame_key]
             # image path
-            file_loc = self.files[view][origin]['file_loc']
-            img_path = self.root / file_loc
+            file_loc = self.files[view][origin_frame_number]['file_loc']
+            origin_img_path = self.root / file_loc
 
             # mask rows for this frame
-            rows = self.mask_rows[view].get(origin, [])
+            rows = self.mask_rows[view].get(origin_frame_number, [])
             # sort by sub_index to keep instance order
             rows = sorted(rows, key=lambda r: int(r['sub_index']))
 
@@ -139,25 +139,28 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                 masks.append(self._load_full_mask(view, row['file_loc']))
 
             # extract DLC keypoints for each instance
-            kpt_list = self._extract_keypoints(self.keypoints, view, idx, len(bboxes), flip=(view=='bottom'))
+            kpt_list = self._extract_keypoints(view, 
+                                               self.keypoints_confs, 
+                                               idx, 
+                                               len(bboxes), 
+                                               flip=(view=='bottom')
+            )            
 
             view_data[view] = {
-                'img_path': str(img_path),
-                'bboxes': torch.tensor(bboxes, dtype=torch.int64),              # (N,4)
-                'crops': torch.stack([torch.from_numpy(c) for c in crops]),   # (N,Hc,Wc)
-                'masks_full': torch.stack([torch.from_numpy(m) for m in full_masks]),
-                'keypoints': torch.stack(kpt_list)                             # (N,K,3)
+                'img_path':     str(origin_img_path),
+                'bboxes':       torch.tensor(bboxes, dtype=torch.int64),              # (N,4)
+                'crops':        torch.stack([torch.from_numpy(c) for c in crops]),   # (N,Hc,Wc)
+                'masks_full':   torch.stack([torch.from_numpy(m) for m in full_masks]),
+                'keypoints':    torch.stack(kpt_list),                             # (N,K,3)
+                'instances':    len(bboxes)
             }
 
-        sample['imgpaths'] = [view_data[v]['img_path'] for v in self.views]
-        sample['frames']   = [0, 1]
-
-        view2n_instances = {v: data['bboxes'].shape[0] for v, data in view_data.items()}
-        sample['instances'] = view2n_instances
-
+        sample['imgpaths']    = [view_data[v]['img_path'] for v in self.views]
+        sample['frames']      = list(range(len(self.views)))
+        sample['instances']   = max(view_data[v]['instances'] for v in self.views)
         # stack per-view data for use by pipeline
-        # (Do instances need to be stacked?)
-        #sample['instances']   = torch.stack([view2n_instances[v]        for v in self.views])      # (V,N)
+        # view2n_instances = {v: data['bboxes'].shape[0] for v, data in view_data.items()}
+        # sample['instances']   = torch.stack([view2n_instances[v]        for v in self.views])
         sample['bboxes']      = torch.stack([view_data[v]['bboxes']     for v in self.views])      # (V,N,4)
         sample['masks']       = torch.stack([view_data[v]['crops']      for v in self.views])      # (V,N,Hc,Wc)
         sample['masks_full']  = torch.stack([view_data[v]['masks_full'] for v in self.views])      # (V,N,Hf,Wf)
@@ -167,7 +170,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         self.prev_data = sample
         return sample
 
-    def _read_csv_dict(self, view: str, filename: str, key: str, val: str=None) -> dict:
+    def _read_csv_dict(self, view: str, filename: str, key: str, val: str|None = None) -> dict:
         """
         Return a dict that has keys which are the values of a csv in a specific column (key).
         The values of the dict are either the complete row of the csv or an of the row in column 'value'.
@@ -247,7 +250,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             - keypoints_dict['coordinates']: list of length K each shape (M,2)
             - keypoints_dict['confidence']:   list of length K each shape (M,1)
         """
-        filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view, 'bbox_masked', idx, 0]
+        filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view]['bbox_masked'][idx][0]
         coords = keypoints_dict[filename]
         kpt_list = []
         for inst in range(n_instances):
@@ -262,11 +265,11 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             kpt_list.append(torch.tensor(pts, dtype=torch.float32)) # one tensor for reach instance
         return kpt_list
 
-    def get_files_for_frame(self, views: list[str], categories: list[str], idxs: list[int]) -> dict:
+    def get_files_for_frame(self, views: list[str], categories: list[str], idxs: list[int]) -> dict[str, dict[str, dict[int, list[Path]]]]:
         matching_files = {
             view: {
                 category: {
-                    idx: '' for idx in idxs
+                    idx: [] for idx in idxs
                 } for category in categories
             } for view in views
         }
@@ -281,8 +284,10 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                         meta_info = self.mask_rows[view]
                     case 'origin':
                         meta_info = self.files[view]
+                    case _:
+                        break
                 for idx in idxs:
-                    matching_files[view, category, idx] = [ 
+                    matching_files[view][category][idx] = [ 
                         self.root / row['folder'] / row['file_loc'] 
                         for row in meta_info
                         if  row['frame']     == idx

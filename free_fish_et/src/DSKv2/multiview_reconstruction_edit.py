@@ -49,14 +49,10 @@ def process_frame(sample: dict, fish_place: int):
     """
         Just read a dict and return relevant contents.
     """
-    if fish_place == 1:
-        keypoints = sample['keypoints']
-        masks = sample['masks_full']
-        bboxes = sample['bboxes']
-    elif fish_place == 2:
-        keypoints = sample['keypoints2']
-        masks = sample['masks_full2']
-        bboxes = sample['bboxes2']
+    if fish_place <= sample['instances']:
+        keypoints = sample['keypoints'][fish_place]
+        masks = sample['masks_full'][fish_place]
+        bboxes = sample['bboxes'][fish_place]
     else:
         raise ValueError(f'Invalid fish_place: {fish_place}')
 
@@ -152,7 +148,7 @@ def reconstruct(args) -> None:
         result = multiview.fit_mesh(
             fish, optimizer, keypoints, frames, masks,
             renderer, device, *([] if init is None else init),
-            img_paths, idx, bboxes
+            img_filenames=img_paths, index=idx, bboxs=bboxes
         )
         vertex_posed, _, t, body_pose, bone, scale, _ = result
 
