@@ -1,86 +1,82 @@
 import os
 import argparse
-from src.extract_frames import *
-from src.multiview_reconstruction import reconstruct
+from pathlib import Path
+from extract_frames_edit import *
+from multiview_reconstruction_edit import reconstruct
 from src.smooth_eye_detection import detect_eye
 
-def reconstruct_place(place, n_frames, data_folder, out_folder):
-    reconstruct_args.fish_place = place
-    reconstruct_args.datadir = data_folder
-    reconstruct_args.outdir = out_folder
-
-    if not os.path.exists(reconstruct_args.outdir):
-        os.makedirs(reconstruct_args.outdir, exist_ok=True)
-
-    reconstruct_args.index = list(range(n_frames))
-    reconstruct(reconstruct_args)
 
 if __name__ == '__main__':
-    videos = ['data/videos/front.mp4',
-              'data/videos/bottom.mp4']
+    videos = [
+        Path(path) for path in 
+            [
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-1_0s-42s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-2_0s-42s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-4_0s-42s.mp4',
+            ]
+    ]
 
-    segmentation_model_path = 'models/trained_models/segment_bluegill.pt'
-    out_path = 'data/input_frames'
-    video_folder = 'video_frames'
+    segmentation_model_path = Path('segment_bluegill.pt')
+    pose_model_path         = Path('bluegill_pose.pt')
+    out_path                = Path('results')
+    dataset_folder_name     = 'dataset'
+    dataset_folder_path     = out_path / dataset_folder_name
+    final_output_folder     = "results/output/"
 
-    input_folder = os.path.join(out_path, video_folder)
-    out_folder = "data/output/"
 
-    # ====== data processing ======
+    # ====== preprocessing and dataset creation ======
+
     print('extracting frames from video...')
-    extract_from_video(videos, out_path, video_folder)
-
-    # print('processing frames from video...')
-    # process_input_folder(input_folder)
+    extract_from_video(
+        videos, 
+        out_path, 
+        dataset_folder_name, 
+        also_create_frame2video_csv=True
+    )
 
     print('detecting fish masks...')
     predict_masks_yolo(
-        dataset_path    = input_folder, 
+        dataset_path    = dataset_folder_path, 
         model_path      = segmentation_model_path, 
-        device          = 'cuda', 
-        num_classes     = 2, 
-        yolo_env_name   = "yolo", 
+        yolo_env_name   = 'yolo', 
         conf_threshold  = 0.8
     )
 
     print('detecting fish keypoints...')
-    detect_dlc(input_folder)
+    detect_keypoints_yolo(
+        dataset_path    = dataset_folder_path,
+        model_path      = pose_model_path,
+        yolo_env_name   = 'yolo'
+    )
 
-    # ==============================
-
-    print('reconstructing mesh model sequence...')
-    parser2 = argparse.ArgumentParser()
-    reconstruct_args = parser2.parse_args()
-    reconstruct_args.mesh = 'goldfish_design_small.json'
-    reconstruct_args.fish_place = 2
-    reconstruct_args.seed = 700
-    reconstruct_args.save_models = False
-
-    n_frames = 0
-
-    with open(os.path.join(input_folder, 'index.json')) as jf:
+    with open(os.path.join(dataset_folder_path, 'index.json')) as jf:
         video_meta = json.load(jf)
 
-    n_frames = video_meta['image_count']
-
-    reconstruct_place(2, n_frames, input_folder, out_folder)
-    reconstruct_place(1, n_frames, input_folder, out_folder)
-
     # ==============================
 
-    print('detecting eye position...')
 
-    parser = argparse.ArgumentParser()
-    eye_args = parser.parse_args()
+    print('reconstructing mesh model sequence...')
 
-    eye_args.dir = os.path.join(out_folder, 'pose_pickle')
-    eye_args.index_range = f'0-{n_frames}'
-    eye_args.datadir = input_folder
-    eye_args.eye_model = 'models/trained_models/eye_detection_model_2022-06-21'
-    eye_args.fish_place = 2
-    eye_args.epoches = 150
-    eye_args.learning_rate = 1e-3
+    mesh_path       = 'bluegill_mesh.json'
+    instance_number = 0
+    seed            = 700
+    save_models     = True
 
-    detect_eye(eye_args)
+    if not os.path.exists(final_output_folder):
+        os.makedirs(final_output_folder, exist_ok=True)
 
-    print('eye detection done')
+
+    n_frames = video_meta['image_count']
+    index = list(range(n_frames))
+
+    reconstruct(    
+        mesh_path       = mesh_path,
+        dataset_dir     = str(dataset_folder_path),
+        outdir          = final_output_folder,
+        index           = index,
+        instance_number = instance_number,
+        seed            = seed,
+        save_models     = save_models
+    )
+
+    # ==============================

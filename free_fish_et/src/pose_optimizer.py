@@ -9,7 +9,9 @@ class OptimizeMV():
     def __init__(self, lim_weight=1, prior_weight=1, bone_weight=1, mask_weight=1, smooth_weights=None,
                  step_size=1e-2,
                  num_iters=100,
-                 device=torch.device('cpu'), mesh='carp.json'):
+                 device='cpu', mesh='carp.json'):
+
+        device = torch.device(device)
 
         # Store optimization hyperparameters
         if smooth_weights is None:

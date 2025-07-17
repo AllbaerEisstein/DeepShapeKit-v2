@@ -45,16 +45,16 @@ def initialize_model(mesh_file: str, device: str) -> tuple:
     return fish, optimizer, renderer
 
 
-def process_frame(sample: dict, fish_place: int):
+def process_frame(sample: dict, instance_number: int):
     """
         Just read a dict and return relevant contents.
     """
-    if fish_place <= sample['instances']:
-        keypoints = sample['keypoints'][fish_place]
-        masks = sample['masks_full'][fish_place]
-        bboxes = sample['bboxes'][fish_place]
+    if instance_number <= sample['instances']:
+        keypoints = sample['keypoints'][instance_number]
+        masks = sample['masks_full'][instance_number]
+        bboxes = sample['bboxes'][instance_number]
     else:
-        raise ValueError(f'Invalid fish_place: {fish_place}')
+        raise ValueError(f'Invalid fish_place: {instance_number}')
 
     # Normalize mask to [0,1] on appropriate device
     masks = masks.to(device) / 255.
@@ -95,8 +95,16 @@ def save_obj_model(outdir: str, sample_index: int, fish_place: int,
             f.write(f'f {a}//{a} {b}//{b} {c}//{c}\n')
 
 
-def save_pose_pickle(outdir: str, start: int, end: int, fish_place: int,
-                     parameters: list, sample_data: list, mesh_file: str) -> None:
+def save_pose_pickle(
+        outdir: str, 
+        start: int, 
+        end: int, 
+        fish_place: int,
+        parameters: list, 
+        sample_data: list, 
+        mesh_file: str,
+        index: list
+) -> None:
     pickle_dir = os.path.join(outdir, 'pose_pickle')
     ensure_dir(pickle_dir)
     fname = f'pose_result_{start}-{end+1}_({fish_place}).pickle'
@@ -105,28 +113,40 @@ def save_pose_pickle(outdir: str, start: int, end: int, fish_place: int,
     data = {
         'individual_fit_parameters': parameters,
         'sample_data': sample_data,
-        'indices': args.index,
+        'indices': index,
         'model_file': mesh_file
     }
     with open(path, 'wb') as pf:
         pickle.dump(data, pf, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def reconstruct(args) -> None:
-    device = setup_device(args.seed)
+def reconstruct(    
+        mesh_path: str,
+        dataset_dir: str,
+        outdir: str,
+        index: list[int],
+        instance_number: int,
+        seed: int = 1,
+        save_models: bool = False
+) -> None:
+    """
+    Run multiview reconstruction for given frames.
+    """
+    global device 
+    device = setup_device(seed)
     print('Device:', device)
 
-    ensure_dir(args.outdir)
-    fish, optimizer, renderer = initialize_model(args.mesh, device)
-    dataset = load_multiview_dataset(args.datadir)
+    ensure_dir(outdir)
+    fish, optimizer, renderer = initialize_model(mesh_path, device)
+    dataset = load_multiview_dataset(dataset_dir)
 
     parameters = []
     sample_data = []
-    start_idx = args.index[0]
+    start_idx = index[0]
 
-    pbar = tqdm(total=len(args.index), desc=f'video {os.path.basename(args.datadir)}')
+    pbar = tqdm(total=len(index), desc=f'video {os.path.basename(dataset_dir)}')
 
-    for idx in args.index:
+    for idx in index:
         try:
             sample = dataset[idx]
         except IndexError:
@@ -141,7 +161,7 @@ def reconstruct(args) -> None:
             pbar.update(1)
             continue
 
-        frames, img_paths, keypoints, masks, bboxes = process_frame(sample, args.fish_place)
+        frames, img_paths, keypoints, masks, bboxes = process_frame(sample, instance_number)
         # initialize from previous solution if available
         init = None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
 
@@ -156,34 +176,47 @@ def reconstruct(args) -> None:
         sample_data.append([frames, img_paths, keypoints, bboxes, idx])
 
         save_rendered_views(
-            args.outdir, args.fish_place, idx,
+            outdir, instance_number, idx,
             img_paths, vertex_posed, fish, frames, keypoints, bboxes
         )
 
-        if args.save_models:
-            save_obj_model(args.outdir, idx, args.fish_place, vertex_posed, fish)
+        if save_models:
+            save_obj_model(outdir, idx, instance_number, vertex_posed, fish)
 
         pbar.update(1)
 
     pbar.close()
     save_pose_pickle(
-        args.outdir, args.index[0], args.index[-1],
-        args.fish_place, parameters, sample_data, args.mesh
+        outdir      = outdir, 
+        start       = index[0], 
+        end         = index[-1],
+        fish_place  = instance_number, 
+        parameters  = parameters, 
+        sample_data = sample_data, 
+        mesh_file   = mesh_path, 
+        index       = index
     )
+
+
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--index', nargs='+', type=int,
-                        default=list(range(50, 100)))
+    parser.add_argument('--index', nargs='+', type=int, default=list(range(50, 100)))
     parser.add_argument('--mesh', type=str, default='goldfish_design_small.json')
-    parser.add_argument('--outdir', type=str,
-                        default='data/output/GoldFish20171216_BL320/20171216_124610')
-    parser.add_argument('--datadir', type=str,
-                        default='data/input/video_frames_20171215_101550')
+    parser.add_argument('--outdir', type=str, default='data/output/GoldFish20171216_BL320/20171216_124610')
+    parser.add_argument('--datadir', type=str, default='data/input/video_frames_20171215_101550')
     parser.add_argument('--fish_place', type=int, choices=[1,2], default=2)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--save_models', action='store_true')
-
     args = parser.parse_args()
-    reconstruct(args)
+
+    reconstruct(
+        mesh_path=args.mesh,
+        dataset_dir=args.datadir,
+        outdir=args.outdir,
+        index=args.index,
+        instance_number=args.fish_place,
+        seed=args.seed,
+        save_models=args.save_models
+    )

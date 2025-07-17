@@ -20,7 +20,8 @@ from pathlib import Path
 import pickle
 import subprocess
 
-def extract_from_video(videos, out_dir, out_folder='dataset'):
+
+def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
@@ -49,80 +50,85 @@ def extract_from_video(videos, out_dir, out_folder='dataset'):
             - 'folder' - video name
     """
 
-    if not os.path.exists(out_dir):
-        raise Exception('Output dir do not exist')
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        raise Exception('Output dir does not exist')
 
-    dist = os.path.join(out_dir, out_folder)
-    if not os.path.exists(dist):
-        os.mkdir(dist)
+    dist = out_dir / dataset_folder_name
+    dist.mkdir(exist_ok=True)
 
-    json_out_file = open(os.path.join(dist, 'index.json'), "w")
-    json_index = {}
-    json_index['frame_folders'] = []
-    csv_list = {}
+    json_out_path = dist / 'index.json'
+    json_index = {
+        'frame_folders': [],
+        'index_files': {},
+    }
 
     for video_path in videos:
-        if not os.path.exists(video_path):
-            raise Exception('Input video do not exist')
+        if not video_path.exists():
+            raise Exception(f'Input video does not exist: {video_path}')
 
-        print("processing video: {}".format(video_path))
+        print(f"processing video: {video_path}")
 
-        video_name = video_path.split('/')[-1]
-        ext_len = len(video_name.split('.')[-1])
-        save_path = os.path.join(dist, video_name[:-ext_len-1], 'origin')
-        if not os.path.exists(os.path.join(dist, video_name[:-ext_len-1])):
-            os.mkdir(os.path.join(dist, video_name[:-ext_len - 1]))
-        if not os.path.exists(save_path):
-            os.mkdir(save_path)
+        video_name      = video_path.stem
+        video_folder    = dist / video_name
+        origin_folder   = video_folder / 'origin'
+        origin_folder.mkdir(parents=True, exist_ok=True)
 
-        csv_out_file = open(os.path.join(dist, video_name[:-ext_len-1], 'files.csv'), 'w')
-        csvwriter = csv.writer(csv_out_file, delimiter=',',
-                            quotechar='|', quoting=csv.QUOTE_MINIMAL)
-        csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder'])
+        files_csv_path       = video_folder / 'files.csv'
+        with files_csv_path.open('w', newline='') as csv_out_file:
+            csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder'])
 
-        # cv2 extract frames
-        capture = cv2.VideoCapture(video_path)
-        vwidth  = capture.get(cv2.CAP_PROP_FRAME_WIDTH)   # float `width`
-        vheight = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float `height`
+            capture = cv2.VideoCapture(str(video_path))
+            vwidth = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+            vheight = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
-        image_count = 0
-        frame_number = 0
-        success = True
+            image_count = 0
+            frame_number = 0
+            success = True
 
-        while capture.isOpened() and success:
-            success, frame = capture.read()
+            while capture.isOpened() and success:
+                success, frame = capture.read()
+                if success:
+                    filename = f"{video_name}_{frame_number}.png"
+                    abs_file_path = origin_folder / filename
+                    rel_file_path = Path(video_name) / 'origin' / filename
 
-            if success:
-                file_loc = os.path.join(save_path, "{}_{}.png".format(video_name[:-ext_len-1], frame_number))
-                cv2.imwrite(file_loc, frame)
-                image_count += 1
-                csvwriter.writerow([frame_number,
-                                    os.path.join(video_name[:-ext_len-1], "origin/{}_{}.png".format(video_name[:-ext_len-1], frame_number)),
-                                    'origin',
-                                    0,
-                                    video_name[:-ext_len-1]])
+                    cv2.imwrite(str(abs_file_path), frame)
+                    csvwriter.writerow([
+                        frame_number,
+                        str(rel_file_path),
+                        'origin',
+                        0,
+                        video_name
+                    ])
+                    image_count += 1
 
-            frame_number += 1
-            print('frame out: {}, total image: {}'.format(frame_number, image_count), end='\r')
+                frame_number += 1
+                print(f'frame out: {frame_number}, total image: {image_count}', end='\r')
 
-            # if image_count > 5:
-            #     break
+            print(f'total image: {image_count}, done                  ')
 
-        print('total image: {}, done                  '.format(image_count))
+            json_index['frame_folders'].append(video_name)
+            json_index['index_files'][video_name] = str(files_csv_path)
 
-        json_index['frame_folders'].append(video_name[:-ext_len-1])
-        csv_list[video_name[:-ext_len-1]] = os.path.join(dist, video_name[:-ext_len-1], 'files.csv')
+            capture.release()
+    
+        if also_create_frame2video_csv:
+            frame2video_csv_path = video_folder / 'frame2video_1.csv'
+            with frame2video_csv_path.open('w', newline='') as csv_out_file:
+                csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+                csvwriter.writerow(['origin_frame', 'new_frame'])
 
-        csv_out_file.close()
-        capture.release()
+                for i in range(image_count):
+                    csvwriter.writerow([i, i])
 
-    json_index['status']        = 'origin'
-    json_index['index_files']   = csv_list
-    json_index['image_count']   = image_count
-    json_index['image_size']    = [int(vwidth), int(vheight)]
+    json_index['status'] = 'origin'
+    json_index['image_count'] = image_count
+    json_index['image_size'] = [int(vwidth), int(vheight)]
 
-    json.dump(json_index, json_out_file)
-    json_out_file.close()
+    with json_out_path.open("w") as f:
+        json.dump(json_index, f, indent=2)
 
 
 def process_input_folder(data_folder):
@@ -246,12 +252,21 @@ def process_input_folder(data_folder):
     out.release()
 
 
-def get_image_tensor(image_path: str, device: str) -> torch.Tensor:
+def get_image_np_from_path(image_path: str) -> np.ndarray:
     """
-    Load a PIL image, convert to an RGB tensor in [0,1], and move to `device`.
+    Load a PIL image and convert it to a numpy array.
     """
     img = Image.open(image_path).convert("RGB")
-    return T.ToTensor()(img).to(device)
+    return np.array(img.getdata()).reshape(img.size[1], img.size[0], 3)
+    #return T.ToTensor()(img).to(device)
+
+def get_image_np_from_Image(img: Image.Image) -> np.ndarray:
+    """
+    Load a PIL image and convert it to a numpy array.
+    """
+    img = img.convert("RGB")
+    return np.array(img.getdata()).reshape(img.size[1], img.size[0], 3)
+    #return T.ToTensor()(img).to(device)
 
 
 def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0):
@@ -295,7 +310,7 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0):
     return mask_img
 
 
-def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env_name="yolo", conf_threshold=0.8):
+def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo", conf_threshold=0.8):
     """
     Use a pre-trained YOLO11n-seg model (model_path) to infer the segmentation masks of the dataset.
     Augment the dataset as follows:
@@ -390,7 +405,7 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
             return crop_img, crop_mask
 
     def save_crops(
-            dataset_path: str,
+            dataset_path: Path,
             folder: str,
             frame_counter: int,
             det_idx: int,
@@ -404,7 +419,7 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
             - the tight binary mask crop,
             - the full-frame mask.
             """
-            base = os.path.join(dataset_path, folder)
+            base = dataset_path / folder
 
             # 1) crop image
             crop_path = os.path.join(
@@ -419,13 +434,13 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
             Image.fromarray((cropped_mask * 255).astype(np.uint8)).save(mask_path)
 
             # 3) full-frame mask
-            full_mask = (full_mask_np.cpu().numpy() * 255).astype(np.uint8)
+            full_mask = (full_mask_np * 255).astype(np.uint8)
             full_mask_path = os.path.join(
                 base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask.png'
             )
             Image.fromarray(full_mask).save(full_mask_path)
 
-    def run_infer_mask(input_path: Path, is_dir=False):
+    def run_infer_mask(input_path: Path, is_dir=False) -> dict | tuple[list, list, list]:
         cmd = [
             "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
             "inference",
@@ -458,26 +473,26 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
         cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(cp.stdout)
 
+    
     # Read index.json
-    with open(os.path.join(dataset_path, 'index.json')) as jf:
+    with open(dataset_path / 'index.json') as jf:
         idx_json = json.load(jf)
     image_folders   = idx_json['frame_folders']
-    total_frames    = idx_json['image_count']
     image_size      = idx_json['image_size']
 
     csvwriters = {}
     for folder in image_folders:
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
-            if not os.path.exists(os.path.join(dataset_path, folder, new_dir)):
-                os.mkdir(os.path.join(dataset_path, folder, new_dir))
+            if not os.path.exists(dataset_path / folder / new_dir):
+                os.mkdir(dataset_path / folder / new_dir)
 
-        csv_out_file = open(os.path.join(dataset_path, folder, 'files_crop.csv'), 'w')
+        csv_out_file = open(dataset_path / folder / 'files_crop.csv', 'w')
         csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar=' ', quoting=csv.QUOTE_MINIMAL)
         # write the headers
         csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
         csvwriters[folder] = csvwriter
         
-        img_path2prediction = run_infer_mask(Path(dataset_path) / folder / "origin", is_dir=True)
+        img_path2prediction = run_infer_mask(dataset_path / folder / "origin", is_dir=True)
 
         with open(dataset_path / "origin") as files_csv:
             files_csv_reader = csv.DictReader(files_csv)
@@ -501,11 +516,11 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
                             out_filename=bbox_masked_image_fname,
                             is_dir=False
                         )
-                        mask_img = polygon_to_binary_mask(mask_xy, image_size=image_size)
-                        crop_img, crop_mask = crop_and_pad(get_image_tensor(str(img_path), device=device), mask_img, bbox)
+                        mask_img_np = get_image_np_from_Image(polygon_to_binary_mask(mask_xy, image_size=image_size))
+                        crop_img, crop_mask = crop_and_pad(get_image_np_from_path(str(img_path)), mask_img_np, bbox)
                         # Save outputs
                         save_crops(dataset_path, folder, frame_number, det_idx,
-                                crop_img, crop_mask, mask_img)
+                                crop_img, crop_mask, mask_img_np)
                         # Record CSV entries
                         rel_crop       = f"{folder}/cropped/image_{frame_number}_{det_idx}.png"
                         rel_mask       = f"{folder}/mask/image_{frame_number}_{det_idx}_mask.png"
@@ -515,7 +530,7 @@ def predict_masks_yolo(dataset_path, model_path, device, num_classes=2, yolo_env
                         csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', det_idx, folder, bbox])
 
 
-def detect_keypoints_yolo(dataset_path: str, model_path: str, yolo_env_name: str = "yolo", conf_threshold: float = 0.8):
+def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: str = "yolo"):
     """
     ├── keypoint_results/
     └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
@@ -531,13 +546,12 @@ def detect_keypoints_yolo(dataset_path: str, model_path: str, yolo_env_name: str
         cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(cp.stdout)
 
-    dataset_path = Path(dataset_path)
-    views = [str(subdir) for subdir in dataset_path.listdir() if subdir.is_dir()]
+    views = [str(subdir) for subdir in dataset_path.iterdir() if subdir.is_dir()]
     for view in views:
-        os.makedirs(dataset_path / view / "keypoints_results", exist_ok=True)
-        img_path2prediction = run_infer_kpts(Path(dataset_path) / view / "bbox-masked_images", is_dir=True)
+        os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
+        img_path2prediction = run_infer_kpts(dataset_path / view / 'bbox-masked_images', is_dir=True)
         # low-confidence fish detections are already filtered out by mask detection!            
-        with open('keypoints_confs.pickle', 'wb') as handle:
+        with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             # correspondence between keypoints and filename can later be established via files_crop.csv!
             pickle.dump(img_path2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
 

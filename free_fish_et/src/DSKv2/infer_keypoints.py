@@ -59,7 +59,7 @@ def create_discrete_color_map(kpt_names, cmap=cv2.COLORMAP_RAINBOW, RGB=False):
 
     for kpt, val in zip(kpt_names, step_values):
         gray = np.uint8([[val]])  # 1x1 grayscale image
-        color_bgr = cv2.applyColorMap(gray, cmap)[0, 0]
+        color_bgr = cv2.applyColorMap(src=gray, colormap=cmap)[0, 0]
         color_rgb = tuple(int(c) for c in color_bgr[::-1])  # Convert BGR to RGB
         kpt_name_2_color[kpt] = [int(v) for v in color_rgb] if RGB else [int(v) for v in color_bgr]
 

@@ -1,11 +1,8 @@
 {
-	"folders": [
-		{
-			"path": "../../../deepshapekit-v2"
-		},
-		{
-			"path": "../.."
-		}
-	],
-	"settings": {}
+  "folders": [
+    {
+      "path": "../../../../deepshapekit-v2"
+    }
+  ],
+  "settings": {}
 }

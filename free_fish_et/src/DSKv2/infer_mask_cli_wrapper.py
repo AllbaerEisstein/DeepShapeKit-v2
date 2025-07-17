@@ -98,17 +98,17 @@ def run_reference_kpts(model_path: str, input_path: str, is_dir=False):
         for img in Path(input_path).iterdir():
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
                 img_path2result[str(img)] = {}
-                instances = infer_mask.inference(model, img)
-                for instance, (x, y, c) in enumerate(instances):
+                _, kpts = infer_keypoints.inference(model, img)
+                for instance, (x, y, c) in enumerate(kpts):
                     img_path2result[str(img)][str(instance)] = []
-                    img_path2result[str(img)][str(instance)].append() = (x, y, c if (x > 0 and y > 0) else 0) # undetected keypoints indicated by x=y=0
+                    img_path2result[str(img)][str(instance)].append(x, y, c if (x > 0 and y > 0) else 0) # undetected keypoints indicated by x=y=0
         out = img_path2result
     else:
         if Path(input_path).suffix.lower() in [".jpg", ".jpeg", ".png"]:
-            instances = infer_mask.inference(model, Path(input_path))
-            for instance, (x, y, c) in enumerate(instances):
+            _, kpts = infer_keypoints.inference(model, Path(input_path))
+            for instance, (x, y, c) in enumerate(kpts):
                 out[str(instance)] = []
-                out[str(instance)].append() = (x, y, c)
+                out[str(instance)].append(x, y, c)
 
     print(json.dumps(out))
 
