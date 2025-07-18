@@ -114,15 +114,15 @@ dependencies:
   - libopenvino-auto-batch-plugin=2024.2.0=hb045406_1
   - libopenvino-auto-plugin=2024.2.0=hb045406_1
   - libopenvino-hetero-plugin=2024.2.0=h5c03a75_1
-  - libopenvino-intel-cpu-plugin=2024.2.0=h2da1b83_1
-  - libopenvino-intel-gpu-plugin=2024.2.0=h2da1b83_1
-  - libopenvino-intel-npu-plugin=2024.2.0=he02047a_1
+  # - libopenvino-intel-cpu-plugin=2024.2.0=h2da1b83_1
+  # - libopenvino-intel-gpu-plugin=2024.2.0=h2da1b83_1
+  # - libopenvino-intel-npu-plugin=2024.2.0=he02047a_1
   - libopenvino-ir-frontend=2024.2.0=h5c03a75_1
   - libopenvino-onnx-frontend=2024.2.0=h07e8aee_1
   - libopenvino-paddle-frontend=2024.2.0=h07e8aee_1
-  - libopenvino-pytorch-frontend=2024.2.0=he02047a_1
-  - libopenvino-tensorflow-frontend=2024.2.0=h39126c6_1
-  - libopenvino-tensorflow-lite-frontend=2024.2.0=he02047a_1
+  # - libopenvino-pytorch-frontend=2024.2.0=he02047a_1
+  # - libopenvino-tensorflow-frontend=2024.2.0=h39126c6_1
+  # - libopenvino-tensorflow-lite-frontend=2024.2.0=he02047a_1
   - libopus=1.3.1=h7f98852_1
   - libpciaccess=0.18=hd590300_0
   - libpng=1.6.43=h2797004_0
@@ -274,7 +274,7 @@ dependencies:
       - dask==2024.7.1
       - dask-expr==1.1.9
       - dask-image==2024.5.3
-      - deeplabcut==3.0.0rc3
+      # - deeplabcut==3.0.0rc3
       - dlclibrary==0.0.6
       - docker-pycreds==0.4.0
       - docstring-parser==0.16
@@ -322,28 +322,28 @@ dependencies:
       - mpmath==1.3.0
       - msgpack==1.0.8
       - msgpack-numpy==0.4.8
-      - napari==0.4.18
-      - napari-console==0.0.9
-      - napari-deeplabcut==0.2.1.7
-      - napari-plugin-engine==0.2.0
-      - napari-svg==0.2.0
+      # - napari==0.4.18
+      # - napari-console==0.0.9
+      # - napari-deeplabcut==0.2.1.7
+      # - napari-plugin-engine==0.2.0
+      # - napari-svg==0.2.0
       - natsort==8.4.0
       - networkx==3.3
       - npe2==0.7.7
       - numba==0.60.0
       - numpydoc==1.5.0
-      - nvidia-cublas-cu12==12.1.3.1
-      - nvidia-cuda-cupti-cu12==12.1.105
-      - nvidia-cuda-nvrtc-cu12==12.1.105
-      - nvidia-cuda-runtime-cu12==12.1.105
-      - nvidia-cudnn-cu12==9.1.0.70
-      - nvidia-cufft-cu12==11.0.2.54
-      - nvidia-curand-cu12==10.3.2.106
-      - nvidia-cusolver-cu12==11.4.5.107
-      - nvidia-cusparse-cu12==12.1.0.106
-      - nvidia-nccl-cu12==2.20.5
-      - nvidia-nvjitlink-cu12==12.5.82
-      - nvidia-nvtx-cu12==12.1.105
+      # - nvidia-cublas-cu12==12.1.3.1
+      # - nvidia-cuda-cupti-cu12==12.1.105
+      # - nvidia-cuda-nvrtc-cu12==12.1.105
+      # - nvidia-cuda-runtime-cu12==12.1.105
+      # - nvidia-cudnn-cu12==9.1.0.70
+      # - nvidia-cufft-cu12==11.0.2.54
+      # - nvidia-curand-cu12==10.3.2.106
+      # - nvidia-cusolver-cu12==11.4.5.107
+      # - nvidia-cusparse-cu12==12.1.0.106
+      # - nvidia-nccl-cu12==2.20.5
+      # - nvidia-nvjitlink-cu12==12.5.82
+      # - nvidia-nvtx-cu12==12.1.105
       - oauthlib==3.2.2
       - opencv-python==4.10.0.84
       - opencv-python-headless==4.10.0.84
@@ -371,7 +371,7 @@ dependencies:
       - pyside6==6.4.2
       - pyside6-addons==6.4.2
       - pyside6-essentials==6.4.2
-      - pytorch3d==0.7.7
+      # - pytorch3d==0.7.7
       - pytz==2024.1
       - qdarkstyle==3.1
       - requests-oauthlib==2.0.0
@@ -402,23 +402,23 @@ dependencies:
       - superqt==0.6.7
       - sympy==1.13.1
       - tabulate==0.9.0
-      - tensorboard==2.10.1
-      - tensorboard-data-server==0.6.1
-      - tensorboard-plugin-wit==1.8.1
-      - tensorflow==2.10.0
-      - tensorflow-estimator==2.10.0
-      - tensorflow-io-gcs-filesystem==0.37.1
-      - tensorpack==0.11
+      # - tensorboard==2.10.1
+      # - tensorboard-data-server==0.6.1
+      # - tensorboard-plugin-wit==1.8.1
+      # - tensorflow==2.10.0
+      # - tensorflow-estimator==2.10.0
+      # - tensorflow-io-gcs-filesystem==0.37.1
+      # - tensorpack==0.11
       - termcolor==2.4.0
-      - tf-slim==1.1.0
+      # - tf-slim==1.1.0
       - threadpoolctl==3.5.0
       - tifffile==2024.7.24
       - timm==1.0.8
       - tomli==2.0.1
       - tomli-w==1.0.0
       - toolz==0.12.1
-      - torch==2.4.0
-      - torchvision==0.19.0
+      # - torch==2.4.0
+      # - torchvision==0.19.0
       - tqdm==4.66.4
       - triton==3.0.0
       - typer==0.12.3
