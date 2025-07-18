@@ -1,27 +1,25 @@
 import os
 import argparse
 from pathlib import Path
-from extract_frames_edit import *
-from multiview_reconstruction_edit import reconstruct
-from src.smooth_eye_detection import detect_eye
-
+from src.extract_frames_edit import *
+from src.multiview_reconstruction_edit import reconstruct
 
 if __name__ == '__main__':
     videos = [
         Path(path) for path in 
             [
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-1_0s-42s.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-2_0s-42s.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-4_0s-42s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-1_0s-3s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-2_0s-3s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-4_0s-3s.mp4',
             ]
     ]
 
-    segmentation_model_path = Path('segment_bluegill.pt')
-    pose_model_path         = Path('bluegill_pose.pt')
-    out_path                = Path('results')
+    segmentation_model_path = Path('src/DSKv2/segment_bluegill.pt')
+    pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
+    out_path                = Path('src/results')
     dataset_folder_name     = 'dataset'
     dataset_folder_path     = out_path / dataset_folder_name
-    final_output_folder     = "results/output/"
+    final_output_folder     = 'src/results/output/'
 
 
     # ====== preprocessing and dataset creation ======

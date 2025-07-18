@@ -4,21 +4,14 @@ import json
 import os
 import numpy as np
 import torch
-import deeplabcut
-
-from src.dataloaders import UniLabDataset
-from PIL import Image, ImageDraw
 from tqdm import trange
-
-import torchvision.transforms as T
-import torch.nn.functional as F
-import models.MaskRCNN as MRCNN
-import infer_mask_cli_wrapper
-import pathlib
-from pathlib import Path
-
 import pickle
 import subprocess
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+#import infer_mask_cli_wrapper
 
 
 def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
@@ -50,7 +43,6 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
             - 'folder' - video name
     """
 
-    out_dir = Path(out_dir)
     if not out_dir.exists():
         raise Exception('Output dir does not exist')
 
@@ -442,13 +434,14 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo
 
     def run_infer_mask(input_path: Path, is_dir=False) -> dict | tuple[list, list, list]:
         cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
+            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
             "inference",
-            "--model", model_path,
+            "--model", str(model_path),
             "--input", str(input_path),
-            "--isdir", is_dir
+            "--isdir", str(is_dir)
         ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        cp = subprocess.run(cmd, capture_output=True, text=True)#, check=True)
+        print(cp.returncode, cp.stderr)
         res = json.loads(cp.stdout)
         if is_dir:
             return res
@@ -460,17 +453,18 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo
 
     def run_img2bbx(input_path: Path, bboxes, out_dir: Path, padding: int, is_dir=False, out_filename=None):
         cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
+            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
             "img2bbx",
             "--input", str(input_path),
             "--bboxes", json.dumps(bboxes),
             "--outdir", str(out_dir),
             "--pad", str(padding),
-            "--isdir", is_dir
+            "--isdir", str(is_dir)
         ]
         if not is_dir:
             cmd += ["--outfilename", out_filename]
         cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(cp.returncode, cp.stderr)
         return json.loads(cp.stdout)
 
     
@@ -537,13 +531,14 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: s
     """
     def run_infer_kpts(input_path: Path, is_dir=False):
         cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", infer_mask_cli_wrapper,
+            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
             "keypoints",
-            "--model", model_path,
+            "--model", str(model_path),
             "--input", str(input_path),
-            "--isdir", is_dir
+            "--isdir", str(is_dir)
         ]
         cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(cp.returncode, cp.stderr)
         return json.loads(cp.stdout)
 
     views = [str(subdir) for subdir in dataset_path.iterdir() if subdir.is_dir()]
@@ -554,174 +549,3 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: s
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             # correspondence between keypoints and filename can later be established via files_crop.csv!
             pickle.dump(img_path2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-def predict(dataset_path, model_path, device, num_classes=2):
-    """
-    <dataset_path>/
-    └── <frame_folder>/
-        ├── origin/         ← extracted frames
-        ├── cropped/        ← to be created here
-        ├── mask/           ← to be created here
-        ├── mask_full/      ← to be created here
-        └── files_crop.csv  ← newly created CSV
-
-    """
-    def get_transform(train):
-        transforms = []
-        transforms.append(T.ToTensor())
-        if train:
-            transforms.append(T.RandomHorizontalFlip(0.5))
-        return T.Compose(transforms)
-
-    def collate_fn(batch):
-        return tuple(zip(*batch))
-
-    # get the model using our helper function
-    model = MRCNN.get_model_instance_segmentation(num_classes)
-
-    # move model to the right device
-    model.to(device)
-    model.load_state_dict(torch.load(model_path))
-
-    dataset = UniLabDataset(dataset_path, get_transform(train=False))
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False, num_workers=0,
-        collate_fn=collate_fn)
-
-    # create csv index files in each video folder
-    jf = open(os.path.join(dataset_path, 'index.json'))
-    index_json = json.load(jf)
-    image_folders = index_json['frame_folders']
-
-    csvwriters = {}
-    for folder in image_folders:
-        if not os.path.exists(os.path.join(dataset_path, folder, 'cropped')):
-            os.mkdir(os.path.join(dataset_path, folder, 'cropped'))
-
-        if not os.path.exists(os.path.join(dataset_path, folder, 'mask')):
-            os.mkdir(os.path.join(dataset_path, folder, 'mask'))
-
-        if not os.path.exists(os.path.join(dataset_path, folder, 'mask_full')):
-            os.mkdir(os.path.join(dataset_path, folder, 'mask_full'))
-
-        csv_out_file = open(os.path.join(dataset_path, folder, 'files_crop.csv'), 'w')
-        csvwriter = csv.writer(csv_out_file, delimiter=',',
-                               quotechar=' ', quoting=csv.QUOTE_MINIMAL)
-        csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
-
-        csvwriters[folder] = csvwriter
-
-    target_frames = list(range(index_json['image_count']))
-
-    model.eval()
-    with torch.no_grad():
-        k = 0
-        pbar = trange(len(target_frames), desc="detect from frames")
-        for image, label in data_loader_test:
-            # only use non-overlap frames
-            label = label[0]
-            if int(label['frame']) not in target_frames:
-                continue
-
-            pbar.set_description('detecting frame {}'.format(label['frame']))
-            images = torch.from_numpy(np.array(Image.open(image[0]).convert("RGB"))) #image[0]
-            csvwriter = csvwriters[label['folder']]
-
-            crop_image = images.permute(1,0,2)
-
-            images = [images.to(device).permute(2, 0, 1) / 255.]
-            predictions = model(images)
-
-            for i in range(predictions[0]['boxes'].size()[0]):
-                # only 2 fishes in the scene
-                if i > 1:
-                    break
-                mask = predictions[0]['masks'][i, 0].cpu().numpy()
-
-                pos = np.where(mask)
-                xmin = np.min(pos[1])
-                xmax = np.max(pos[1])
-                ymin = np.min(pos[0])
-                ymax = np.max(pos[0])
-                bounding_box = [xmin, ymin, xmax, ymax]
-
-                cropped = crop_image[int(bounding_box[0]):int(bounding_box[2]),
-                          int(bounding_box[1]):int(bounding_box[3])]
-
-                crop_mask = predictions[0]['masks'][i, 0].mul(255).permute(1, 0)
-                cropped_mask = crop_mask[int(bounding_box[0]):int(bounding_box[2]),
-                               int(bounding_box[1]):int(bounding_box[3])]
-
-                diff = abs(bounding_box[2] - bounding_box[0] - (bounding_box[3] - bounding_box[1]))
-
-                output = cropped.permute(2,0,1)
-                out_mask = cropped_mask
-
-                if bounding_box[2] - bounding_box[0] < bounding_box[3] - bounding_box[1]:
-                    # padding height
-                    output = F.pad(input=output,
-                                   pad=(0, 0, int(diff / 2.0),
-                                        int(diff / 2.0)),
-                                   mode='constant', value=0)
-                    out_mask = F.pad(input=cropped_mask,
-                                     pad=(0, 0, int(diff / 2.0),
-                                          int(diff / 2.0)),
-                                     mode='constant', value=0)
-
-                if bounding_box[2] - bounding_box[0] > bounding_box[3] - bounding_box[1]:
-                    # padding height
-                    output = F.pad(input=output,
-                                   pad=(int(diff / 2.0),
-                                        int(diff / 2.0), 0, 0),
-                                   mode='constant', value=0)
-                    out_mask = F.pad(input=cropped_mask,
-                                     pad=(int(diff / 2.0),
-                                          int(diff / 2.0), 0, 0),
-                                     mode='constant', value=0)
-
-                crop_out_dir = os.path.join(dataset_path, label['folder'], 'cropped')
-                mask_out_dir = os.path.join(dataset_path, label['folder'], 'mask')
-                mask_full_dir = os.path.join(dataset_path, label['folder'], 'mask_full')
-
-                output = Image.fromarray(output.permute(2, 1, 0).cpu().byte().numpy())
-                output.save(os.path.join(crop_out_dir, 'image_{}_{}.png'.format(k, i)))
-                predicted_mask = Image.fromarray(out_mask.permute(1, 0).byte().cpu().numpy())
-                predicted_mask.save(os.path.join(mask_out_dir, 'image_{}_{}_mask.png'.format(k, i)))
-                full_mask = Image.fromarray(predictions[0]['masks'][i, 0].mul(255).byte().cpu().numpy())
-                full_mask.save(os.path.join(mask_full_dir, 'image_{}_{}_mask.png'.format(k, i)))
-
-                crop_out_dir = os.path.join(crop_out_dir, 'image_{}_{}.png'.format(k, i))
-                mask_out_dir = os.path.join(mask_out_dir, 'image_{}_{}_mask.png'.format(k, i))
-
-                csvwriter.writerow([label['frame'],
-                                    '/'.join(crop_out_dir.split('/')[-3:]),
-                                    'cropped',
-                                    str(i),
-                                    label['folder'],
-                                    str(bounding_box)])
-
-                csvwriter.writerow([label['frame'],
-                                    '/'.join(mask_out_dir.split('/')[-3:]),
-                                    'mask',
-                                    str(i),
-                                    label['folder'],
-                                    str(bounding_box)])
-
-            pbar.update(1)
-            k += 1
-    print('\n finish')
-
-
-def detect_dlc(data_folder,
-               front_config_path='/home/lab/Documents/fish_mesh_eye_public/models/trained_models/master2021demo_front-Ruiheng Wu-2021-06-02/config.yaml',
-               bottom_config_path='/home/lab/Documents/fish_mesh_eye_public/models/trained_models/master2021demo_bottom-Ruiheng Wu-2021-06-01/config.yaml'):
-
-    deeplabcut.analyze_videos(front_config_path,
-                              [os.path.join(data_folder, 'front', 'dlc_results', 'full_size.mp4')],
-                              videotype='.mp4',
-                              engine=deeplabcut.core.engine.Engine.TF)
-
-    deeplabcut.analyze_videos(bottom_config_path,
-                              [os.path.join(data_folder, 'bottom', 'dlc_results', 'full_size.mp4')],
-                              videotype='.mp4',
-                              engine=deeplabcut.core.engine.Engine.TF)

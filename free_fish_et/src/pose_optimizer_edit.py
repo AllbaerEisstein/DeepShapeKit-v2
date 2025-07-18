@@ -1,6 +1,6 @@
 import torch
 from src import fish_model
-from src.losses import (
+from losses import (
     camera_fitting_loss,
     body_fitting_loss,
     mask_fitting_loss

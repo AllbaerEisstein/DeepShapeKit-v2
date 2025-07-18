@@ -1,13 +1,15 @@
-import os
 import pickle
+import os
 import argparse
 import numpy as np
-import torch
-from tqdm import tqdm
 import matplotlib.pyplot as plt
+import torch
+
 
 import src.multiview as multiview
 import src.multiview_utils as mutil
+
+from tqdm import tqdm
 from src.fish_model import fish_model
 from src.pose_optimizer import OptimizeMV
 from src.Silhouette_Renderer import Silhouette_Renderer
