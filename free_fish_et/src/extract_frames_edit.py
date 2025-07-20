@@ -80,7 +80,6 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
                 success, frame = capture.read()
                 if success:
                     vheight, vwidth = frame.shape[:2]
-                    print(f"height: {vheight}, width: {vwidth}")
                     filename = f"{video_name}_{frame_number}.png"
                     abs_file_path = origin_folder / filename
                     rel_file_path = Path(video_name) / 'origin' / filename
@@ -517,7 +516,7 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: s
         out = {}
         if is_dir:
             img_path2result = {}
-            for img in Path(input_path).iterdir():
+            for img in input_path.iterdir():
                 if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
                     img_path2result[str(img)] = {}
                     _, kpts = infer_keypoints.inference(model, img)
@@ -536,10 +535,10 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: s
 
     model = infer_mask.load_model(model_path)
 
-    views = [str(subdir) for subdir in dataset_path.iterdir() if subdir.is_dir()]
+    views = [str(subdir.name) for subdir in dataset_path.iterdir() if subdir.is_dir()]
     for view in views:
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        img_path2prediction = run_infer_kpts(model, dataset_path / view / 'bbox-masked_images', is_dir=True)
+        img_path2prediction = run_infer_kpts(model, dataset_path / view / 'bbox-masked_image', is_dir=True)
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             # correspondence between keypoints and filename can later be established via files_crop.csv!

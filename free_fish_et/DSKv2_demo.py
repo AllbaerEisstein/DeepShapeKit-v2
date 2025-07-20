@@ -13,9 +13,9 @@ if __name__ == '__main__':
     videos = [
         Path(path) for path in 
             [
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-1_0s-3s_rotcc90.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-2_0s-3s_rotc90.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/05142025_4-cam-4_0s-3s.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/left.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/bottom.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/top_right.mp4',
             ]
     ]
 
@@ -60,8 +60,6 @@ if __name__ == '__main__':
     # ==============================
 
 
-    print('reconstructing mesh model sequence...')
-
     mesh_path       = 'bluegill_mesh.json'
     instance_number = 0
     seed            = 700
@@ -75,6 +73,7 @@ if __name__ == '__main__':
     index = list(range(n_frames))
 
     if 'reconstruct' in steps:
+        print('reconstructing mesh model sequence...')
         reconstruct(    
             mesh_path       = mesh_path,
             dataset_dir     = str(dataset_folder_path),
