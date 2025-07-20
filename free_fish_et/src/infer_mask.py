@@ -10,7 +10,7 @@ def load_model(model_path: Path):
     return YOLO(model_path)
 
 
-def inference(model: YOLO, image_path: Path):
+def inference(model: YOLO, image_path: Path) -> tuple[list, list, list]:
     """
     Run inference on an image and return masks and bounding boxes.
 
@@ -19,32 +19,34 @@ def inference(model: YOLO, image_path: Path):
         img_path (Path): Path to the input image.
 
     Returns:
-        bboxes (List[List[int,int,int,int]]): List of bounding boxes (x1, y1, x2, y2).
-        masks (List[List[float,float]]): List of mask polygons (points x 2) per object.
-        confs (List[float]): Confidence for each detection.
+        bboxes (list[list[int,int,int,int]]): list of one bounding box (x1, y1, x2, y2) per instance.
+
+        masks (list[list[list[float,float]]]): list of mask polygons (list of points) per instance.
+
+        confs (list[float]): Confidence for each detection.
     """
     # Run prediction
-    results = model(str(image_path))
+    results = model(str(image_path), verbose=False)
 
     bboxes = []
     masks_xy = []
     confs = []
 
     for result in results:
-        # Extract bounding boxes (xyxy format) and convert to ints
-        for box in result.boxes.xyxy.cpu().numpy():
-            x1, y1, x2, y2 = map(int, box)
-            bboxes.append((x1, y1, x2, y2))
-
-        # Extract mask matrices (num_objects x H x W)
         if result.masks is not None:
-            for mask in result.masks.xy.cpu().numpy():
-                masks_xy.append(mask.tolist())
-        
-        for conf in result.boxes.conf:
-            confs.append(float(conf))
+            for instance in result.boxes.xyxy.cpu().numpy():
+                x1, y1, x2, y2 = map(int, instance)
+                bboxes.append(list((x1, y1, x2, y2)))
 
-    return [list(box) for box in bboxes], masks_xy, confs
+            for instance in result.masks.xy:
+                masks_xy.append(instance.tolist())
+            
+            for instance in result.boxes.conf:
+                confs.append(float(instance))
+        else:
+            return [[]], [[[]]], [0.0] # None detection to be filtered out by confidence
+
+    return bboxes, masks_xy, confs
         
 
 
@@ -59,19 +61,11 @@ def img2bbx(img_path: Path, bbox, out_dir: Path, padding, out_filename: None | s
     # Black canvas
     canvas = np.zeros((h, w, 3), dtype=img.dtype)
 
-    # Copy ROIs
-    if type(bbox) == list:
-        for (x1, y1, x2, y2) in bbox:
-            # Ensure coords within image
-            x1, y1 = max(0, x1-padding), max(0, y1-padding)
-            x2, y2 = min(w, x2+padding), min(h, y2+padding)
-            canvas[y1:y2, x1:x2] = img[y1:y2, x1:x2]
-    else:
-        (x1, y1, x2, y2) = bbox
-        # Ensure coords within image
-        x1, y1 = max(0, x1-padding), max(0, y1-padding)
-        x2, y2 = min(w, x2+padding), min(h, y2+padding)
-        canvas[y1:y2, x1:x2] = img[y1:y2, x1:x2]
+    (x1, y1, x2, y2) = bbox
+    # Ensure coords within image
+    x1, y1 = max(0, x1-padding), max(0, y1-padding)
+    x2, y2 = min(w, x2+padding), min(h, y2+padding)
+    canvas[y1:y2, x1:x2] = img[y1:y2, x1:x2]
 
     # Prepare output path
     if out_filename is None:

@@ -3,15 +3,14 @@ import csv
 import json
 import os
 import numpy as np
-import torch
 from tqdm import trange
+from tqdm import tqdm
 import pickle
-import subprocess
-import sys
 from pathlib import Path
-
 from PIL import Image, ImageDraw
-#import infer_mask_cli_wrapper
+
+import src.infer_mask as infer_mask
+import src.infer_keypoints as infer_keypoints
 
 
 def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
@@ -72,8 +71,6 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
             csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder'])
 
             capture = cv2.VideoCapture(str(video_path))
-            vwidth = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
-            vheight = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
             image_count = 0
             frame_number = 0
@@ -82,6 +79,8 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
             while capture.isOpened() and success:
                 success, frame = capture.read()
                 if success:
+                    vheight, vwidth = frame.shape[:2]
+                    print(f"height: {vheight}, width: {vwidth}")
                     filename = f"{video_name}_{frame_number}.png"
                     abs_file_path = origin_folder / filename
                     rel_file_path = Path(video_name) / 'origin' / filename
@@ -250,18 +249,16 @@ def get_image_np_from_path(image_path: str) -> np.ndarray:
     """
     img = Image.open(image_path).convert("RGB")
     return np.array(img.getdata()).reshape(img.size[1], img.size[0], 3)
-    #return T.ToTensor()(img).to(device)
 
 def get_image_np_from_Image(img: Image.Image) -> np.ndarray:
     """
     Load a PIL image and convert it to a numpy array.
     """
-    img = img.convert("RGB")
-    return np.array(img.getdata()).reshape(img.size[1], img.size[0], 3)
-    #return T.ToTensor()(img).to(device)
+    #img = img.convert("RGB")
+    return np.array(img.getdata(0)).reshape(img.size[1], img.size[0])
 
 
-def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0):
+def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) -> np.ndarray:
     """
     Create a binary (mask) PIL Image from a polygon.
 
@@ -296,13 +293,14 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0):
     mask_img = Image.new(mode, image_size, background)
     draw = ImageDraw.Draw(mask_img)
 
+    #print(coords)
+    print(image_size)
     # Draw filled polygon
     draw.polygon(coords, outline=fill, fill=fill)
+    return np.array(mask_img, dtype=np.uint8)
 
-    return mask_img
 
-
-def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo", conf_threshold=0.8):
+def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8):
     """
     Use a pre-trained YOLO11n-seg model (model_path) to infer the segmentation masks of the dataset.
     Augment the dataset as follows:
@@ -432,40 +430,20 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo
             )
             Image.fromarray(full_mask).save(full_mask_path)
 
-    def run_infer_mask(input_path: Path, is_dir=False) -> dict | tuple[list, list, list]:
-        cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
-            "inference",
-            "--model", str(model_path),
-            "--input", str(input_path),
-            "--isdir", str(is_dir)
-        ]
-        cp = subprocess.run(cmd, capture_output=True, text=True)#, check=True)
-        print(cp.returncode, cp.stderr)
-        res = json.loads(cp.stdout)
-        if is_dir:
-            return res
-        else:
-            bboxes = res["bboxes"]
-            masks = res["masks_xy"]
-            confs = res["confs"]
-            return bboxes, masks, confs
-
-    def run_img2bbx(input_path: Path, bboxes, out_dir: Path, padding: int, is_dir=False, out_filename=None):
-        cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
-            "img2bbx",
-            "--input", str(input_path),
-            "--bboxes", json.dumps(bboxes),
-            "--outdir", str(out_dir),
-            "--pad", str(padding),
-            "--isdir", str(is_dir)
-        ]
-        if not is_dir:
-            cmd += ["--outfilename", out_filename]
-        cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(cp.returncode, cp.stderr)
-        return json.loads(cp.stdout)
+    def run_infer_mask(model, input_path: Path) -> dict[str, dict[str, list]]:
+        img_path2result = {}
+        for img in Path(input_path).iterdir():
+            if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                img_path2result[str(img)] = {
+                    "bboxes": [],
+                    "masks_xy": [],
+                    "confs": []
+                }
+                bboxes, masks_xy, confs = infer_mask.inference(model, img)
+                img_path2result[str(img)]["bboxes"]   = bboxes
+                img_path2result[str(img)]["masks_xy"] = masks_xy
+                img_path2result[str(img)]["confs"]    = confs
+        return img_path2result
 
     
     # Read index.json
@@ -474,8 +452,11 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo
     image_folders   = idx_json['frame_folders']
     image_size      = idx_json['image_size']
 
+    model = infer_mask.load_model(Path(model_path))
+
     csvwriters = {}
     for folder in image_folders:
+        print(f"processing frames for video {folder}...")
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
             if not os.path.exists(dataset_path / folder / new_dir):
                 os.mkdir(dataset_path / folder / new_dir)
@@ -485,43 +466,46 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, yolo_env_name="yolo
         # write the headers
         csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
         csvwriters[folder] = csvwriter
-        
-        img_path2prediction = run_infer_mask(dataset_path / folder / "origin", is_dir=True)
 
-        with open(dataset_path / "origin") as files_csv:
-            files_csv_reader = csv.DictReader(files_csv)
-            for img_path, prediction in img_path2prediction.items():
-                # set frame number based on frame number of original file:
-                frame_number = int([
-                    row["frame"] for row in files_csv_reader 
-                    if str(Path(row["file_loc"]).name) == img_path
-                ][0])
-                bboxes   = prediction["bboxes"]
-                masks_xy = prediction["masks_xy"]
-                confs    = prediction["confs"]
-                for det_idx, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
-                    if conf > conf_threshold:
-                        bbox_masked_image_fname = f"image_{frame_number}_{det_idx}_bbox-masked.png"
-                        run_img2bbx(
-                            input_path=Path(dataset_path) / folder / "origin" / img_path, 
-                            bboxes=bbox,
-                            padding=20, 
-                            out_dir=Path(dataset_path) / folder / "bbox-masked_image",
-                            out_filename=bbox_masked_image_fname,
-                            is_dir=False
-                        )
-                        mask_img_np = get_image_np_from_Image(polygon_to_binary_mask(mask_xy, image_size=image_size))
-                        crop_img, crop_mask = crop_and_pad(get_image_np_from_path(str(img_path)), mask_img_np, bbox)
-                        # Save outputs
-                        save_crops(dataset_path, folder, frame_number, det_idx,
-                                crop_img, crop_mask, mask_img_np)
-                        # Record CSV entries
-                        rel_crop       = f"{folder}/cropped/image_{frame_number}_{det_idx}.png"
-                        rel_mask       = f"{folder}/mask/image_{frame_number}_{det_idx}_mask.png"
-                        rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
-                        csvwriter.writerow([frame_number, rel_crop, 'cropped', det_idx, folder, bbox])
-                        csvwriter.writerow([frame_number, rel_mask, 'mask', det_idx, folder, bbox])
-                        csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', det_idx, folder, bbox])
+        img_path2prediction: dict[str, dict[str, list]] = run_infer_mask(model=model, input_path=dataset_path / folder / "origin")
+
+        files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
+
+        for img_path, prediction in tqdm(img_path2prediction.items()):
+            img_name = str(Path(img_path).name)
+            for row in files_csv_rows:
+                if str(Path(row["file_loc"]).name) == img_name:
+                    frame_number = row["frame"]
+                    break
+
+            bboxes:   list[list[int]]         = prediction["bboxes"]
+            masks_xy: list[list[list[float]]] = prediction["masks_xy"]
+            confs:    list[float]             = prediction["confs"]
+            #           |   └──> entry per instance
+            #           └──> list of instances 
+            for instance_number, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
+                print(f"processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
+                if conf > conf_threshold:
+                    bbox_masked_image_fname = f"image_{frame_number}_{instance_number}_bbox-masked.png"
+                    infer_mask.img2bbx(
+                        img_path     = dataset_path / folder / "origin" / img_name, 
+                        bbox         = bbox,
+                        padding      = 20, 
+                        out_dir      = dataset_path / folder / "bbox-masked_image",
+                        out_filename = bbox_masked_image_fname
+                    )
+                    mask_img_np = polygon_to_binary_mask(mask_xy, image_size=image_size)
+                    crop_img, crop_mask = crop_and_pad(get_image_np_from_path(str(img_path)), mask_img_np, bbox)
+                    # Save outputs
+                    save_crops(dataset_path, folder, frame_number, instance_number,
+                            crop_img, crop_mask, mask_img_np)
+                    # Record CSV entries
+                    rel_crop       = f"{folder}/cropped/image_{frame_number}_{instance_number}.png"
+                    rel_mask       = f"{folder}/mask/image_{frame_number}_{instance_number}_mask.png"
+                    rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
+                    csvwriter.writerow([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
+                    csvwriter.writerow([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
+                    csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
 
 
 def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: str = "yolo"):
@@ -529,22 +513,33 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: s
     ├── keypoint_results/
     └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
     """
-    def run_infer_kpts(input_path: Path, is_dir=False):
-        cmd = [
-            "conda", "run", "-n", yolo_env_name, "python", "infer_mask_cli_wrapper.py",
-            "keypoints",
-            "--model", str(model_path),
-            "--input", str(input_path),
-            "--isdir", str(is_dir)
-        ]
-        cp = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(cp.returncode, cp.stderr)
-        return json.loads(cp.stdout)
+    def run_infer_kpts(model, input_path: Path, is_dir=False):
+        out = {}
+        if is_dir:
+            img_path2result = {}
+            for img in Path(input_path).iterdir():
+                if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                    img_path2result[str(img)] = {}
+                    _, kpts = infer_keypoints.inference(model, img)
+                    for instance, (x, y, c) in enumerate(kpts):
+                        img_path2result[str(img)][str(instance)] = []
+                        img_path2result[str(img)][str(instance)].append(x, y, c if (x > 0 and y > 0) else 0) # undetected keypoints indicated by x=y=0
+            out = img_path2result
+        else:
+            if Path(input_path).suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                _, kpts = infer_keypoints.inference(model, Path(input_path))
+                for instance, (x, y, c) in enumerate(kpts):
+                    out[str(instance)] = []
+                    out[str(instance)].append(x, y, c)
+
+        return out
+
+    model = infer_mask.load_model(model_path)
 
     views = [str(subdir) for subdir in dataset_path.iterdir() if subdir.is_dir()]
     for view in views:
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        img_path2prediction = run_infer_kpts(dataset_path / view / 'bbox-masked_images', is_dir=True)
+        img_path2prediction = run_infer_kpts(model, dataset_path / view / 'bbox-masked_images', is_dir=True)
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             # correspondence between keypoints and filename can later be established via files_crop.csv!
