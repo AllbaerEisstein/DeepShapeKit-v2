@@ -471,11 +471,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
         files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
 
         for img_path, prediction in tqdm(img_path2prediction.items()):
-            img_name = str(Path(img_path).name)
-            for row in files_csv_rows:
-                if str(Path(row["file_loc"]).name) == img_name:
-                    frame_number = row["frame"]
-                    break
+            frame_number = get_frame_number(img_path=Path(img_path), files_csv_rows=files_csv_rows)
 
             bboxes:   list[list[int]]         = prediction["bboxes"]
             masks_xy: list[list[list[float]]] = prediction["masks_xy"]
@@ -506,39 +502,55 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
                     csvwriter.writerow([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
                     csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
 
+def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
+    img_name = str(Path(img_path).name)
+    for row in files_csv_rows:
+        if str(Path(row["file_loc"]).name) == img_name:
+            return int(row["frame"])
+    return -1
 
-def detect_keypoints_yolo(dataset_path: Path, model_path: Path, yolo_env_name: str = "yolo"):
-    """
-    ├── keypoint_results/
-    └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
-    """
-    def run_infer_kpts(model, input_path: Path, is_dir=False):
-        out = {}
-        if is_dir:
-            img_path2result = {}
-            for img in input_path.iterdir():
-                if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                    img_path2result[str(img)] = {}
-                    _, kpts = infer_keypoints.inference(model, img)
-                    for instance, (x, y, c) in enumerate(kpts):
-                        img_path2result[str(img)][str(instance)] = []
-                        img_path2result[str(img)][str(instance)].append(x, y, c if (x > 0 and y > 0) else 0) # undetected keypoints indicated by x=y=0
-            out = img_path2result
-        else:
-            if Path(input_path).suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                _, kpts = infer_keypoints.inference(model, Path(input_path))
-                for instance, (x, y, c) in enumerate(kpts):
-                    out[str(instance)] = []
-                    out[str(instance)].append(x, y, c)
 
-        return out
+def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict):
+    """
+    └── keypoint_results/
+        └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
+    """
 
     model = infer_mask.load_model(model_path)
 
-    views = [str(subdir.name) for subdir in dataset_path.iterdir() if subdir.is_dir()]
+    with open(dataset_path / 'index.json', 'r') as jf:
+        index_json = json.load(jf)
+
+    views = index_json["frame_folders"]
+
     for view in views:
+        print(f"processing frames for video {view}...")
+        files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / "files_crop.csv")))
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        img_path2prediction = run_infer_kpts(model, dataset_path / view / 'bbox-masked_image', is_dir=True)
+        img_path2prediction: dict[
+            str, dict[
+            # └──> bbox-masked_image filename
+                str, dict[
+            #    └──> instance number 
+                    str, tuple[float, float, float]
+            #        └──> keypoint name
+                ]
+            ]
+        ] = {}
+        input_path = dataset_path / view / 'bbox-masked_image'
+
+        for img in input_path.iterdir():
+            frame_number = get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows)
+            if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                img_path2prediction[str(img)] = {}
+                _, instances = infer_keypoints.inference(model, img)
+                for instance_number, kpts in enumerate(instances):
+                    print(f"processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
+                    img_path2prediction[str(img)][str(instance_number)] = {}
+                    for index, (x, y, c) in enumerate(kpts):
+                        print(f"keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
+                        img_path2prediction[str(img)][str(instance_number)][kpt_names_dict[index]] = (x, y, (c if (x > 0 or y > 0) else 0)) # undetected keypoints indicated by x=y=0
+
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             # correspondence between keypoints and filename can later be established via files_crop.csv!

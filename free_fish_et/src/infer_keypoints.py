@@ -19,28 +19,28 @@ def inference(model: YOLO, img_path: Path):
         img_path (Path): Path to the input image.
 
     Returns:
-        bboxes (List[Tuple[int,int,int,int]]): List of bounding boxes (x1, y1, x2, y2).
-        kpts (List[List[List[float, float, float]]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
-    """
-    # Run prediction
-    results = model(str(img_path))
+        bboxes (list[tuple[int,int,int,int]]): List of bounding boxes (x1, y1, x2, y2).
 
-    bboxes = []
-    kpts = []
+        kpts (list[list[tuple[float,float,float]]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
+    """
+    results = model(str(img_path), verbose=False)
+
+    bboxes: list[tuple[int,int,int,int]]           = []
+    kpts:   list[list[tuple[float, float, float]]] = [[]]
 
     for result in results:
-        # Extract bounding boxes (xyxy format) and convert to ints
-        for box in result.boxes.xyxy.cpu().numpy():
-            x1, y1, x2, y2 = map(int, box)
-            bboxes.append((x1, y1, x2, y2))
-
-        # Extract keypoints
         if result.keypoints is not None and result.keypoints.has_visible:
-            keypoints_array = result.keypoints.data.cpu().numpy()  # shape: (num_instances, num_keypoints, 3)
-            for instance_kpts in keypoints_array:
-                kpts.append([[float(x), float(y), float(v)] for x, y, v in instance_kpts])
+            for instance in result.boxes.xyxy.cpu().numpy():
+                x1, y1, x2, y2 = map(int, instance)
+                bboxes.append((x1, y1, x2, y2))
 
-    return bboxes, kpts #kpts[0] if len(kpts) > 0 else None
+            for instance_kpts in result.keypoints.data.cpu().numpy(): # shape: (num_instances, num_keypoints, 3)
+                kpts.append([(float(x), float(y), float(v)) for x, y, v in instance_kpts])
+            
+        else:
+            return [], [[(0, 0, 0)]] # None detection to be filtered out by confidence
+    
+    return bboxes, kpts
 
 
 def create_discrete_color_map(kpt_names, cmap=cv2.COLORMAP_RAINBOW, RGB=False):

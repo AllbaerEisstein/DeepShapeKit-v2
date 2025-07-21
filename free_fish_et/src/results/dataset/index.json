@@ -1,0 +1,18 @@
+{
+  "frame_folders": [
+    "left",
+    "bottom",
+    "top_right"
+  ],
+  "index_files": {
+    "left": "src/results/dataset/left/files.csv",
+    "bottom": "src/results/dataset/bottom/files.csv",
+    "top_right": "src/results/dataset/top_right/files.csv"
+  },
+  "status": "origin",
+  "image_count": 150,
+  "image_size": [
+    1024,
+    576
+  ]
+}

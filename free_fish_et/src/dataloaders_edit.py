@@ -66,8 +66,10 @@ class Multiview_Dataset(torch.utils.data.Dataset):
     """
     def __init__(self, root: str):
         self.root = Path(root)
-        # self.views = ['front', 'bottom']
-        self.views = [str(subdir.name) for subdir in self.root.iterdir() if subdir.is_dir()]
+        with open(self.root / 'index.json', 'r') as jf:
+            self.index_json = json.load(jf)
+        self.views = self.index_json["frame_folders"]
+        #self.views = [str(subdir.name) for subdir in self.root.iterdir() if subdir.is_dir()]
 
         # DLC outputs per view
         """
@@ -250,10 +252,11 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             - keypoints_dict['coordinates']: list of length K each shape (M,2)
             - keypoints_dict['confidence']:   list of length K each shape (M,1)
         """
-        filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view]['bbox_masked'][idx][0]
-        coords = keypoints_dict[filename]
+        #filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view]['bbox_masked'][idx][0]
+        coords = keypoints_dict[str(idx)]
         kpt_list = []
         for inst in range(n_instances):
+            inst = str(inst)
             pts = []
             for kpt_name in coords[inst]:
                 x,y     = (coords[inst][kpt_name,0], coords[inst][kpt_name,1])
