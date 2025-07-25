@@ -1,6 +1,6 @@
 import torch
-from src import fish_model
-from losses import (
+from src import fish_model_edit as fish_model
+from src.losses import (
     camera_fitting_loss,
     body_fitting_loss,
     mask_fitting_loss
@@ -19,6 +19,7 @@ class OptimizeMV:
 
     def __init__(
         self,
+        fish_model_obj: fish_model.fish_model,
         lim_weight=1.0,
         prior_weight=1.0,
         bone_weight=1.0,
@@ -27,7 +28,6 @@ class OptimizeMV:
         step_size=1e-2,
         num_iters=100,
         device=torch.device('cpu'),
-        mesh='carp.json',
     ):
         # Store hyper-parameters
         self.device = device
@@ -40,7 +40,7 @@ class OptimizeMV:
         self.smooth_weights = smooth_weights or [1.0, 1.0, 1.0]
 
         # Load parametric fish mesh and faces
-        self.fish = fish_model(device=device, mesh=mesh)
+        self.fish = fish_model_obj
         self.faces = self.fish.faces.to(self.device)
 
     def __call__(

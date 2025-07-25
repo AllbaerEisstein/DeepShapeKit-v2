@@ -10,7 +10,7 @@ def load_model(model_path: Path):
     return YOLO(model_path)
 
 
-def inference(model: YOLO, img_path: Path):
+def inference(model: YOLO, img_path: Path) -> tuple[list[tuple[int,int,int,int]], list[list[tuple[float, float, float]]]]:
     """
     Run inference on an image and return bounding boxes of the keypoints and keypoints.
 
@@ -21,24 +21,27 @@ def inference(model: YOLO, img_path: Path):
     Returns:
         bboxes (list[tuple[int,int,int,int]]): List of bounding boxes (x1, y1, x2, y2).
 
-        kpts (list[list[tuple[float,float,float]]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
+        kpts (list[list[tuple[float,float,float]]]): 
+        List of the lists of keypoint tuples (x, y, visibility) per detected instance.
+
+        Important! 
+        An empty results.keypoints means "no objects were detected," not "all keypoints are missing for a detected object." 
+        If you have detections, you should always get keypoint results (possibly including zeros for undetected keypoints); 
+        if you have no detections, results.keypoints is empty.
     """
     results = model(str(img_path), verbose=False)
 
     bboxes: list[tuple[int,int,int,int]]           = []
-    kpts:   list[list[tuple[float, float, float]]] = [[]]
+    kpts:   list[list[tuple[float, float, float]]] = []
 
     for result in results:
-        if result.keypoints is not None and result.keypoints.has_visible:
+        if result.keypoints is not None: # else: no instance was detected
             for instance in result.boxes.xyxy.cpu().numpy():
                 x1, y1, x2, y2 = map(int, instance)
                 bboxes.append((x1, y1, x2, y2))
 
             for instance_kpts in result.keypoints.data.cpu().numpy(): # shape: (num_instances, num_keypoints, 3)
                 kpts.append([(float(x), float(y), float(v)) for x, y, v in instance_kpts])
-            
-        else:
-            return [], [[(0, 0, 0)]] # None detection to be filtered out by confidence
     
     return bboxes, kpts
 

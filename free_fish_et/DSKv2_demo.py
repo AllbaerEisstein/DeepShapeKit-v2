@@ -21,10 +21,25 @@ if __name__ == '__main__':
 
     segmentation_model_path = Path('src/DSKv2/segment_bluegill.pt')
     pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
+    mesh_path               = '../../bluegill_data/bluegill_mesh.json'
     out_path                = Path('src/results')
     dataset_folder_name     = 'dataset'
-    dataset_folder_path     = out_path / dataset_folder_name
+    dataset_folder_path     = (out_path / dataset_folder_name).absolute()
     final_output_folder     = 'src/results/output/'
+
+    keypoint_list = [
+        'mouth tip', 
+        'gill', 
+        'root of pelvic fin', 
+        'caudal peduncle', 
+        'middle of caudal fin', 
+        'lower tip of caudal fin'
+    ]
+    
+    kpt_name_dict = {
+        index: kpt_name 
+        for index, kpt_name in enumerate(keypoint_list)
+    }
 
 
     # ====== preprocessing and dataset creation ======
@@ -51,7 +66,7 @@ if __name__ == '__main__':
         detect_keypoints_yolo(
             dataset_path    = dataset_folder_path,
             model_path      = pose_model_path,
-            yolo_env_name   = 'yolo'
+            kpt_names_dict  = kpt_name_dict
         )
 
     with open(os.path.join(dataset_folder_path, 'index.json')) as jf:
@@ -59,8 +74,6 @@ if __name__ == '__main__':
 
     # ==============================
 
-
-    mesh_path       = 'bluegill_mesh.json'
     instance_number = 0
     seed            = 700
     save_models     = True

@@ -10,10 +10,10 @@ import src.multiview as multiview
 import src.multiview_utils as mutil
 
 from tqdm import tqdm
-from src.fish_model import fish_model
-from src.pose_optimizer import OptimizeMV
+from src.fish_model_edit import fish_model
+from src.pose_optimizer_edit import OptimizeMV
 from src.Silhouette_Renderer import Silhouette_Renderer
-from src.dataloaders import Multiview_Dataset
+from src.dataloaders_edit import Multiview_Dataset
 
 
 def setup_device(seed: int) -> str:
@@ -41,7 +41,7 @@ def initialize_model(mesh_file: str, device: str) -> tuple:
         mask_weight=200,
         smooth_weights=[100, 100, 20],
         device=device,
-        mesh=mesh_file
+        fish_model_obj=fish
     )
     renderer = Silhouette_Renderer(device=device)
     return fish, optimizer, renderer

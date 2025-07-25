@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 
 import src.infer_mask as infer_mask
 import src.infer_keypoints as infer_keypoints
+from src.types import *
 
 
 def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
@@ -292,8 +293,6 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) 
     mask_img = Image.new(mode, image_size, background)
     draw = ImageDraw.Draw(mask_img)
 
-    #print(coords)
-    print(image_size)
     # Draw filled polygon
     draw.polygon(coords, outline=fill, fill=fill)
     return np.array(mask_img, dtype=np.uint8)
@@ -425,7 +424,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
             # 3) full-frame mask
             full_mask = (full_mask_np * 255).astype(np.uint8)
             full_mask_path = os.path.join(
-                base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask.png'
+                base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask_full.png'
             )
             Image.fromarray(full_mask).save(full_mask_path)
 
@@ -455,7 +454,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
 
     csvwriters = {}
     for folder in image_folders:
-        print(f"processing frames for video {folder}...")
+        print(f"   processing frames for video {folder}...")
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
             if not os.path.exists(dataset_path / folder / new_dir):
                 os.mkdir(dataset_path / folder / new_dir)
@@ -470,8 +469,9 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
 
         files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
 
-        for img_path, prediction in tqdm(img_path2prediction.items()):
+        for img_path, prediction in tqdm(sorted(img_path2prediction.items())):
             frame_number = get_frame_number(img_path=Path(img_path), files_csv_rows=files_csv_rows)
+            img_name = Path(img_path).name
 
             bboxes:   list[list[int]]         = prediction["bboxes"]
             masks_xy: list[list[list[float]]] = prediction["masks_xy"]
@@ -479,7 +479,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
             #           |   └──> entry per instance
             #           └──> list of instances 
             for instance_number, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
-                print(f"processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
+                print(f"      processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
                 if conf > conf_threshold:
                     bbox_masked_image_fname = f"image_{frame_number}_{instance_number}_bbox-masked.png"
                     infer_mask.img2bbx(
@@ -497,9 +497,11 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
                     # Record CSV entries
                     rel_crop       = f"{folder}/cropped/image_{frame_number}_{instance_number}.png"
                     rel_mask       = f"{folder}/mask/image_{frame_number}_{instance_number}_mask.png"
+                    rel_mask_full  = f"{folder}/mask_full/image_{frame_number}_{instance_number}_mask_full.png"
                     rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
                     csvwriter.writerow([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
                     csvwriter.writerow([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
+                    csvwriter.writerow([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
                     csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
 
 def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
@@ -521,37 +523,53 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
     with open(dataset_path / 'index.json', 'r') as jf:
         index_json = json.load(jf)
 
+    zero_dict = { # for reusing
+        kpt_name: [0.0, 0.0, 0.0]
+        for kpt_name in kpt_names_dict.values()
+    }
+    no_instance_detected_dict = { # for reusing
+        kpt_name: [-1.0, -1.0, -1.0]
+        for kpt_name in kpt_names_dict.values()
+    }
+
     views = index_json["frame_folders"]
 
     for view in views:
         print(f"processing frames for video {view}...")
         files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / "files_crop.csv")))
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        img_path2prediction: dict[
-            str, dict[
-            # └──> bbox-masked_image filename
-                str, dict[
-            #    └──> instance number 
-                    str, tuple[float, float, float]
-            #        └──> keypoint name
-                ]
-            ]
-        ] = {}
+        frame2prediction: KeypointsDict = KeypointsDict()
         input_path = dataset_path / view / 'bbox-masked_image'
 
-        for img in input_path.iterdir():
-            frame_number = get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows)
+        for img in sorted(input_path.iterdir()):
+            frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                img_path2prediction[str(img)] = {}
+                frame2prediction[frame_number] = {}
                 _, instances = infer_keypoints.inference(model, img)
+
+                if len(instances) == 0:
+                    """
+                    this means no instance was detected - however, 
+                    we know that there is an instance in the image because all images used here 
+                    are pre-filtered for containing instances by the instance segmentation step.
+                    so we indicate that with -1-confidences. 
+                    """
+                    print(f"   keypoint-detection missed all instances in frame {frame_number} ({Path(img).name})")
+                    frame2prediction[frame_number]['-1'] = no_instance_detected_dict
+
                 for instance_number, kpts in enumerate(instances):
-                    print(f"processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
-                    img_path2prediction[str(img)][str(instance_number)] = {}
+                    print(f"   processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
+                    if len(kpts) == 0:
+                        print("      keypoint-detection missed this instance")
+                        frame2prediction[frame_number][str(instance_number)] = no_instance_detected_dict
+                    else:
+                        frame2prediction[frame_number][str(instance_number)] = zero_dict
                     for index, (x, y, c) in enumerate(kpts):
-                        print(f"keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
-                        img_path2prediction[str(img)][str(instance_number)][kpt_names_dict[index]] = (x, y, (c if (x > 0 or y > 0) else 0)) # undetected keypoints indicated by x=y=0
+                        print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
+                        frame2prediction[frame_number][str(instance_number)][kpt_names_dict[index]] = [
+                            x, y, (c if (x > 0 or y > 0) else 0) # undetected keypoints indicated by x=y=0
+                        ] 
 
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
-            # correspondence between keypoints and filename can later be established via files_crop.csv!
-            pickle.dump(img_path2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(frame2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
