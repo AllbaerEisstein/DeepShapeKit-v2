@@ -137,55 +137,60 @@ def project_by_object_utils(cam, point):
 # Keypoint and Mask Data Retrieval
 #---------------------------------------------------------------
 
-def get_mesh_data(collection_name, object_name):
+def get_deformed_mesh_data(collection_name, object_name):
     obj = bpy.data.collections[collection_name].objects[object_name]
+    deps = bpy.context.evaluated_depsgraph_get()
+    obj_eval = obj.evaluated_get(deps)
+
+    # create a mesh with modifiers, armature, shapekeys applied
+    # -> docs: create a Mesh data-block from the current state of the object. The object owns the data-block. 
+    # The result is temporary and cannot be used by objects from the main database.
+    mesh_eval = obj_eval.to_mesh(preserve_all_data_layers=True, depsgraph=deps)
     bm = bmesh.new()
-    bm.from_mesh(obj.data)
-    faces = [[v.index for v in f.verts] for f in bm.faces]
-    vertices = [list(v.co) for v in obj.data.vertices]
-    n_verts = len(obj.data.vertices)
+    bm.from_mesh(mesh_eval)
+
+    faces    = [[v.index for v in f.verts] for f in bm.faces]
+    vertices = [tuple(v.co)                for v in bm.verts]
+    normals  = [tuple(v.normal)            for v in bm.verts]
     bm.free()
 
     keypoint_list = [
-        'mouth tip', 
-        'gill', 
-        'root of pelvic fin', 
-        'caudal peduncle', 
-        'middle of caudal fin', 
-        'lower tip of caudal fin'
+        'mouth tip', 'gill',
+        'root of pelvic fin','caudal peduncle',
+        'middle of caudal fin','lower tip of caudal fin'
     ]
-    keypoint2index = {
-        kpt_name: index 
-        for index, kpt_name in enumerate(keypoint_list)
-    }
-    keypoint_groups = [
-        group for group in obj.vertex_groups
-        if group.name in keypoint_list
-    ]
-    
-    return obj, bm, faces, vertices, n_verts, keypoint_list, keypoint2index, keypoint_groups
 
-
-def get_median_kpt_coords(obj, keypoint_list, keypoint_groups):
-    kpt2coords = {
-        kpt_name: []
-        for kpt_name in keypoint_list
-    }
-    
-    kpt2verts = {
-        group.name: [
-            v for v in obj.data.vertices 
-            if group.name in [
-                obj.vertex_groups[vg.group].name for vg in v.groups
-                ]
+    # build a mapping group-name -> list of vertex indices in that group
+    kpt2idx = {}
+    for vg in obj_eval.vertex_groups:
+        if vg.name in keypoint_list:
+            # find all vertices in mesh_eval whose group indices include vg.index
+            verts_in_group = [
+                vi for vi, v in enumerate(mesh_eval.vertices)
+                if any(g.group == vg.index for g in v.groups)
             ]
-        for group in keypoint_groups
+            kpt2idx[vg.name] = verts_in_group
+
+    # now get their coords:
+    kpt2verts_co = {
+        kpt: [tuple(mesh_eval.vertices[i].co) for i in idx_list]
+        for kpt, idx_list in kpt2idx.items()
     }
+
+    bm.free()
+    # docs: The object owns the mesh data-block. To force free it use to_mesh_clear(). 
+    obj_eval.to_mesh_clear()
     
-    for kpt, verts in kpt2verts.items():
+    return faces, vertices, normals, kpt2verts_co
+
+
+def get_avg_kpt_coords(kpt2verts_co:dict):
+    kpt2coords = {}
+    
+    for kpt, coord in kpt2verts_co.items():
         xs, ys, zs = [], [], []
-        for vert in verts:
-            x, y, z = vert.co
+        for vert in coord:
+            x, y, z = vert
             xs.append(x)
             ys.append(y)
             zs.append(z)
@@ -260,9 +265,9 @@ def get_seg_mask_polygon(cam_matrix, faces):
 
 
 def calculate_metadata(collection_name, object_name):
-    obj, bm, faces, vertices, n_verts, keypoint_list, keypoint2index, keypoint_groups = get_mesh_data(collection_name, object_name)
+    faces, vertices, normals, kpt2verts_co = get_deformed_mesh_data(collection_name, object_name)
 
-    kpt2coords_world = get_median_kpt_coords(obj, keypoint_list, keypoint_groups)
+    kpt2coords_world = get_avg_kpt_coords(kpt2verts_co)
 
     obj_camera = bpy.context.scene.camera
     P, K, RT = get_3x4_P_matrix_from_blender(obj_camera)
@@ -330,7 +335,7 @@ class TimedRender(bpy.types.Operator):
 
 
     def make_filename(self, qitem):
-        return f'{qitem["view"]}_{qitem["frame"]}' 
+        return f"{qitem['view']}_{str(qitem['frame']).zfill(4)}" 
 
     def exists(self, blender_formatted_filepath):
         filepath = bpy.path.abspath(blender_formatted_filepath)
@@ -346,7 +351,7 @@ class TimedRender(bpy.types.Operator):
 
 # --- Build render queue ------------------------------------------------------
 
-        for cam_name, cam_object in cam_objects.items():
+        for cam_name in cam_objects.keys():
             for frame_index in range(bpy.context.scene.frame_start,
                                      bpy.context.scene.frame_end):
                 self.render_queue.append({
@@ -371,7 +376,7 @@ class TimedRender(bpy.types.Operator):
         bpy.types.RenderSettings.use_lock_interface = True
 
         # Add a timer to the given window, to generate periodic ‘TIMER’ events
-        self.timer_event = bpy.context.window_manager.event_timer_add(0.3, window=bpy.context.window)
+        self.timer_event = bpy.context.window_manager.event_timer_add(0.5, window=bpy.context.window)
         # Add a modal handler to the window manager, for the given modal operator (this is expected to be a class that extends bpy.types.Operator!) (called by invoke() with self, just before returning {‘RUNNING_MODAL’})
         # -> A modal handler handles events!
         context.window_manager.modal_handler_add(self)  # <- This is key
@@ -425,9 +430,7 @@ class TimedRender(bpy.types.Operator):
                 # nothing is rendering and there are items in queue
                 elif self.rendering == False:
                     sc = context.scene
-                    # render_filename = self.make_filename(qitem)
-                    # img_out_file = self.OUT_DIR + os.sep + render_filename + '.png'
-                    
+                                        
                     # # skip if the file exists
                     # if self.exists(img_out_file):
                     #     self.render_queue.pop(0)
@@ -437,6 +440,8 @@ class TimedRender(bpy.types.Operator):
                     qitem = self.render_queue.pop(0)
                     frame_index = qitem["frame"]
                     cam_name = qitem["view"]
+                    
+                    render_basename = self.make_filename(qitem)
 
                     # switch camera
                     sc.camera = bpy.data.objects.get(cam_name)
@@ -447,8 +452,6 @@ class TimedRender(bpy.types.Operator):
                     # set frame
                     sc.frame_set(frame_index)
 
-                    # build an exact filename
-                    render_basename = f"{cam_name}_{str(frame_index).zfill(4)}"
                     img_file = os.path.join(self.OUT_DIR, render_basename + ".png")
 
                     print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {img_file}')
@@ -458,14 +461,14 @@ class TimedRender(bpy.types.Operator):
                     bpy.ops.render.render(write_still=True)
 
                     # annotate immediately
-                    try:
-                        draw_kpts_on_img(
-                            kpt2coords = calculate_metadata("Bluegill","Body"),
-                            img_path   = bpy.path.abspath(img_file),
-                            out_path   = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot.png"),
-                        )
-                    except Exception as e:
-                        self.report({'ERROR'}, f"Annotation failed on {bpy.path.abspath(img_file)}: {e}")
+                    # try:
+                    draw_kpts_on_img(
+                        kpt2coords = calculate_metadata("Bluegill","Body"),
+                        img_path   = bpy.path.abspath(img_file),
+                        out_path   = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot.png"),
+                    )
+                    # except Exception as e:
+                    #     self.report({'ERROR'}, f"Annotation failed on {bpy.path.abspath(img_file)}: {e}")
 
 
         return {'PASS_THROUGH'}
