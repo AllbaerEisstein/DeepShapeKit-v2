@@ -1,4 +1,5 @@
 import os
+import math
 
 import bpy
 import bmesh
@@ -9,6 +10,8 @@ from mathutils import Vector
 import numpy as np
 import json
 import cv2
+import alphashape
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 
 
 #---------------------------------------------------------------
@@ -16,15 +19,27 @@ import cv2
 #---------------------------------------------------------------
 
 
-keypoint_list:   list[str] = []
-collection_name: str       = ""
-object_name:     str       = ""
-use_cam_matrix:  bool      = True
+keypoint_list:     list[str] = []
+collection_name:   str       = ""
+object_name:       str       = ""
+use_cam_matrix:    bool      = True
+contour_threshold: float     = 0.01
+alphashape_alpha:  float     = 1.0
+
+# invert y and z:
+Blender_cam_2_cv_cam = Matrix((
+    ( 1,  0,  0),  # -> x becomes x
+    ( 0, -1,  0),  # -> y becomes negative y
+    ( 0,  0, -1))) # -> z becomes negative z
+
+mirror_y = Matrix((
+    ( 1,  0,  0),
+    ( 0, -1,  0),
+    ( 0,  0,  1)))
 
 
 #---------------------------------------------------------------
 # 3x4 P matrix from Blender camera
-# !! With the unaltered code, x- and z-axis are swapped and the direction of the z-axis is inverted - also, the axes have a scale factor > 1 !!
 #---------------------------------------------------------------
 
 
@@ -128,7 +143,7 @@ def project_by_object_utils(cam, point):
     return Vector((co_2d.x * render_size[0], render_size[1] - co_2d.y * render_size[1]))
 
 
-def blender2d_to_opencv2d(point2d):
+def blender2d_origin_to_opencv2d_origin(point2d):
     """
 .    openCV: 
 .            
@@ -192,9 +207,9 @@ def get_deformed_mesh_data(collection_name, object_name):
     bm = bmesh.new()
     bm.from_mesh(mesh_eval)
 
-    faces    = [[v.index for v in f.verts] for f in bm.faces]
-    vertices = [tuple(v.co)                for v in bm.verts]
-    normals  = [tuple(v.normal)            for v in bm.verts]
+    faces    = [[tuple(v.co) for v in f.verts]   for f in bm.faces]
+    vertices = [tuple(v.co)                      for v in bm.verts]
+    normals  = [(tuple(v.co), tuple(v.normal))   for v in bm.verts]
     bm.free()
 
     # build a mapping group-name -> list of vertex indices in that group
@@ -227,15 +242,36 @@ def calculate_metadata(collection_name, object_name, cam_name):
     kpt2coords_world = get_avg_kpt_coords(kpt2verts_co)
 
     obj_camera = bpy.data.objects.get(cam_name)
-    Blender_world_2_Blender_image, Blender_cam_2_Blender_image, R, T, Blender_world_2_Blender_cam = get_3x4_P_matrix_Blender2Blenderimage(obj_camera)
+    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blender2Blenderimage(obj_camera)
 
-    # invert y and z:
-    Blender_cam_2_cv_cam = Matrix(
-        (( 1,  0,  0),  # -> x becomes x
-         ( 0, -1,  0),  # -> y becomes negative y
-         ( 0,  0, -1))) # -> z becomes negative z
-    
-    Blender_world_2_cv_image = Blender_cam_2_Blender_image @ Blender_cam_2_cv_cam @ Blender_world_2_Blender_cam
+    scene = bpy.context.scene
+    render_scale = scene.render.resolution_percentage / 100
+    w, h = (
+        scene.render.resolution_x * render_scale,
+        scene.render.resolution_y * render_scale,
+    )
+
+    def get_height_dependent_matrices(h):
+        Blender2d_origin_to_opencv2d_origin = Matrix((
+            ( 1,  0,  0),
+            ( 0, -1,  h),  # -> y, after mirroring, is still at y, but the origin got shifted by +h and the direction go changed, so it needs to be translated to h - y
+            ( 0,  0,  1)))
+        
+        translate_by_hdiv2 = Matrix((
+            ( 1,  0,  0),
+            ( 0,  1, h/2),
+            ( 0,  0,  1)))
+
+        translate_by_neghdiv2 = Matrix((
+            ( 1,  0,  0),
+            ( 0,  1, -h/2),
+            ( 0,  0,  1)))
+        
+        return Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2
+
+    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(h)
+ 
+    Blender_world_2_cv_image = K_Blender_cam_2_Blender_image @ Blender_cam_2_cv_cam @ RT_Blender_world_2_Blender_cam
 
     kpt2coords_camera = {
         kpt: Blender_world_2_cv_image@Vector(coords + (1,)) if use_cam_matrix else project_by_object_utils(obj_camera, Vector(coords))
@@ -249,7 +285,20 @@ def calculate_metadata(collection_name, object_name, cam_name):
         for kpt, coords_homog in kpt2coords_camera.items()
     }
 
-    return kpt2coords_image
+    seg_mask_points = get_contour_polygon_points_3d(RT_Blender_world_2_Blender_cam, normals, contour_threshold)
+    seg_mask_points_2d_homog = [
+        Blender_world_2_cv_image@Vector(coords + (1,)) 
+        for coords in seg_mask_points
+    ]
+    
+    seg_mask_points_cv_img = nearest_neighbour([
+        (coords_homog.x / coords_homog.z, coords_homog.y / coords_homog.z) 
+        for coords_homog in seg_mask_points_2d_homog
+    ])
+
+    seg_mask_alphashape = alphashape.alphashape(seg_mask_points_cv_img, alphashape_alpha)
+
+    return kpt2coords_image, [seg_mask_points_cv_img]#seg_mask_poly
 
 # -----------------------------
 
@@ -284,7 +333,78 @@ def draw_kpts_on_img(kpt2coords, img_path, out_path, annot_radius = 5):
     cv2.imwrite(str(out_path), img)
 
 
-def get_seg_mask_polygon(cam_matrix, faces):
+def draw_lattice_lines(image_path, output_path=None,
+                       line_color=(0, 255, 0),  # BGR tuple: green lines
+                       middle_thickness=3,
+                       other_thickness=1,
+                       draw_horizontal=True,
+                       draw_vertical=True):
+    """
+    Reads an image, draws horizontal and/or vertical lines at intervals of 0.1 * dimension
+    with the central line thicker and centered.
+
+    :param image_path: Path to the input image file
+    :param output_path: Optional path to save the modified image
+    :param line_color: Color for the lines in BGR format (default green)
+    :param middle_thickness: Thickness of the central lines in pixels
+    :param other_thickness: Thickness of the other lines in pixels
+    :param draw_horizontal: Whether to draw horizontal lines
+    :param draw_vertical: Whether to draw vertical lines
+    :return: The image with lines drawn (as a NumPy array)
+    """
+    # Load the image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Unable to load image at '{image_path}'")
+
+    height, width = image.shape[:2]
+
+    # Horizontal lines
+    if draw_horizontal:
+        h_step = int(0.1 * height)
+        mid_y = height // 2
+        # central horizontal line
+        cv2.line(image, (0, mid_y), (width, mid_y), line_color, thickness=middle_thickness)
+        # lines below
+        offset = h_step
+        while mid_y + offset < height:
+            y = mid_y + offset
+            cv2.line(image, (0, y), (width, y), line_color, thickness=other_thickness)
+            offset += h_step
+        # lines above
+        offset = h_step
+        while mid_y - offset > 0:
+            y = mid_y - offset
+            cv2.line(image, (0, y), (width, y), line_color, thickness=other_thickness)
+            offset += h_step
+
+    # Vertical lines
+    if draw_vertical:
+        v_step = int(0.1 * width)
+        mid_x = width // 2
+        # central vertical line
+        cv2.line(image, (mid_x, 0), (mid_x, height), line_color, thickness=middle_thickness)
+        # lines right
+        offset = v_step
+        while mid_x + offset < width:
+            x = mid_x + offset
+            cv2.line(image, (x, 0), (x, height), line_color, thickness=other_thickness)
+            offset += v_step
+        # lines left
+        offset = v_step
+        while mid_x - offset > 0:
+            x = mid_x - offset
+            cv2.line(image, (x, 0), (x, height), line_color, thickness=other_thickness)
+            offset += v_step
+
+    # Save or return
+    if output_path:
+        cv2.imwrite(output_path, image)
+    return image
+
+# -----------------------------
+
+def get_contour_polygon_points_3d(RT, normals, contour_threshold=0.1):
     """
     get seg mask polygon
     frontfaces = []
@@ -296,6 +416,114 @@ def get_seg_mask_polygon(cam_matrix, faces):
         frontfaces.insert(index, [cam_matrix@vertex for vertex in f.vertices])
         
     """
+    cam_forward = (RT @ Vector((0, 0, 1))).normalized()
+    outline_points_3d = []
+    for co, normal in normals:
+        if abs(Vector(normal).normalized().dot(cam_forward)) < contour_threshold:
+            outline_points_3d.append(tuple(co))
+
+    return outline_points_3d
+
+
+def nearest_neighbour(points, use_two_opt=False):
+
+    def euclid(a, b):
+        return math.hypot(a[0]-b[0], a[1]-b[1])
+
+    def tour_length(tour):
+        """Compute total length of a closed tour."""
+        L = 0.0
+        N = len(tour)
+        for i in range(N):
+            L += euclid(tour[i], tour[(i+1) % N])
+        return L
+
+    def two_opt(tour):
+        """
+        Perform 2-opt until no improving swap is found.
+        tour: list of (x,y) points in initial visit order.
+        Returns a new list (possibly the same) with shorter length.
+        """
+        best = tour
+        improved = True
+        while improved:
+            improved = False
+            best_dist = tour_length(best)
+            N = len(best)
+
+            for i in range(1, N - 2):
+                for j in range(i+1, N):
+                    # skip adjacent edges, and the case i=0, j=N-1 which is the same closing edge
+                    if j - i == 1 or (i == 0 and j == N-1):
+                        continue
+
+                    # create a new tour by reversing the segment between i and j
+                    new_tour = best[:i] + best[i:j][::-1] + best[j:]
+                    new_dist = tour_length(new_tour)
+                    if new_dist + 1e-8 < best_dist:  # found an improvement
+                        best = new_tour
+                        best_dist = new_dist
+                        improved = True
+                        # break out to restart searching from the top
+                        break
+                if improved:
+                    break
+
+        return best
+
+    ordered = []
+    next_vertex_x, next_vertex_y = points.pop(0)
+    neighbour_index = 0
+    
+    # Nearest-Neighbour-Heuristic for ordering the polygon
+    while len(points) > 0:
+        min_dist = 10e6
+        for candidate_index, (candidate_x, candidate_y) in enumerate(points):
+            dist_squared = (next_vertex_x-candidate_x)**2 + (next_vertex_y-candidate_y)**2
+            if dist_squared < min_dist:
+                min_dist = dist_squared
+                neighbour_index = candidate_index
+
+        next_vertex_x, next_vertex_y = points.pop(neighbour_index)
+        ordered.append((next_vertex_x, next_vertex_y)) 
+    
+    return two_opt(ordered) if use_two_opt else ordered
+
+
+def collect_polys(g):
+    polys = []
+    if isinstance(g, Polygon):
+        polys.append(g)
+    elif isinstance(g, (MultiPolygon, GeometryCollection)):
+        for sub in g.geoms:
+            collect_polys(sub)
+    
+    return polys
+
+
+def get_mask_polygon_from_binary_image(img_path):
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    polypoints = []
+    height, width, _ = img.shape
+    for i in range(0, height-1):
+        for j in range(0, width-1):
+            if img[i][j] > 0: # white pixel
+                black_neighbour = False
+                for neighbour in [(i-1,j),(i+1,j),(i,j-1),(i,j+1)]:
+                    if 0 <= neighbour[0] <= height and 0 <= neighbour[1] <= width:
+                        if img[neighbour[0]][neighbour[1]] == 0:
+                            black_neighbour = True
+                            break
+                if black_neighbour == True:
+                    polypoints.append((i,j))
+
+
+def draw_polygon(img_path, out_path, poly_points):
+    img = cv2.imread(img_path)
+    for poly in poly_points:
+        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(img=img, pts=[pts], isClosed=True, color=(255,0,0), thickness=1, )
+    cv2.imwrite(out_path, img)
 
 
 #---------------------------------------------------------------
@@ -359,16 +587,23 @@ class TimedRender(bpy.types.Operator):
         self.rendering = False
         self.render_queue = []
 
-        cam_objects = bpy.data.collections['Cameras'].objects
+        cam_objects = sorted(bpy.data.collections['Cameras'].objects, key=lambda cam_obj: cam_obj.name.split('.')[1])
 
 # --- Build render queue ------------------------------------------------------
 
-        for cam_name in cam_objects.keys():
+        for cam in cam_objects:
             for frame_index in range(bpy.context.scene.frame_start,
                                      bpy.context.scene.frame_end):
                 self.render_queue.append({
-                    "view":  cam_name,
-                    "frame": frame_index
+                    "view":  cam.name,
+                    "frame": frame_index,
+                    "mode":  "regular"
+                })
+                # an additional entry for the binary render (used for mask annotation)
+                self.render_queue.append({
+                    "view":  cam.name,
+                    "frame": frame_index,
+                    "mode":  "binary"
                 })
         
         self.total = len(self.render_queue)
@@ -435,6 +670,7 @@ class TimedRender(bpy.types.Operator):
                     qitem = self.render_queue.pop(0)
                     frame_index = qitem["frame"]
                     cam_name = qitem["view"]
+                    mode = qitem["mode"]
                     
                     render_basename = self.make_filename(qitem)
 
@@ -453,17 +689,49 @@ class TimedRender(bpy.types.Operator):
 
                     # render to that exact path
                     sc.render.filepath = img_file
-                    bpy.ops.render.render(write_still=True)
 
-                    # annotate immediately
-                    # try:
-                    draw_kpts_on_img(
-                        kpt2coords = calculate_metadata(collection_name, object_name, cam_name),
-                        img_path   = bpy.path.abspath(img_file),
-                        out_path   = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot.png"),
-                    )
-                    # except Exception as e:
+                    if mode == "regular":
+
+                        sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 0)
+                        sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 0
+                        sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 0
+
+                        bpy.ops.render.render(write_still=True)
+
+                        kpt2coords_cvimg, polygons = calculate_metadata(collection_name, object_name, cam_name)
+
+                        # annotate immediately
+                        # try:
+                        draw_kpts_on_img(
+                            kpt2coords = kpt2coords_cvimg,
+                            img_path   = bpy.path.abspath(img_file),
+                            out_path   = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png"),
+                        )
+                        draw_lattice_lines(
+                            image_path=os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png"),
+                            output_path=os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png")
+                        )
+                        # except Exception as e:
                     #     self.report({'ERROR'}, f"Annotation failed on {bpy.path.abspath(img_file)}: {e}")
+
+                    elif mode == "binary":
+
+                        sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
+                        sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
+                        sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
+
+                        sc.render.filepath = os.path.join(self.ANNOT_DIR, render_basename + "_annot_poly.png")
+
+                        bpy.ops.render.render(write_still=True)
+
+                        polygons = get_mask_polygon_from_binary_image(os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_poly.png"))
+
+                        draw_polygon(
+                            poly_points = [polygons],
+                            img_path    = bpy.path.abspath(img_file),
+                            out_path    = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_poly.png"),
+                        )
+
 
 
         return {'PASS_THROUGH'}
@@ -483,6 +751,8 @@ if __name__ == "__main__":
     use_cam_matrix = True
     ortho          = False
 
+    contour_threshold = 0.1
+    alphashape_alpha  = 2.0
 
     if test:
         keypoint_list = [
