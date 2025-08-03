@@ -3,28 +3,30 @@ import sys
 import random
 import shutil
 
-def create_directory_structure(base_dir):
+def create_directory_structure(imgs_dir):
     """
     Create the directory structure:
-      base_dir/
-         images/train, images/test, images/val
-         labels/train, labels/test, labels/val
+      imgs_dir/
+         dataset/
+            images/train, images/test, images/val
+            labels/train, labels/test, labels/val
     """
+    os.makedirs(os.path.join(imgs_dir, "dataset"), exist_ok=True)
     for folder in ["images", "labels"]:
         for subset in ["train", "test", "val"]:
-            dir_path = os.path.join(base_dir, folder, subset)
+            dir_path = os.path.join(imgs_dir, "dataset", folder, subset)
             os.makedirs(dir_path, exist_ok=True)
 
-def split_labels(base_dir, train_pct, test_pct, val_pct):
+def split_labels(label_dir, train_pct, test_pct, val_pct):
     """
-    Finds all .txt label files in the base directory (ignoring subdirectories),
+    Finds all .txt label files in the label directory (ignoring subdirectories),
     shuffles them, and splits them into train, test, and val groups according to the given percentages.
     Returns three lists of filenames and a dictionary mapping subset names to the set of basenames.
     """
     # Only consider files in the base directory (not in subdirectories)
-    all_files = os.listdir(base_dir)
+    all_files = os.listdir(label_dir)
     label_files = [f for f in all_files 
-                   if os.path.isfile(os.path.join(base_dir, f)) and f.lower().endswith('.txt')]
+                   if os.path.isfile(os.path.join(label_dir, f)) and f.lower().endswith('.txt')]
     
     random.shuffle(label_files)
     total = len(label_files)
@@ -44,26 +46,27 @@ def split_labels(base_dir, train_pct, test_pct, val_pct):
     
     return train_labels, test_labels, val_labels, subsets
 
-def move_label_files(base_dir, train_labels, test_labels, val_labels):
+def move_label_files(label_dir, dataset_dir, train_labels, test_labels, val_labels):
     """
-    Moves the given label files from the base directory to base_dir/labels/<subset>.
+    Moves the given label files from the base directory to imgs_dir/dataset/labels/<subset>.
     """
     for subset, file_list in zip(["train", "test", "val"], [train_labels, test_labels, val_labels]):
         for filename in file_list:
-            src = os.path.join(base_dir, filename)
-            dst = os.path.join(base_dir, "labels", subset, filename)
+            src = os.path.join(label_dir, filename)
+            dst = os.path.join(dataset_dir, "labels", subset, filename)
             shutil.move(src, dst)
             print(f"Moved label file {filename} to labels/{subset}")
 
-def process_images(base_dir, subsets):
+def process_images(imgs_dir, subsets):
     """
-    From the base directory, find all .jpg files (ignoring subdirectories).
+    From the base directory, find all imagge files (ignoring subdirectories).
     For each image, determine its corresponding subset by matching its basename against the label subsets.
-    If a match is found, move the image to base_dir/images/<subset>; otherwise, remove the image.
+    If a match is found, move the image to imgs_dir/dataset/images/<subset>; otherwise, remove the image.
     """
-    all_files = os.listdir(base_dir)
+    all_files = os.listdir(imgs_dir)
     image_files = [f for f in all_files 
-                   if os.path.isfile(os.path.join(base_dir, f)) and f.lower().endswith('.jpg')]
+                   if os.path.isfile(os.path.join(imgs_dir, f)) and 
+                   (f.lower().endswith('.jpg') or f.lower().endswith('.jpeg') or f.lower().endswith('.png'))]
     
     for img in image_files:
         basename, _ = os.path.splitext(img)
@@ -75,9 +78,9 @@ def process_images(base_dir, subsets):
         elif basename in subsets['val']:
             dest_subset = "val"
         
-        src = os.path.join(base_dir, img)
+        src = os.path.join(imgs_dir, img)
         if dest_subset:
-            dst_dir = os.path.join(base_dir, "images", dest_subset)
+            dst_dir = os.path.join(imgs_dir, "dataset", "images", dest_subset)
             dst = os.path.join(dst_dir, img)
             shutil.move(src, dst)
             print(f"Moved image {img} to images/{dest_subset}")
@@ -86,15 +89,16 @@ def process_images(base_dir, subsets):
             print(f"Removed image {img} (no matching label file found)")
 
 def main():
-    if len(sys.argv) != 5:
-        print("Usage: python create_dataset_structure_yolo.py <base_dir> <train_pct> <test_pct> <val_pct>")
+    if len(sys.argv) != 6:
+        print("Usage: python create_dataset_structure_yolo.py <imgs_dir> <label_dir> <train_pct> <test_pct> <val_pct>")
         sys.exit(1)
     
-    base_dir = sys.argv[1]
+    imgs_dir = sys.argv[1]
+    label_dir = sys.argv[2]
     try:
-        train_pct = float(sys.argv[2])
-        test_pct = float(sys.argv[3])
-        val_pct = float(sys.argv[4])
+        train_pct = float(sys.argv[3])
+        test_pct = float(sys.argv[4])
+        val_pct = float(sys.argv[5])
     except ValueError:
         print("Error: The percentages must be numbers between 0 and 1.")
         sys.exit(1)
@@ -107,24 +111,26 @@ def main():
         print("Error: The three percentages must add up to 1.")
         sys.exit(1)
     
-    if not os.path.isdir(base_dir):
-        print(f"Error: {base_dir} is not a valid directory.")
+    if not os.path.isdir(imgs_dir):
+        print(f"Error: {imgs_dir} is not a valid directory.")
         sys.exit(1)
     
     # Create new directory structure inside the base directory.
-    create_directory_structure(base_dir)
+    create_directory_structure(imgs_dir)
+
+    dataset_dir = os.path.join(imgs_dir, "dataset")
     
     # Split label files into subsets.
-    train_labels, test_labels, val_labels, subsets = split_labels(base_dir, train_pct, test_pct, val_pct)
+    train_labels, test_labels, val_labels, subsets = split_labels(label_dir, train_pct, test_pct, val_pct)
     total_labels = len(train_labels) + len(test_labels) + len(val_labels)
     print(f"Total label files: {total_labels}")
     print(f"Train: {len(train_labels)}, Test: {len(test_labels)}, Val: {len(val_labels)}")
     
     # Move label files into their new folders.
-    move_label_files(base_dir, train_labels, test_labels, val_labels)
+    move_label_files(label_dir, dataset_dir, train_labels, test_labels, val_labels)
     
     # Process images based on corresponding label assignments.
-    process_images(base_dir, subsets)
+    process_images(imgs_dir, subsets)
 
 if __name__ == "__main__":
     main()

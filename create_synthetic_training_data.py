@@ -18,13 +18,27 @@ from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
 # Global variables
 #---------------------------------------------------------------
 
+global RENDER_SCALE
+global IMAGE_WIDTH
+global IMAGE_HEIGHT
+global SCENE
+global evaluated_depsgraph
+global CAM_OBJECTS
 
-keypoint_list:     list[str] = []
-collection_name:   str       = ""
-object_name:       str       = ""
-use_cam_matrix:    bool      = True
-contour_threshold: float     = 0.01
-alphashape_alpha:  float     = 1.0
+
+global KEYPOINT_LIST
+global COLLECTION_NAME
+global OBJECT_NAME
+
+global OUT_DIR_BL
+global ANNOT_DIR_BL
+
+use_cam_matrix:        bool      = True
+render_binary:         bool      = False
+keypoint_visible_threshold_percentage: float = 0.1
+contour_threshold:     float     = 0.01
+alphashape_alpha:      float     = 1.0
+draw_lattice_for_kpt_annot: bool = False
 
 # invert y and z:
 Blender_cam_2_cv_cam = Matrix((
@@ -193,9 +207,10 @@ def blender2d_origin_to_opencv2d_origin(point2d):
 #---------------------------------------------------------------
 
 
-def get_deformed_mesh_data(collection_name, object_name):
+def get_deformed_mesh_data(deps, collection_name, object_name):
     obj = bpy.data.collections[collection_name].objects[object_name]
-    deps = bpy.context.evaluated_depsgraph_get()
+    if deps is None:
+        deps = bpy.context.evaluated_depsgraph_get()
     obj_eval = obj.evaluated_get(deps)
 
     obj2world = obj_eval.matrix_world
@@ -215,7 +230,7 @@ def get_deformed_mesh_data(collection_name, object_name):
     # build a mapping group-name -> list of vertex indices in that group
     kpt2idx = {}
     for vg in obj_eval.vertex_groups:
-        if vg.name in keypoint_list:
+        if vg.name in KEYPOINT_LIST:
             # find all vertices in mesh_eval whose group indices include vg.index
             verts_in_group = [
                 vi for vi, v in enumerate(mesh_eval.vertices)
@@ -236,21 +251,27 @@ def get_deformed_mesh_data(collection_name, object_name):
     return faces, vertices, normals, kpt2verts_worldco
 
 
-def calculate_metadata(collection_name, object_name, cam_name):
-    faces, vertices, normals, kpt2verts_co = get_deformed_mesh_data(collection_name, object_name)
+def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
+    evaluated_depsgraph = bpy.context.evaluated_depsgraph_get()
+    cam_obj = bpy.data.objects.get(cam_name)
 
-    kpt2coords_world = get_avg_kpt_coords(kpt2verts_co)
+    faces, vertices, normals, kpt_2_coord_list_world = get_deformed_mesh_data(evaluated_depsgraph, collection_name, object_name)
 
-    obj_camera = bpy.data.objects.get(cam_name)
-    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blender2Blenderimage(obj_camera)
+    occluded_kpts = []
+    kpt_2_coord_list_world_visible = {}
+    for kpt, coords_list in kpt_2_coord_list_world.items():
+        visible_verts = [v for v in coords_list if not is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(v))]
+        if len(visible_verts)/len(kpt_2_coord_list_world[kpt]) >= keypoint_visible_threshold_percentage:
+            kpt_2_coord_list_world_visible[kpt] = visible_verts
+        else:
+            occluded_kpts.append(kpt)
+    for kpt in occluded_kpts:
+        kpt_2_coord_list_world.pop(kpt)
 
-    scene = bpy.context.scene
-    render_scale = scene.render.resolution_percentage / 100
-    w, h = (
-        scene.render.resolution_x * render_scale,
-        scene.render.resolution_y * render_scale,
-    )
+    kpt_2_coords_world = get_avg_kpt_coords_3d(kpt_2_coord_list_world)
 
+
+    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blender2Blenderimage(cam_obj)
     def get_height_dependent_matrices(h):
         Blender2d_origin_to_opencv2d_origin = Matrix((
             ( 1,  0,  0),
@@ -268,56 +289,84 @@ def calculate_metadata(collection_name, object_name, cam_name):
             ( 0,  0,  1)))
         
         return Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2
-
-    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(h)
+    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(IMAGE_HEIGHT)
  
     Blender_world_2_cv_image = K_Blender_cam_2_Blender_image @ Blender_cam_2_cv_cam @ RT_Blender_world_2_Blender_cam
 
-    kpt2coords_camera = {
-        kpt: Blender_world_2_cv_image@Vector(coords + (1,)) if use_cam_matrix else project_by_object_utils(obj_camera, Vector(coords))
-        for kpt, coords in kpt2coords_world.items()
+    kpt_2_coords_camera = {
+        kpt: Blender_world_2_cv_image@Vector(coords + (1,)) 
+            if use_cam_matrix 
+            else project_by_object_utils(cam_obj, Vector(coords))
+        for kpt, coords in kpt_2_coords_world.items()
     }
 
-    kpt2coords_image = {
-        kpt: (coords_homog.x / coords_homog.z, coords_homog.y / coords_homog.z)
+    kpt_2_coords_image = {
+        kpt: (
+                (coords_homog.x / coords_homog.z, coords_homog.y / coords_homog.z), # cv image coords
+                len(kpt_2_coord_list_world_visible[kpt]) / len(kpt_2_coord_list_world[kpt]) # "confidence" (percentage of vertices of this keypoint visible)
+            ) # ((x,y),c) in the end
             if use_cam_matrix
-            else (coords_homog.x, coords_homog.y)
-        for kpt, coords_homog in kpt2coords_camera.items()
+            else (
+                (coords_homog.x, coords_homog.y),
+                len(kpt_2_coord_list_world_visible[kpt]) / len(kpt_2_coord_list_world[kpt])
+            )
+        for kpt, coords_homog in kpt_2_coords_camera.items()
+        # check if keypoint is in rendered frame
+        if  0 <= (coords_homog.x / coords_homog.z) < IMAGE_WIDTH
+        and 0 <= (coords_homog.y / coords_homog.z) < IMAGE_HEIGHT
     }
 
-    seg_mask_points = get_contour_polygon_points_3d(RT_Blender_world_2_Blender_cam, normals, contour_threshold)
-    seg_mask_points_2d_homog = [
-        Blender_world_2_cv_image@Vector(coords + (1,)) 
-        for coords in seg_mask_points
-    ]
-    
-    seg_mask_points_cv_img = nearest_neighbour([
-        (coords_homog.x / coords_homog.z, coords_homog.y / coords_homog.z) 
-        for coords_homog in seg_mask_points_2d_homog
-    ])
-
-    seg_mask_alphashape = alphashape.alphashape(seg_mask_points_cv_img, alphashape_alpha)
-
-    return kpt2coords_image, [seg_mask_points_cv_img]#seg_mask_poly
+    return kpt_2_coords_image
 
 # -----------------------------
 
-def get_avg_kpt_coords(kpt2verts_co:dict):
+def get_avg_kpt_coords_3d(kpt2verts_co:dict):
+    """
+    Given a dict mapping keypoint names to lists of 3D vertex coords,
+    return a dict mapping each keypoint to its (x,y,z) mean.
+    """
     kpt2coords = {}
-    
-    for kpt, coord in kpt2verts_co.items():
-        xs, ys, zs = [], [], []
-        for vert in coord:
-            x, y, z = vert
-            xs.append(x)
-            ys.append(y)
-            zs.append(z)
-        kpt2coords[kpt] = (np.average(xs),np.average(ys),np.average(zs))
-    
+    for kpt, verts in kpt2verts_co.items():
+        if not verts:
+            # no vertices → skip or assign NaNs
+            continue  
+        arr = np.array(verts, dtype=float)       # shape (N,3)
+        mean_xyz = arr.mean(axis=0)              # shape (3,)
+        kpt2coords[kpt] = tuple(mean_xyz.tolist())
     return kpt2coords
 
 
-def draw_kpts_on_img(kpt2coords, img_path, out_path, annot_radius = 5):
+def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-5):
+    # 1) Get depsgraph
+    if deps is None:
+        deps = bpy.context.evaluated_depsgraph_get()
+
+    # 2) Ray origin / direction  
+    cam_co = cam_obj.matrix_world.translation
+    dir_vec = (vertex_co_world - cam_co)
+    dist_to_pt = dir_vec.length
+    if dist_to_pt < eps:
+        return False    # at camera, always “visible”
+    dir_vec.normalize()
+
+    # 3) Nudge the origin off the camera to avoid immediate self-hit
+    origin = cam_co + dir_vec * eps
+
+    # 4) Cast the ray
+    hit, hit_loc, _, _, hit_obj, _ = SCENE.ray_cast(deps, origin, dir_vec)
+
+    # 5) If nothing was hit → visible
+    if not hit:
+        return False
+
+    # 6) Otherwise compare distances **from the same origin**:
+    dist_hit = (hit_loc - origin).length
+
+    # occluded if something is strictly *before* the target point
+    return dist_hit < (dist_to_pt - eps)
+
+
+def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int = 1):
     """
     Args:
         kpts (List[List[np.ndarray]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
@@ -325,10 +374,15 @@ def draw_kpts_on_img(kpt2coords, img_path, out_path, annot_radius = 5):
     """
     img = cv2.imread(str(img_path))
     #cmap = create_discrete_color_map(list(kpt2coords))
+    annot_radius = tenth_of_annot_radius * 10
 
-    for name,(x,y) in kpt2coords.items():
-        cv2.circle(img=img, center=(int(x),int(y)), radius=annot_radius, color=(255, 0, 0), lineType=-1)
-        cv2.putText(img, name, (int(x),int(y+annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=(255, 0, 0), thickness=1)
+    for name,((x,y),c) in kpt2coords.items():
+        conf_scaled_annot_radius = int(
+            int(c*10)/10   # will cut off second decimal (e.g 0.72 -> 0.7)
+            *annot_radius  # if annot_radius is k*10 with k in N, this will yield an int
+        )
+        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=(255, 0, 0), lineType=-1)
+        cv2.putText(img, f"{int(c*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=(255, 0, 0), thickness=1)
 
     cv2.imwrite(str(out_path), img)
 
@@ -501,29 +555,137 @@ def collect_polys(g):
     return polys
 
 
-def get_mask_polygon_from_binary_image(img_path):
-    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    polypoints = []
-    height, width, _ = img.shape
-    for i in range(0, height-1):
-        for j in range(0, width-1):
-            if img[i][j] > 0: # white pixel
-                black_neighbour = False
-                for neighbour in [(i-1,j),(i+1,j),(i,j-1),(i,j+1)]:
-                    if 0 <= neighbour[0] <= height and 0 <= neighbour[1] <= width:
-                        if img[neighbour[0]][neighbour[1]] == 0:
-                            black_neighbour = True
-                            break
-                if black_neighbour == True:
-                    polypoints.append((i,j))
+def get_mask_polygons_from_binary_image(img_path):
+    # 1. Read as binary mask
+    mask = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    _, thresh = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+    # 2. Find external contours only
+    contours, _ = cv2.findContours(
+        thresh, 
+        cv2.RETR_EXTERNAL,     # only outer boundaries
+        cv2.CHAIN_APPROX_NONE  # no approximation → get every pixel
+    )
+
+    # 3. contours is a list of NumPy arrays of shape (N,1,2)
+    #    We’ll flatten each to a list of (x,y) tuples
+    polygons = []
+    for cnt in contours:
+        pts = cnt.reshape(-1, 2)  # shape (N,2)
+        polygons.append([tuple(pt) for pt in pts])
+
+    # If you know there’s only one object, return polygons[0]
+    return polygons
 
 
-def draw_polygon(img_path, out_path, poly_points):
+def draw_polygons(img_path, out_path, polygons):
     img = cv2.imread(img_path)
-    for poly in poly_points:
-        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(img=img, pts=[pts], isClosed=True, color=(255,0,0), thickness=1, )
+    for poly in polygons:
+        pts = np.array(poly, dtype=np.int32, ndmin=2).reshape(-1, 1, 2)
+        cv2.polylines(img=img, pts=[pts], isClosed=True, color=(255,0,0), thickness=1)
     cv2.imwrite(out_path, img)
+
+# -----------------------------
+
+def write_pose_labels_yolo(instances, kpt_order, image_width, image_height, class_idx, out_path):
+    """
+    Write YOLOv8-pose label file from a list of detected-instance keypoint dicts.
+
+    Parameters
+    ----------
+    instances : List[Dict[str, Tuple[ Tuple[float,float], float ]]]
+        Each dict maps keypoint name → ((x, y), confidence).
+    kpt_order : List[str]
+        The exact ordering of keypoint names to write.
+    image_width : int
+        Width of the image.
+    image_height : int
+        Height of the image.
+    class_idx : int
+        The class index for all instances.
+    out_path : str
+        Path to the output .txt file.
+    """
+    lines = []
+    for inst in instances:
+        # 1) compute bbox over only the keypoints present
+        pts = []
+        for ((x, y), _) in inst.values():
+            pts.append((x, y))
+        if pts:
+            xs, ys = zip(*pts)
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            x_ctr = ((xmin + xmax) / 2) / image_width
+            y_ctr = ((ymin + ymax) / 2) / image_height
+            w_box = (xmax - xmin) / image_width
+            h_box = (ymax - ymin) / image_height
+        else:
+            # fallback to full image
+            x_ctr, y_ctr, w_box, h_box = 0.5, 0.5, 1.0, 1.0
+
+        parts = [
+            str(class_idx),
+            f"{x_ctr:.6f}",
+            f"{y_ctr:.6f}",
+            f"{w_box:.6f}",
+            f"{h_box:.6f}"
+        ]
+
+        # 2) append each keypoint in the fixed order
+        for kpt in kpt_order:
+            if kpt in inst:
+                (x, y), _ = inst[kpt]
+                parts.append(f"{x / image_width:.6f}")
+                parts.append(f"{y / image_height:.6f}")
+            else:
+                # missing → zero
+                parts.append("0.000000")
+                parts.append("0.000000")
+
+        lines.append(" ".join(parts))
+
+    # write out
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def write_polygons_to_yolo(polygons, image_width, image_height, out_path):
+    """
+    Write a list of polygons to a YOLOv8 segmentation txt file.
+
+    Parameters
+    ----------
+    polygons : List[List[Tuple[float, float]]]
+        A list of polygons. Each polygon is a list of (x, y) tuples in pixel coords.
+    image_width : int
+        Width of the image the polygons came from.
+    image_height : int
+        Height of the image the polygons came from.
+    out_path : str
+        Path to the output .txt file. Will be overwritten if it exists.
+
+    Output file format (one polygon per line):
+      <instance_id> <x1> <y1> <x2> <y2> ... <xn> <yn>
+    where coordinates are normalized to [0,1] by dividing x by image_width
+    and y by image_height.
+    """
+    lines = []
+    for idx, polygon in enumerate(polygons):
+        # normalize each point and format to three decimal places
+        norm_pts = []
+        for x, y in polygon:
+            x_n = x / image_width
+            y_n = y / image_height
+            norm_pts.append(f"{x_n:.3f}")
+            norm_pts.append(f"{y_n:.3f}")
+        # assemble the line: instance-id followed by all normalized coords
+        line = f"{idx} " + " ".join(norm_pts)
+        lines.append(line)
+
+    # write all lines to the output file
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
 
 
 #---------------------------------------------------------------
@@ -548,11 +710,16 @@ class TimedRender(bpy.types.Operator):
     cancel_render:  bool | None = None
     rendering:      bool | None = None
     render_queue:   list | None = None
-    timer_event = None
-    total: int | None = None
+    timer_event                 = None
+    total:           int | None = None
 
-    OUT_DIR   = "//synthetic_data"
-    ANNOT_DIR = "//synthetic_data" + os.sep + "annot"
+    OUT_DIR_BL   = "//synthetic_data"
+    ANNOT_DIR_BL = "//synthetic_data" + os.sep + "annot"
+    KPT_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_DIR_BL, "labels_keypoints"))
+    MASK_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_DIR_BL, "labels_masks"))
+    for dir in [bpy.path.abspath(ANNOT_DIR_BL), KPT_LABEL_DIR, MASK_LABEL_DIR]:
+        os.makedirs(dir, exist_ok=True)
+
 
 
     def render_init(self, scene, depsgraph):
@@ -560,13 +727,12 @@ class TimedRender(bpy.types.Operator):
         print("RENDER INIT")
     
     def render_complete(self, scene, depsgraph):
-        if not self.render_queue:
+        if self.render_queue == None:
             self.report(
                 {'ERROR_INVALID_INPUT'}, message=f"Render queue is empty!"
             )
             return {'CANCELLED'}
         else:
-            self.render_queue.pop(0)
             self.rendering = False
     
     def render_cancel(self, scene, depsgraph):
@@ -574,12 +740,9 @@ class TimedRender(bpy.types.Operator):
         print("RENDER CANCEL")
 
 
-    def make_filename(self, qitem):
-        return f"{qitem['view']}_{str(qitem['frame']).zfill(4)}" 
-
-    def exists(self, blender_formatted_filepath):
-        filepath = bpy.path.abspath(blender_formatted_filepath)
-        return os.path.exists(filepath)
+    def make_prefix_cam_frame(self, qitem):
+        prefix_for_cam = qitem['view'].split('.')[1]+'_'+qitem['view'].split('.')[0]
+        return f"{str(qitem['frame']).zfill(4)}_{prefix_for_cam}" 
     
 
     def execute(self, context):
@@ -591,20 +754,21 @@ class TimedRender(bpy.types.Operator):
 
 # --- Build render queue ------------------------------------------------------
 
+        modes = ["regular", "binary"] if render_binary else ["regular"]
         for cam in cam_objects:
             for frame_index in range(bpy.context.scene.frame_start,
-                                     bpy.context.scene.frame_end):
-                self.render_queue.append({
-                    "view":  cam.name,
-                    "frame": frame_index,
-                    "mode":  "regular"
-                })
-                # an additional entry for the binary render (used for mask annotation)
-                self.render_queue.append({
-                    "view":  cam.name,
-                    "frame": frame_index,
-                    "mode":  "binary"
-                })
+                                    bpy.context.scene.frame_end+1):
+                for mode in modes: # an additional entry for the binary render (used for mask annotation) appended to the end of the queue
+                    self.render_queue.append({
+                        "view":  cam.name,
+                        "frame": frame_index,
+                        "mode":  mode
+                    })
+
+        # for entry in self.render_queue:
+        #     for key, value in entry.items():
+        #         print(f"{key}: {value}")
+        #     print("\n")
         
         self.total = len(self.render_queue)
         print("number of images to render: "+str(self.total))
@@ -643,12 +807,15 @@ class TimedRender(bpy.types.Operator):
     def modal(self, context, event):
         # cancelling manually via pressing escape
         if event.type == 'ESC':
-            bpy.types.RenderSettings.use_lock_interface = False
+            self.cleanup(context)
             print("CANCELLED")
+            self.report(
+                {'INFO'}, message=f"Cancelled via pressing ESC."
+            )
             return {'CANCELLED'}
         # react to timer event
         elif event.type == 'TIMER':
-            if not self.render_queue:
+            if self.render_queue is None:
                 self.report(
                     {'ERROR_INVALID_INPUT'}, message=f"Render queue is empty!"
                 )
@@ -657,6 +824,10 @@ class TimedRender(bpy.types.Operator):
                 # if cancelled or there are no items left to render, first cleanup and finish, then annotate the last rendered image
                 if len(self.render_queue) == 0 or self.cancel_render == True:
                     self.cleanup(context)
+                    self.report(
+                        {'INFO'}, message=f"Done! Render queue is empty."
+                    )
+                    return {'FINISHED'}
                 # nothing is rendering and there are items in queue
                 elif self.rendering == False:
                     sc = context.scene
@@ -667,71 +838,81 @@ class TimedRender(bpy.types.Operator):
                     #     print("Skipping " + render_filename)
                     
                     #else:
-                    qitem = self.render_queue.pop(0)
+                    qitem       = self.render_queue.pop(0)
                     frame_index = qitem["frame"]
-                    cam_name = qitem["view"]
-                    mode = qitem["mode"]
-                    
-                    render_basename = self.make_filename(qitem)
+                    cam_name    = qitem["view"]
+                    mode        = qitem["mode"]
 
                     # switch camera
                     sc.camera = bpy.data.objects.get(cam_name)
                     if not sc.camera:
                         self.report({'ERROR'}, f"Camera {cam_name} not found!")
                         return {'CANCELLED'}
-
                     # set frame
                     sc.frame_set(frame_index)
-
-                    img_file = os.path.join(self.OUT_DIR, render_basename + ".png")
-
-                    print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {img_file}')
-
                     # render to that exact path
-                    sc.render.filepath = img_file
+                    render_prefix_cam_frame = self.make_prefix_cam_frame(qitem)
+                    render_out_file_path_bl = os.path.join(self.OUT_DIR_BL, render_prefix_cam_frame + ".png")
+                    sc.render.filepath = render_out_file_path_bl
 
-                    if mode == "regular":
-
+                    def reset_render_settings():
                         sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 0)
                         sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 0
                         sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 0
 
+
+                    if mode == "regular":
+                        print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'regular\'')
+
+                        reset_render_settings()
                         bpy.ops.render.render(write_still=True)
 
-                        kpt2coords_cvimg, polygons = calculate_metadata(collection_name, object_name, cam_name)
+                        kpt_2_coords_cvimg = get_projected_keypoint_coords_cv(COLLECTION_NAME, OBJECT_NAME, cam_name)
 
-                        # annotate immediately
-                        # try:
+                        # annotate keypoints
+                        keypoint_annot_out_file_path = os.path.join(
+                            self.KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
+                        )
                         draw_kpts_on_img(
-                            kpt2coords = kpt2coords_cvimg,
-                            img_path   = bpy.path.abspath(img_file),
-                            out_path   = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png"),
+                            kpt2coords = kpt_2_coords_cvimg,
+                            img_path   = bpy.path.abspath(render_out_file_path_bl),
+                            out_path   = keypoint_annot_out_file_path
                         )
-                        draw_lattice_lines(
-                            image_path=os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png"),
-                            output_path=os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_kpt.png")
-                        )
-                        # except Exception as e:
-                    #     self.report({'ERROR'}, f"Annotation failed on {bpy.path.abspath(img_file)}: {e}")
+                        if draw_lattice_for_kpt_annot:
+                            draw_lattice_lines(
+                                image_path  = keypoint_annot_out_file_path,
+                                output_path = keypoint_annot_out_file_path,
+                                middle_thickness = 2
+                            )
+
+                        kpt_label_out_path =  os.path.join(self.KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                        write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH, IMAGE_HEIGHT, 0, kpt_label_out_path)
 
                     elif mode == "binary":
+                        print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'binary\'')
 
                         sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
                         sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
                         sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
 
-                        sc.render.filepath = os.path.join(self.ANNOT_DIR, render_basename + "_annot_poly.png")
+                        render_binary_out_path_bl = os.path.join(
+                            self.MASK_LABEL_DIR, render_prefix_cam_frame + "_annot_poly.png"
+                        )
+                        sc.render.filepath = render_binary_out_path_bl
 
                         bpy.ops.render.render(write_still=True)
 
-                        polygons = get_mask_polygon_from_binary_image(os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_poly.png"))
-
-                        draw_polygon(
-                            poly_points = [polygons],
-                            img_path    = bpy.path.abspath(img_file),
-                            out_path    = os.path.join(bpy.path.abspath(self.ANNOT_DIR), render_basename + "_annot_poly.png"),
+                        polygons = get_mask_polygons_from_binary_image(bpy.path.abspath(render_binary_out_path_bl))
+                        draw_polygons(
+                            polygons = polygons,
+                            img_path = bpy.path.abspath(render_out_file_path_bl),
+                            out_path = bpy.path.abspath(render_binary_out_path_bl)
                         )
+                        
+                        mask_label_out_path =  os.path.join(self.MASK_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                        write_polygons_to_yolo(polygons, IMAGE_WIDTH, IMAGE_HEIGHT, mask_label_out_path)
 
+                        reset_render_settings()
 
 
         return {'PASS_THROUGH'}
@@ -749,30 +930,43 @@ if __name__ == "__main__":
 
     test           = False
     use_cam_matrix = True
+    render_binary  = True
     ortho          = False
 
+    keypoint_visible_threshold_percentage = 0.1
     contour_threshold = 0.1
     alphashape_alpha  = 2.0
+    draw_lattice_for_kpt_annot = False
+
+    SCENE = bpy.context.scene
+    RENDER_SCALE = SCENE.render.resolution_percentage / 100
+    IMAGE_HEIGHT, IMAGE_WIDTH = (
+        SCENE.render.resolution_x * RENDER_SCALE,
+        SCENE.render.resolution_y * RENDER_SCALE,
+    )
+
+    OUT_DIR_BL   = "//synthetic_data"
+    ANNOT_DIR_BL = "//synthetic_data" + os.sep + "annot"
 
     if test:
-        keypoint_list = [
+        KEYPOINT_LIST = [
             'x0', 'y0', 'z0', 'x1', 'y1', 'z1', 'origin'
         ]
-        collection_name = "Test"
-        object_name = "Cube"
+        COLLECTION_NAME = "Test"
+        OBJECT_NAME = "Cube"
 
     else:
-        keypoint_list = [
+        KEYPOINT_LIST = [
             'mouth tip', 'gill',
             'root of pelvic fin','caudal peduncle',
             'middle of caudal fin','lower tip of caudal fin'
         ]
-        collection_name = "Bluegill"
-        object_name = "Body"
+        COLLECTION_NAME = "Bluegill"
+        OBJECT_NAME = "Body"
 
 
-    cam_objects = bpy.data.collections['Cameras'].objects
-    for cam_name in cam_objects.keys():
+    CAM_OBJECTS = bpy.data.collections['Cameras'].objects
+    for cam_name in CAM_OBJECTS.keys():
         cam = bpy.data.objects.get(cam_name)
         cam.data.type = 'ORTHO' if ortho else 'PERSP'
         if ortho:
