@@ -8,45 +8,55 @@ from mathutils import Matrix
 from mathutils import Vector
 
 import numpy as np
-import json
 import cv2
 import alphashape
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+import random
+import shutil
 
 
 #---------------------------------------------------------------
 # Global variables
 #---------------------------------------------------------------
 
-global RENDER_SCALE
-global IMAGE_WIDTH
-global IMAGE_HEIGHT
-global SCENE
-global evaluated_depsgraph
-global CAM_OBJECTS
 
+RENDER_SCALE: float
+IMAGE_WIDTH: int
+IMAGE_HEIGHT: int
+SCENE: bpy.types.Scene
+evaluated_depsgraph: bpy.types.Depsgraph
+CAM_OBJECTS: bpy.types.bpy_prop_collection
 
-global KEYPOINT_LIST
-global COLLECTION_NAME
-global OBJECT_NAME
+KEYPOINT_LIST: list[str]
+COLLECTION_NAME: str
+OBJECT_NAME: str
 
-global OUT_DIR_BL
-global ANNOT_DIR_BL
+RENDER_OUT_DIR_BL: str
+ANNOT_OUT_DIR_BL: str
+KPT_LABEL_DIR: str
+MASK_LABEL_DIR: str
 
-use_cam_matrix:        bool      = True
-render_binary:         bool      = False
-keypoint_visible_threshold_percentage: float = 0.1
-contour_threshold:     float     = 0.01
-alphashape_alpha:      float     = 1.0
-draw_lattice_for_kpt_annot: bool = False
+use_cam_matrix: bool
+render_binary: bool
+
+check_keypoint_visibility: bool
+keypoint_visible_percentage_threshold: float
+draw_every_keypoint_vertex: bool
+contour_threshold_dot_product_threshold: float
+alphashape_alpha: float
+
+test_mode: bool
+use_ortho: bool
+draw_lattice_for_kpt_annot: bool
+create_yolo_datasets: bool
 
 # invert y and z:
-Blender_cam_2_cv_cam = Matrix((
+BLENDER_CAM_2_CV_CAM = Matrix((
     ( 1,  0,  0),  # -> x becomes x
     ( 0, -1,  0),  # -> y becomes negative y
     ( 0,  0, -1))) # -> z becomes negative z
 
-mirror_y = Matrix((
+MIRROR_Y = Matrix((
     ( 1,  0,  0),
     ( 0, -1,  0),
     ( 0,  0,  1)))
@@ -57,40 +67,156 @@ mirror_y = Matrix((
 #---------------------------------------------------------------
 
 
+# BKE_camera_sensor_size
+def get_sensor_size(sensor_fit, sensor_x, sensor_y):
+    if sensor_fit == 'VERTICAL':
+        return sensor_y
+    return sensor_x
+
+
+# BKE_camera_sensor_fit
+def get_sensor_fit(sensor_fit, size_x, size_y):
+    if sensor_fit == 'AUTO':
+        if size_x >= size_y:
+            return 'HORIZONTAL'
+        else:
+            return 'VERTICAL'
+    return sensor_fit
+
+
 def get_calibration_matrix_K_Blendercam2Blenderimage(camd):
     """
     Build intrinsic camera parameters from Blender camera data
 
     See notes on this in 
     blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
+    as well as
+    https://blender.stackexchange.com/a/120063/3581
     """
+    if camd.type != 'PERSP':
+        raise ValueError('Non-perspective cameras not supported')
     f_in_mm = camd.lens
-    scene = bpy.context.scene
-    resolution_x_in_px = scene.render.resolution_x
-    resolution_y_in_px = scene.render.resolution_y
-    scale = scene.render.resolution_percentage / 100
-    sensor_width_in_mm = camd.sensor_width
-    sensor_height_in_mm = camd.sensor_height
-    pixel_aspect_ratio = scene.render.pixel_aspect_x / scene.render.pixel_aspect_y
-    if (camd.sensor_fit == 'VERTICAL'):
-        # the sensor HEIGHT is FIXED (sensor fit is vertical), 
-        # the sensor width is effectively changed with the pixel aspect ratio
-        s_u = resolution_x_in_px * scale / sensor_width_in_mm / pixel_aspect_ratio 
-        s_v = resolution_y_in_px * scale / sensor_height_in_mm
-    else: # 'HORIZONTAL' and 'AUTO'
-        # the sensor WIDTH is FISXED (sensor fit is horizontal), 
-        # the sensor height is effectively changed with the pixel aspect ratio
-        pixel_aspect_ratio = scene.render.pixel_aspect_x / scene.render.pixel_aspect_y
-        s_u = resolution_x_in_px * scale / sensor_width_in_mm
-        s_v = resolution_y_in_px * scale * pixel_aspect_ratio / sensor_height_in_mm
-    
+    resolution_x_in_px = RENDER_SCALE * SCENE.render.resolution_x
+    resolution_y_in_px = RENDER_SCALE * SCENE.render.resolution_y
+    sensor_size_in_mm = get_sensor_size(camd.sensor_fit, camd.sensor_width, camd.sensor_height)
+    sensor_fit = get_sensor_fit(
+        camd.sensor_fit,
+        SCENE.render.pixel_aspect_x * resolution_x_in_px,
+        SCENE.render.pixel_aspect_y * resolution_y_in_px
+    )
+    pixel_aspect_ratio = SCENE.render.pixel_aspect_y / SCENE.render.pixel_aspect_x
+    """
+        sensor fit tells Blender which dimension of your physical sensor should exactly match your output resolution.
+        the other dimension must then be “stretched” to fit, and that stretching is exactly your pixel aspect ratio correction.
+
+        'VERTICAL':
+        the sensor HEIGHT (y) is FIXED (sensor fit is vertical), 
+        the sensor width is effectively changed with the pixel aspect ratio
+
+        s_u = (resolution_x_in_px * RENDER_SCALE * pixel_aspect_ratio) / sensor_width_in_mm
+                        ^ n pixels in width   ^ scaled by pixel aspect ratio      ^ per mm
+
+        e.g. aspect ratio 2:1; 
+        that means our sensor width was shrunk, 
+        i.e. we need the same number of pixels but higher pixel density to get the same resolution.
+        Say we need k pixels on the output resolution width; 
+        that means, after the shrinking, we need those k pixels on half the sensor width.
+        so the number of our pixels on the *full* sensor width gets doubled, 
+        since, after shrinking, we only use half of them.
+        (So we need 2*k pixels on the original sensor width to fill the output resolution.)
+
+        s_v = resolution_y_in_px * RENDER_SCALE / sensor_height_in_mm # ----> pixels in sensor height per mm
+
+        
+        'HORIZONTAL' and 'AUTO':
+        the sensor WIDTH (x) is FIXED (sensor fit is horizontal), 
+        the sensor height is effectively changed with the pixel aspect ratio
+
+        s_u = resolution_x_in_px * RENDER_SCALE / sensor_width_in_mm  # ----> pixels in sensor width per mm
+
+        s_v = (resolution_y_in_px * RENDER_SCALE * 1/pixel_aspect_ratio) / sensor_height_in_mm
+                        ^ n pixels in height   ^ scaled by pixel aspect ratio        ^ per mm
+
+        e.g. aspect ratio 2:1; 
+        that means our sensor height was to be stretched, 
+        i.e. we need the same number of pixels but lower pixel density to get the same resolution.
+        Say we need l pixels on the output resolution height; 
+        that means, after the stretching, we need those l pixels on double the sensor height.
+        so the number of our pixels on the *full* sensor height gets halfed, 
+        since, after stretching, we use twice as many of them.
+        (So we need 0.5*l pixels on the original sensor height to fill the output resolution.)
+    """
+    if sensor_fit == 'HORIZONTAL':
+        view_fac_in_px = resolution_x_in_px
+    else:
+        view_fac_in_px = pixel_aspect_ratio * resolution_y_in_px
+    pixel_size_mm_per_px = sensor_size_in_mm / f_in_mm / view_fac_in_px
+    s_u = 1 / pixel_size_mm_per_px
+    s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
 
     # Parameters of intrinsic calibration matrix K
+    u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
+    v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
+    skew = 0 # only use rectangular pixels
+
+    K = Matrix(
+        ((s_u, skew, u_0),
+        (   0,  s_v, v_0),
+        (   0,    0,   1)))
+    return K
+
+
+def get_calibration_matrix_K_Blendercam2Blenderimage_old(camd):
+    """
+    Build intrinsic camera parameters from Blender camera data
+
+    See notes on this in 
+    blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
+    """
+    f_in_mm             = camd.lens
+    resolution_x_in_px  = SCENE.render.resolution_x
+    resolution_y_in_px  = SCENE.render.resolution_y
+    sensor_width_in_mm  = camd.sensor_width
+    sensor_height_in_mm = camd.sensor_height
+    pixel_aspect_ratio  = SCENE.render.pixel_aspect_x / SCENE.render.pixel_aspect_y # how  
+    # sensor fit tells Blender which dimension of your physical sensor should exactly match your output resolution.
+    # the other dimension must then be “stretched” to fit, and that stretching is exactly your pixel aspect ratio correction.
+    if (camd.sensor_fit == 'VERTICAL'):
+        # the sensor HEIGHT (y) is FIXED (sensor fit is vertical), 
+        # the sensor width is effectively changed with the pixel aspect ratio
+        s_u = (resolution_x_in_px * RENDER_SCALE * pixel_aspect_ratio) / sensor_width_in_mm
+        #                  ^ n pixels in width   ^ scaled by pixel aspect ratio      ^ per mm
+        # e.g. aspect ratio 2:1; 
+        #   that means our sensor width was shrunk, 
+        #   i.e. we need the same number of pixels but higher pixel density to get the same resolution.
+        #   Say we need k pixels on the output resolution width; 
+        #   that means, after the shrinking, we need those k pixels on half the sensor width.
+        #   so the number of our pixels on the *full* sensor width gets doubled, 
+        #   since, after shrinking, we only use half of them.
+        #   (So we need 2*k pixels on the original sensor width to fill the output resolution.)
+        s_v = resolution_y_in_px * RENDER_SCALE / sensor_height_in_mm # ----> pixels in sensor height per mm
+    else: # 'HORIZONTAL' and 'AUTO'
+        # the sensor WIDTH (x) is FIXED (sensor fit is horizontal), 
+        # the sensor height is effectively changed with the pixel aspect ratio
+        s_u = resolution_x_in_px * RENDER_SCALE / sensor_width_in_mm  # ----> pixels in sensor width per mm
+        s_v = (resolution_y_in_px * RENDER_SCALE * 1/pixel_aspect_ratio) / sensor_height_in_mm
+        #                  ^ n pixels in height   ^ scaled by pixel aspect ratio        ^ per mm
+        # e.g. aspect ratio 2:1; 
+        #   that means our sensor height was to be stretched, 
+        #   i.e. we need the same number of pixels but lower pixel density to get the same resolution.
+        #   Say we need l pixels on the output resolution height; 
+        #   that means, after the stretching, we need those l pixels on double the sensor height.
+        #   so the number of our pixels on the *full* sensor height gets halfed, 
+        #   since, after stretching, we use twice as many of them.
+        #   (So we need 0.5*l pixels on the original sensor height to fill the output resolution.)
+
+    # Parameters of intrinsic calibration matrix K
+    # s_u, s_v are 1/(pixel width, height in mm) -> "number of pixels in width/height per mm"
     alpha_u = f_in_mm * s_u
     alpha_v = f_in_mm * s_v
-    u_0 = resolution_x_in_px * scale / 2
-    v_0 = resolution_y_in_px * scale / 2
-    skew = 0 # only use rectangular pixels
+    u_0 = resolution_x_in_px * RENDER_SCALE / 2
+    v_0 = resolution_y_in_px * RENDER_SCALE / 2
+    skew = 0 # only use rectangular (not necessarily square!) pixels
 
     K = Matrix(
         (  (alpha_u,  skew  , u_0),
@@ -119,22 +245,22 @@ def get_3x4_RT_matrix_Blender2Blendercam(cam):
     """
     # Use matrix_world instead to account for all constraints
     location, rotation = cam.matrix_world.decompose()[0:2]
-    R_world2bcam = rotation.to_matrix().transposed()
+    R_world_2_blcam = rotation.to_matrix().transposed()
 
     # Use location from matrix_world to account for constraints:     
-    T_world2bcam = -1*R_world2bcam @ location
+    T_world_2_blcam = -1*R_world_2_blcam @ location
 
     # put into 3x4 matrix
     RT = Matrix((
-        R_world2bcam[0][:] + (T_world2bcam[0],),
-        R_world2bcam[1][:] + (T_world2bcam[1],),
-        R_world2bcam[2][:] + (T_world2bcam[2],)
+        R_world_2_blcam[0][:] + (T_world_2_blcam[0],),
+        R_world_2_blcam[1][:] + (T_world_2_blcam[1],),
+        R_world_2_blcam[2][:] + (T_world_2_blcam[2],)
     ))
 
-    return RT, R_world2bcam, T_world2bcam
+    return RT, R_world_2_blcam, T_world_2_blcam
 
 
-def get_3x4_P_matrix_Blender2Blenderimage(cam):
+def get_3x4_P_matrix_Blendercam2Blenderimage(cam):
     K = get_calibration_matrix_K_Blendercam2Blenderimage(cam.data)
     RT, R, T = get_3x4_RT_matrix_Blender2Blendercam(cam)
     return K@RT, K, R, T, RT
@@ -228,7 +354,7 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
     bm.free()
 
     # build a mapping group-name -> list of vertex indices in that group
-    kpt2idx = {}
+    kpt_2_verts_objco = {}
     for vg in obj_eval.vertex_groups:
         if vg.name in KEYPOINT_LIST:
             # find all vertices in mesh_eval whose group indices include vg.index
@@ -236,10 +362,10 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
                 vi for vi, v in enumerate(mesh_eval.vertices)
                 if any(g.group == vg.index for g in v.groups)
             ]
-            kpt2idx[vg.name] = verts_in_group
+            kpt_2_verts_objco[vg.name] = verts_in_group
 
     # now get their coords in world space:
-    kpt2verts_worldco = {
+    kpt_2_verts_worldco = {
         kpt: [tuple(obj2world @ mesh_eval.vertices[i].co) for i in idx_list]
         for kpt, idx_list in kpt2idx.items()
     }
@@ -248,7 +374,7 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
     # docs: The object owns the mesh data-block. To force free it use to_mesh_clear(). 
     obj_eval.to_mesh_clear()
     
-    return faces, vertices, normals, kpt2verts_worldco
+    return faces, vertices, normals, kpt_2_verts_worldco
 
 
 def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
@@ -260,8 +386,11 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
     occluded_kpts = []
     kpt_2_coord_list_world_visible = {}
     for kpt, coords_list in kpt_2_coord_list_world.items():
-        visible_verts = [v for v in coords_list if not is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(v))]
-        if len(visible_verts)/len(kpt_2_coord_list_world[kpt]) >= keypoint_visible_threshold_percentage:
+        visible_verts = [
+            v for v in coords_list 
+            if ((not is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(v))) if check_keypoint_visibility else True)
+        ]
+        if len(visible_verts)/len(kpt_2_coord_list_world[kpt]) >= keypoint_visible_percentage_threshold:
             kpt_2_coord_list_world_visible[kpt] = visible_verts
         else:
             occluded_kpts.append(kpt)
@@ -270,8 +399,7 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
 
     kpt_2_coords_world = get_avg_kpt_coords_3d(kpt_2_coord_list_world)
 
-
-    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blender2Blenderimage(cam_obj)
+    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj)
     def get_height_dependent_matrices(h):
         Blender2d_origin_to_opencv2d_origin = Matrix((
             ( 1,  0,  0),
@@ -289,9 +417,9 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
             ( 0,  0,  1)))
         
         return Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2
-    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(IMAGE_HEIGHT)
+    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(IMAGE_HEIGHT_PX)
  
-    Blender_world_2_cv_image = K_Blender_cam_2_Blender_image @ Blender_cam_2_cv_cam @ RT_Blender_world_2_Blender_cam
+    Blender_world_2_cv_image = K_Blender_cam_2_Blender_image @ BLENDER_CAM_2_CV_CAM @ RT_Blender_world_2_Blender_cam
 
     kpt_2_coords_camera = {
         kpt: Blender_world_2_cv_image@Vector(coords + (1,)) 
@@ -311,10 +439,23 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
                 len(kpt_2_coord_list_world_visible[kpt]) / len(kpt_2_coord_list_world[kpt])
             )
         for kpt, coords_homog in kpt_2_coords_camera.items()
-        # check if keypoint is in rendered frame
-        if  0 <= (coords_homog.x / coords_homog.z) < IMAGE_WIDTH
-        and 0 <= (coords_homog.y / coords_homog.z) < IMAGE_HEIGHT
+        # # check if keypoint is in rendered frame .... this will weirdly get rid of keypoints!
+        # if  0 <= (coords_homog.x / coords_homog.z) < IMAGE_WIDTH_PX
+        # and 0 <= (coords_homog.y / coords_homog.z) < IMAGE_HEIGHT_PX
     }
+
+    if draw_every_keypoint_vertex:
+        kpt_2_coords_image["vertices"] = []
+        for vertex_list in kpt_2_coord_list_world.values():
+            for vertex in vertex_list:
+                vertex_bl_cam = Blender_world_2_cv_image@Vector(tuple(vertex) + (1,))
+                kpt_2_coords_image["vertices"].append((vertex_bl_cam.x / vertex_bl_cam.z, vertex_bl_cam.y / vertex_bl_cam.z))
+
+    # DEBUGGING
+    # for index, d in enumerate([kpt_2_coord_list_world, kpt_2_coord_list_world_visible, kpt_2_coords_world, kpt_2_coords_camera, kpt_2_coords_image]):
+    #     for kpt in KEYPOINT_LIST:
+    #         if kpt not in d.keys():
+    #             print(f"keypoint {kpt} missing in frame number: {SCENE.frame_current}, \n camera {cam_name}, \n and dict {index}")
 
     return kpt_2_coords_image
 
@@ -384,6 +525,13 @@ def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int 
         cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=(255, 0, 0), lineType=-1)
         cv2.putText(img, f"{int(c*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=(255, 0, 0), thickness=1)
 
+    cv2.imwrite(str(out_path), img)
+
+
+def draw_points_on_img(points, img_path, out_path, annot_radius = 1):
+    img = cv2.imread(str(img_path))
+    for point in points:
+        cv2.circle(img=img, center=(int(point[0]),int(point[1])), radius=annot_radius, color=(255, 255, 255), lineType=-1)
     cv2.imwrite(str(out_path), img)
 
 
@@ -693,10 +841,10 @@ def write_polygons_to_yolo(polygons, image_width, image_height, out_path):
 #---------------------------------------------------------------
 
 
-def render_image_from_active_cam(out_path):
-    bpy.context.scene.render.filepath = out_path
+def render_image_from_active_cam(out_path_bl):
+    bpy.context.scene.render.filepath = out_path_bl
     bpy.ops.render.render(write_still=True)
-    return out_path
+    return out_path_bl
 
 
 class TimedRender(bpy.types.Operator):
@@ -712,14 +860,6 @@ class TimedRender(bpy.types.Operator):
     render_queue:   list | None = None
     timer_event                 = None
     total:           int | None = None
-
-    OUT_DIR_BL   = "//synthetic_data"
-    ANNOT_DIR_BL = "//synthetic_data" + os.sep + "annot"
-    KPT_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_DIR_BL, "labels_keypoints"))
-    MASK_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_DIR_BL, "labels_masks"))
-    for dir in [bpy.path.abspath(ANNOT_DIR_BL), KPT_LABEL_DIR, MASK_LABEL_DIR]:
-        os.makedirs(dir, exist_ok=True)
-
 
 
     def render_init(self, scene, depsgraph):
@@ -742,7 +882,7 @@ class TimedRender(bpy.types.Operator):
 
     def make_prefix_cam_frame(self, qitem):
         prefix_for_cam = qitem['view'].split('.')[1]+'_'+qitem['view'].split('.')[0]
-        return f"{str(qitem['frame']).zfill(4)}_{prefix_for_cam}" 
+        return f"{prefix_for_cam}_{str(qitem['frame']).zfill(4)}" 
     
 
     def execute(self, context):
@@ -821,12 +961,29 @@ class TimedRender(bpy.types.Operator):
                 )
                 return {'CANCELLED'}
             else:
-                # if cancelled or there are no items left to render, first cleanup and finish, then annotate the last rendered image
+                # if cancelled or there are no items left to render, first cleanup and finish, then create the yolo datasets
                 if len(self.render_queue) == 0 or self.cancel_render == True:
                     self.cleanup(context)
                     self.report(
                         {'INFO'}, message=f"Done! Render queue is empty."
                     )
+                    if create_yolo_datasets:
+                        create_yolo_dataset(
+                            imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
+                            label_dir=KPT_LABEL_DIR,
+                            dataset_name="keypoint_dataset_yolo",
+                            train_pct=0.8,
+                            test_pct=0.15,
+                            val_pct=0.05
+                        )
+                        create_yolo_dataset(
+                            imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
+                            label_dir=MASK_LABEL_DIR,
+                            dataset_name="masks_dataset_yolo",
+                            train_pct=0.8,
+                            test_pct=0.15,
+                            val_pct=0.05
+                        )
                     return {'FINISHED'}
                 # nothing is rendering and there are items in queue
                 elif self.rendering == False:
@@ -852,7 +1009,7 @@ class TimedRender(bpy.types.Operator):
                     sc.frame_set(frame_index)
                     # render to that exact path
                     render_prefix_cam_frame = self.make_prefix_cam_frame(qitem)
-                    render_out_file_path_bl = os.path.join(self.OUT_DIR_BL, render_prefix_cam_frame + ".png")
+                    render_out_file_path_bl = os.path.join(RENDER_OUT_DIR_BL, render_prefix_cam_frame + ".png")
                     sc.render.filepath = render_out_file_path_bl
 
                     def reset_render_settings():
@@ -867,12 +1024,16 @@ class TimedRender(bpy.types.Operator):
                         reset_render_settings()
                         bpy.ops.render.render(write_still=True)
 
-                        kpt_2_coords_cvimg = get_projected_keypoint_coords_cv(COLLECTION_NAME, OBJECT_NAME, cam_name)
-
                         # annotate keypoints
                         keypoint_annot_out_file_path = os.path.join(
-                            self.KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
+                            KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
                         )
+
+                        kpt_2_coords_cvimg = get_projected_keypoint_coords_cv(COLLECTION_NAME, OBJECT_NAME, cam_name)
+
+                        if draw_every_keypoint_vertex:
+                            keypoint_vertices = kpt_2_coords_cvimg.pop("vertices")
+
                         draw_kpts_on_img(
                             kpt2coords = kpt_2_coords_cvimg,
                             img_path   = bpy.path.abspath(render_out_file_path_bl),
@@ -884,9 +1045,11 @@ class TimedRender(bpy.types.Operator):
                                 output_path = keypoint_annot_out_file_path,
                                 middle_thickness = 2
                             )
+                        if draw_every_keypoint_vertex:
+                            draw_points_on_img(keypoint_vertices, keypoint_annot_out_file_path, keypoint_annot_out_file_path)
 
-                        kpt_label_out_path =  os.path.join(self.KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
-                        write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH, IMAGE_HEIGHT, 0, kpt_label_out_path)
+                        kpt_label_out_path =  os.path.join(KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                        write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, 0, kpt_label_out_path)
 
                     elif mode == "binary":
                         print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'binary\'')
@@ -896,7 +1059,7 @@ class TimedRender(bpy.types.Operator):
                         sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
 
                         render_binary_out_path_bl = os.path.join(
-                            self.MASK_LABEL_DIR, render_prefix_cam_frame + "_annot_poly.png"
+                            MASK_LABEL_DIR, render_prefix_cam_frame + "_annot_poly.png"
                         )
                         sc.render.filepath = render_binary_out_path_bl
 
@@ -909,13 +1072,136 @@ class TimedRender(bpy.types.Operator):
                             out_path = bpy.path.abspath(render_binary_out_path_bl)
                         )
                         
-                        mask_label_out_path =  os.path.join(self.MASK_LABEL_DIR, render_prefix_cam_frame + ".txt")
-                        write_polygons_to_yolo(polygons, IMAGE_WIDTH, IMAGE_HEIGHT, mask_label_out_path)
+                        mask_label_out_path =  os.path.join(MASK_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                        write_polygons_to_yolo(polygons, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, mask_label_out_path)
 
                         reset_render_settings()
 
 
         return {'PASS_THROUGH'}
+    
+
+#---------------------------------------------------------------
+# Yolo dataset creation
+#---------------------------------------------------------------
+
+
+def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, val_pct):  
+    # Validate percentages and sum
+    if not (0 <= train_pct <= 1 and 0 <= test_pct <= 1 and 0 <= val_pct <= 1):
+        raise ValueError("Percentages must be between 0 and 1.")
+    if abs((train_pct + test_pct + val_pct) - 1.0) > 1e-6:
+        raise ValueError("Percentages must be between 0 and 1.")
+    if not os.path.isdir(imgs_dir):
+        raise FileNotFoundError(f"{imgs_dir} is not a valid directory.")
+    if not os.path.isdir(label_dir):
+        raise FileNotFoundError(f"{label_dir} is not a valid directory.")
+    
+    # Create new directory structure inside the base directory.
+    create_directory_structure(imgs_dir, dataset_name)
+
+    dataset_dir = os.path.join(imgs_dir, dataset_name)
+    
+    # Split label files into subsets.
+    train_labels, test_labels, val_labels, subsets = split_labels(label_dir, train_pct, test_pct, val_pct)
+    total_labels = len(train_labels) + len(test_labels) + len(val_labels)
+    print(f"Total label files: {total_labels}")
+    print(f"Train: {len(train_labels)}, Test: {len(test_labels)}, Val: {len(val_labels)}")
+    
+    # Move label files into their new folders.
+    move_label_files(label_dir, dataset_dir, train_labels, test_labels, val_labels)
+    
+    # Process images based on corresponding label assignments.
+    process_images(imgs_dir, subsets, dataset_name)
+
+
+def create_directory_structure(imgs_dir, dataset_name):
+    """
+    Create the directory structure:
+      imgs_dir/
+         dataset_name/
+            images/train, images/test, images/val
+            labels/train, labels/test, labels/val
+    """
+    os.makedirs(os.path.join(imgs_dir, dataset_name), exist_ok=True)
+    for folder in ["images", "labels"]:
+        for subset in ["train", "test", "val"]:
+            dir_path = os.path.join(imgs_dir, dataset_name, folder, subset)
+            os.makedirs(dir_path, exist_ok=True)
+
+
+def split_labels(label_dir, train_pct, test_pct, val_pct):
+    """
+    Finds all .txt label files in the label directory (ignoring subdirectories),
+    shuffles them, and splits them into train, test, and val groups according to the given percentages.
+    Returns three lists of filenames and a dictionary mapping subset names to the set of basenames.
+    """
+    # Only consider files in the base directory (not in subdirectories)
+    all_files = os.listdir(label_dir)
+    label_files = [f for f in all_files 
+                   if os.path.isfile(os.path.join(label_dir, f)) and f.lower().endswith('.txt')]
+    
+    random.shuffle(label_files)
+    total = len(label_files)
+    num_train = int(total * train_pct)
+    num_test = int(total * test_pct)
+    num_val = total - num_train - num_test  # remainder
+
+    train_labels = label_files[:num_train]
+    test_labels = label_files[num_train:num_train+num_test]
+    val_labels = label_files[num_train+num_test:]
+    
+    subsets = {
+        'train': set(os.path.splitext(f)[0] for f in train_labels),
+        'test': set(os.path.splitext(f)[0] for f in test_labels),
+        'val': set(os.path.splitext(f)[0] for f in val_labels),
+    }
+    
+    return train_labels, test_labels, val_labels, subsets
+
+
+def move_label_files(label_dir, dataset_dir, train_labels, test_labels, val_labels):
+    """
+    Moves the given label files from the base directory to imgs_dir/dataset/labels/<subset>.
+    """
+    for subset, file_list in zip(["train", "test", "val"], [train_labels, test_labels, val_labels]):
+        for filename in file_list:
+            src = os.path.join(label_dir, filename)
+            dst = os.path.join(dataset_dir, "labels", subset, filename)
+            shutil.move(src, dst)
+            print(f"Moved label file {filename} to labels/{subset}")
+
+
+def process_images(imgs_dir, subsets, dataset_name):
+    """
+    From the base directory, find all imagge files (ignoring subdirectories).
+    For each image, determine its corresponding subset by matching its basename against the label subsets.
+    If a match is found, move the image to imgs_dir/dataset/images/<subset>; otherwise, remove the image.
+    """
+    all_files = os.listdir(imgs_dir)
+    image_files = [f for f in all_files 
+                   if os.path.isfile(os.path.join(imgs_dir, f)) and 
+                   (f.lower().endswith('.jpg') or f.lower().endswith('.jpeg') or f.lower().endswith('.png'))]
+    
+    for img in image_files:
+        basename, _ = os.path.splitext(img)
+        dest_subset = None
+        if basename in subsets['train']:
+            dest_subset = "train"
+        elif basename in subsets['test']:
+            dest_subset = "test"
+        elif basename in subsets['val']:
+            dest_subset = "val"
+        
+        src = os.path.join(imgs_dir, img)
+        if dest_subset:
+            dst_dir = os.path.join(imgs_dir, dataset_name, "images", dest_subset)
+            dst = os.path.join(dst_dir, img)
+            shutil.copy2(src, dst)
+            print(f"Moved image {img} to images/{dest_subset}")
+        else:
+            os.remove(src)
+            print(f"Removed image {img} (no matching label file found)")
 
 
 #---------------------------------------------------------------
@@ -928,27 +1214,35 @@ def unregister_timed_render():
 
 if __name__ == "__main__":
 
-    test           = False
+    test_mode      = False
     use_cam_matrix = True
     render_binary  = True
-    ortho          = False
+    use_ortho      = False
 
-    keypoint_visible_threshold_percentage = 0.1
-    contour_threshold = 0.1
+    check_keypoint_visibility = True
+    keypoint_visible_percentage_threshold = 0.1
+    draw_every_keypoint_vertex = False
+    contour_threshold_dot_product_threshold = 0.1
     alphashape_alpha  = 2.0
     draw_lattice_for_kpt_annot = False
+    create_yolo_datasets = True
 
     SCENE = bpy.context.scene
     RENDER_SCALE = SCENE.render.resolution_percentage / 100
-    IMAGE_HEIGHT, IMAGE_WIDTH = (
+    IMAGE_HEIGHT_PX, IMAGE_WIDTH_PX = (
         SCENE.render.resolution_x * RENDER_SCALE,
         SCENE.render.resolution_y * RENDER_SCALE,
     )
 
-    OUT_DIR_BL   = "//synthetic_data"
-    ANNOT_DIR_BL = "//synthetic_data" + os.sep + "annot"
+    RENDER_OUT_DIR_BL   = "//synthetic_data"
+    ANNOT_OUT_DIR_BL = "//synthetic_data" + os.sep + "annot"
+    KPT_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_OUT_DIR_BL, "labels_keypoints"))
+    MASK_LABEL_DIR = bpy.path.abspath(os.path.join(ANNOT_OUT_DIR_BL, "labels_masks"))
 
-    if test:
+    for dir in [bpy.path.abspath(ANNOT_OUT_DIR_BL), KPT_LABEL_DIR, MASK_LABEL_DIR]:
+        os.makedirs(dir, exist_ok=True)
+
+    if test_mode:
         KEYPOINT_LIST = [
             'x0', 'y0', 'z0', 'x1', 'y1', 'z1', 'origin'
         ]
@@ -968,8 +1262,8 @@ if __name__ == "__main__":
     CAM_OBJECTS = bpy.data.collections['Cameras'].objects
     for cam_name in CAM_OBJECTS.keys():
         cam = bpy.data.objects.get(cam_name)
-        cam.data.type = 'ORTHO' if ortho else 'PERSP'
-        if ortho:
+        cam.data.type = 'ORTHO' if use_ortho else 'PERSP'
+        if use_ortho:
             cam.data.ortho_scale = 30
 
 
