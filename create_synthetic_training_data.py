@@ -367,7 +367,7 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
     # now get their coords in world space:
     kpt_2_verts_worldco = {
         kpt: [tuple(obj2world @ mesh_eval.vertices[i].co) for i in idx_list]
-        for kpt, idx_list in kpt2idx.items()
+        for kpt, idx_list in kpt_2_verts_objco.items()
     }
 
     bm.free()
