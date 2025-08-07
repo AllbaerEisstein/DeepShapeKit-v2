@@ -1,5 +1,7 @@
 import os
 import math
+import json
+from collections import defaultdict
 
 import bpy
 import bmesh
@@ -36,12 +38,15 @@ ANNOT_OUT_DIR_BL: str
 KPT_LABEL_DIR: str
 MASK_LABEL_DIR: str
 
+cam_name_2_matrix: dict
+
 use_cam_matrix: bool
 render_binary: bool
 
 check_keypoint_visibility: bool
-keypoint_visible_percentage_threshold: float
+KEYPOINT_VISIBLE_THRESHOLD: float
 draw_every_keypoint_vertex: bool
+draw_every_keypoint_face: bool
 contour_threshold_dot_product_threshold: float
 alphashape_alpha: float
 
@@ -248,13 +253,14 @@ def get_3x4_RT_matrix_Blender2Blendercam(cam):
     R_world_2_blcam = rotation.to_matrix().transposed()
 
     # Use location from matrix_world to account for constraints:     
-    T_world_2_blcam = -1*R_world_2_blcam @ location
+    loc_world_2_blcam = -1*R_world_2_blcam @ location
+    T_world_2_blcam = Matrix.Translation(tuple(loc_world_2_blcam))
 
     # put into 3x4 matrix
     RT = Matrix((
-        R_world_2_blcam[0][:] + (T_world_2_blcam[0],),
-        R_world_2_blcam[1][:] + (T_world_2_blcam[1],),
-        R_world_2_blcam[2][:] + (T_world_2_blcam[2],)
+        R_world_2_blcam[0][:] + (loc_world_2_blcam[0],),
+        R_world_2_blcam[1][:] + (loc_world_2_blcam[1],),
+        R_world_2_blcam[2][:] + (loc_world_2_blcam[2],)
     ))
 
     return RT, R_world_2_blcam, T_world_2_blcam
@@ -348,8 +354,22 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
     bm = bmesh.new()
     bm.from_mesh(mesh_eval)
 
-    faces    = [[tuple(v.co) for v in f.verts]   for f in bm.faces]
-    vertices = [tuple(v.co)                      for v in bm.verts]
+    faces = []
+    for poly in mesh_eval.polygons:
+        face_data = {
+            "id":   poly.index,
+            "area": poly.area,
+            "verts": [vid for vid in poly.vertices]
+        }
+        faces.append(face_data)
+
+    vertices = [
+        {
+            "id": v.index,
+            "co": tuple(v.co)
+        }
+        for v in mesh_eval.vertices
+    ]
     normals  = [(tuple(v.co), tuple(v.normal))   for v in bm.verts]
     bm.free()
 
@@ -366,77 +386,87 @@ def get_deformed_mesh_data(deps, collection_name, object_name):
 
     # now get their coords in world space:
     kpt_2_verts_worldco = {
-        kpt: [tuple(obj2world @ mesh_eval.vertices[i].co) for i in idx_list]
+        kpt: [{
+                "id": i, "co": tuple(obj2world @ mesh_eval.vertices[i].co)
+            } for i in idx_list
+        ]
         for kpt, idx_list in kpt_2_verts_objco.items()
     }
+
+    # Keypoint → world-space faces (strictly associated)
+    kpt_2_faces_worldco = {}
+    for kpt, idx_list in kpt_2_verts_objco.items():
+        verts_set = set(idx_list)
+        face_list = []
+        for face in faces:
+            # strict: all face verts must be in the keypoint's vertices
+            if set(face["verts"]).issubset(verts_set):
+                # build list of world‐space coords for this face
+                coords = [
+                    tuple(obj2world @ mesh_eval.vertices[i].co)
+                    for i in face["verts"]
+                ]
+                face_list.append({"coords": coords, "area": face["area"]})
+        kpt_2_faces_worldco[kpt] = face_list
 
     bm.free()
     # docs: The object owns the mesh data-block. To force free it use to_mesh_clear(). 
     obj_eval.to_mesh_clear()
     
-    return faces, vertices, normals, kpt_2_verts_worldco
+    return faces, vertices, normals, kpt_2_verts_worldco, kpt_2_faces_worldco
 
 
 def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
     evaluated_depsgraph = bpy.context.evaluated_depsgraph_get()
     cam_obj = bpy.data.objects.get(cam_name)
 
-    faces, vertices, normals, kpt_2_coord_list_world = get_deformed_mesh_data(evaluated_depsgraph, collection_name, object_name)
+    faces, vertices, normals, kpt_2_verts_list_world, kpt_2_faces_list_world = get_deformed_mesh_data(evaluated_depsgraph, collection_name, object_name)
 
-    occluded_kpts = []
-    kpt_2_coord_list_world_visible = {}
-    for kpt, coords_list in kpt_2_coord_list_world.items():
-        visible_verts = [
-            v for v in coords_list 
-            if ((not is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(v))) if check_keypoint_visibility else True)
-        ]
-        if len(visible_verts)/len(kpt_2_coord_list_world[kpt]) >= keypoint_visible_percentage_threshold:
-            kpt_2_coord_list_world_visible[kpt] = visible_verts
-        else:
-            occluded_kpts.append(kpt)
-    for kpt in occluded_kpts:
-        kpt_2_coord_list_world.pop(kpt)
 
-    kpt_2_coords_world = get_avg_kpt_coords_3d(kpt_2_coord_list_world)
+    kpt_2_visibility_percentage, kpt_2_visible_faces_coords_world = (
+        get_keypoint_visibility_from_faces(evaluated_depsgraph, kpt_2_faces_list_world, cam_obj) 
+        if check_keypoint_visibility 
+        else ({kpt: 1.0 for kpt in kpt_2_verts_list_world.keys()}, kpt_2_faces_list_world)
+    )
 
-    KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj)
-    def get_height_dependent_matrices(h):
-        Blender2d_origin_to_opencv2d_origin = Matrix((
-            ( 1,  0,  0),
-            ( 0, -1,  h),  # -> y, after mirroring, is still at y, but the origin got shifted by +h and the direction go changed, so it needs to be translated to h - y
-            ( 0,  0,  1)))
-        
-        translate_by_hdiv2 = Matrix((
-            ( 1,  0,  0),
-            ( 0,  1, h/2),
-            ( 0,  0,  1)))
+    # keep keypoint if visible_area/total_area ≥ threshold
+    kpt_2_coords_list_world_visible = {
+        kpt: list(set([
+            point 
+            for poly in kpt_2_visible_faces_coords_world[kpt] 
+            for point in poly
+        ]))
+        for kpt, vis in kpt_2_visibility_percentage.items() 
+        if vis >= KEYPOINT_VISIBLE_THRESHOLD
+    }
 
-        translate_by_neghdiv2 = Matrix((
-            ( 1,  0,  0),
-            ( 0,  1, -h/2),
-            ( 0,  0,  1)))
-        
-        return Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2
-    Blender2d_origin_to_opencv2d_origin, translate_by_hdiv2, translate_by_neghdiv2 = get_height_dependent_matrices(IMAGE_HEIGHT_PX)
- 
-    Blender_world_2_cv_image = K_Blender_cam_2_Blender_image @ BLENDER_CAM_2_CV_CAM @ RT_Blender_world_2_Blender_cam
+    kpt_2_coord_world = get_avg_kpt_coords_3d(kpt_2_coords_list_world_visible)
+
+    if not cam_name_2_matrix[cam_name]:
+        KRT_Blender_world_2_Blender_image, K_Blender_cam_2_Blender_image, R, T, RT_Blender_world_2_Blender_cam = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj)
+        cam_name_2_matrix[cam_name]['K'] = K_Blender_cam_2_Blender_image
+        cam_name_2_matrix[cam_name]['R'] = R
+        cam_name_2_matrix[cam_name]['T'] = T
+        cam_name_2_matrix[cam_name]['P'] = K_Blender_cam_2_Blender_image @ BLENDER_CAM_2_CV_CAM @ RT_Blender_world_2_Blender_cam
+    
+    P_Blender_world_2_cv_image = cam_name_2_matrix[cam_name]['P']
 
     kpt_2_coords_camera = {
-        kpt: Blender_world_2_cv_image@Vector(coords + (1,)) 
+        kpt: P_Blender_world_2_cv_image@Vector(coords + (1,)) 
             if use_cam_matrix 
             else project_by_object_utils(cam_obj, Vector(coords))
-        for kpt, coords in kpt_2_coords_world.items()
+        for kpt, coords in kpt_2_coord_world.items()
     }
 
     kpt_2_coords_image = {
         kpt: (
                 (coords_homog.x / coords_homog.z, coords_homog.y / coords_homog.z), # cv image coords
-                len(kpt_2_coord_list_world_visible[kpt]) / len(kpt_2_coord_list_world[kpt]) # "confidence" (percentage of vertices of this keypoint visible)
+                kpt_2_visibility_percentage[kpt] # "confidence" (percentage of area of this keypoint visible)
             ) # ((x,y),c) in the end
             if use_cam_matrix
             else (
                 (coords_homog.x, coords_homog.y),
-                len(kpt_2_coord_list_world_visible[kpt]) / len(kpt_2_coord_list_world[kpt])
+                kpt_2_visibility_percentage[kpt]
             )
         for kpt, coords_homog in kpt_2_coords_camera.items()
         # # check if keypoint is in rendered frame .... this will weirdly get rid of keypoints!
@@ -446,10 +476,23 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
 
     if draw_every_keypoint_vertex:
         kpt_2_coords_image["vertices"] = []
-        for vertex_list in kpt_2_coord_list_world.values():
+        for vertex_list in kpt_2_verts_list_world.values():
             for vertex in vertex_list:
-                vertex_bl_cam = Blender_world_2_cv_image@Vector(tuple(vertex) + (1,))
-                kpt_2_coords_image["vertices"].append((vertex_bl_cam.x / vertex_bl_cam.z, vertex_bl_cam.y / vertex_bl_cam.z))
+                if (is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(vertex)) if check_keypoint_visibility else True):
+                    vertex_bl_cam = P_Blender_world_2_cv_image@Vector(tuple(vertex) + (1,))
+                    kpt_2_coords_image["vertices"].append((vertex_bl_cam.x / vertex_bl_cam.z, vertex_bl_cam.y / vertex_bl_cam.z))
+    
+    if draw_every_keypoint_face:
+        kpt_2_coords_image["faces"] = []
+        for face_list in kpt_2_visible_faces_coords_world.values():
+            for face in face_list:
+                projected_face = []
+                for vertex_world in face:
+                    ph = P_Blender_world_2_cv_image @ Vector((*vertex_world, 1))
+                    u = ph.x / ph.z
+                    v = ph.y / ph.z
+                    projected_face.append((u, v))
+                kpt_2_coords_image["faces"].append(projected_face)
 
     # DEBUGGING
     # for index, d in enumerate([kpt_2_coord_list_world, kpt_2_coord_list_world_visible, kpt_2_coords_world, kpt_2_coords_camera, kpt_2_coords_image]):
@@ -475,6 +518,50 @@ def get_avg_kpt_coords_3d(kpt2verts_co:dict):
         mean_xyz = arr.mean(axis=0)              # shape (3,)
         kpt2coords[kpt] = tuple(mean_xyz.tolist())
     return kpt2coords
+
+
+def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
+    """
+    For each keypoint, kpt_2_faces_worldco[kpt] is a list of faces,
+    each face is a list of world-space (x,y,z) tuples.
+
+    Returns:
+      - kpt_2_visibility_pct: { kpt: visible_area/total_area }
+      - kpt_2_visible_faces: { kpt: [ face_coords, … ] } for faces fully visible
+    """
+
+    kpt_2_visibility_pct = {}
+    kpt_2_visible_faces  = defaultdict(list)
+
+    for kpt, face_list in kpt_2_faces_worldco.items():
+        total_area   = 0.0
+        visible_area = 0.0
+
+        for face in face_list:
+            face_coords = face["coords"]
+            # 1) compute this face's area
+            #area = _polygon_area_3d(face_coords)
+            area = face["area"]
+            total_area += area
+
+            # 2) test all vertices for visibility
+            all_visible = False
+            for coord in face_coords:
+                if not is_vertex_occluded(deps, cam_obj, Vector(coord)):
+                    all_visible = True
+                    break
+
+            if all_visible:
+                visible_area += area
+                kpt_2_visible_faces[kpt].append(face_coords)
+
+        if total_area > 0:
+            kpt_2_visibility_pct[kpt] = visible_area / total_area
+        else:
+            # keypoint has no associated faces
+            kpt_2_visibility_pct[kpt] = 0.0
+
+    return kpt_2_visibility_pct, kpt_2_visible_faces
 
 
 def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-5):
@@ -505,6 +592,22 @@ def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-5):
 
     # occluded if something is strictly *before* the target point
     return dist_hit < (dist_to_pt - eps)
+
+
+def _polygon_area_3d(coords: list[tuple[float,float,float]]) -> float:
+    """
+    Compute area of a planar polygon in 3D by triangulation fan.
+    Assumes polygon is convex and vertices ordered.
+    """
+    if len(coords) < 3:
+        return 0.0
+    area = 0.0
+    v0 = Vector(coords[0])
+    for i in range(1, len(coords)-1):
+        v1 = Vector(coords[i])   - v0
+        v2 = Vector(coords[i+1]) - v0
+        area += v1.cross(v2).length / 2.0
+    return area
 
 
 def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int = 1):
@@ -726,11 +829,11 @@ def get_mask_polygons_from_binary_image(img_path):
     return polygons
 
 
-def draw_polygons(img_path, out_path, polygons):
+def draw_polygons(img_path, out_path, polygons, color=(255,255,255)):
     img = cv2.imread(img_path)
     for poly in polygons:
         pts = np.array(poly, dtype=np.int32, ndmin=2).reshape(-1, 1, 2)
-        cv2.polylines(img=img, pts=[pts], isClosed=True, color=(255,0,0), thickness=1)
+        cv2.polylines(img=img, pts=[pts], isClosed=True, color=color, thickness=1)
     cv2.imwrite(out_path, img)
 
 # -----------------------------
@@ -984,6 +1087,14 @@ class TimedRender(bpy.types.Operator):
                             test_pct=0.15,
                             val_pct=0.05
                         )
+                        for cam_name in CAM_OBJECTS.keys():
+                            cam_name_2_matrix[cam_name]['K'] = [list(row) for row in cam_name_2_matrix[cam_name]['K']]
+                            cam_name_2_matrix[cam_name]['R'] = [list(row) for row in cam_name_2_matrix[cam_name]['R']]
+                            cam_name_2_matrix[cam_name]['T'] = [list(row) for row in cam_name_2_matrix[cam_name]['T']]
+                            cam_name_2_matrix[cam_name]['P'] = [list(row) for row in cam_name_2_matrix[cam_name]['P']]
+                            cam_name_2_matrix[cam_name]['view_prefix'] = cam_name.split('.')[1]+'_'+cam_name.split('.')[0]
+                        with open(os.path.join(bpy.path.abspath(ANNOT_OUT_DIR_BL), 'cam_matrices.json'),'wt') as f:
+                            json.dump(cam_name_2_matrix, f, indent=4)
                     return {'FINISHED'}
                 # nothing is rendering and there are items in queue
                 elif self.rendering == False:
@@ -1033,6 +1144,8 @@ class TimedRender(bpy.types.Operator):
 
                         if draw_every_keypoint_vertex:
                             keypoint_vertices = kpt_2_coords_cvimg.pop("vertices")
+                        if draw_every_keypoint_face:
+                            keypoint_faces = kpt_2_coords_cvimg.pop("faces")
 
                         draw_kpts_on_img(
                             kpt2coords = kpt_2_coords_cvimg,
@@ -1047,6 +1160,8 @@ class TimedRender(bpy.types.Operator):
                             )
                         if draw_every_keypoint_vertex:
                             draw_points_on_img(keypoint_vertices, keypoint_annot_out_file_path, keypoint_annot_out_file_path)
+                        if draw_every_keypoint_face:
+                            draw_polygons(keypoint_annot_out_file_path, keypoint_annot_out_file_path, keypoint_faces)
 
                         kpt_label_out_path =  os.path.join(KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
                         write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, 0, kpt_label_out_path)
@@ -1096,6 +1211,8 @@ def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, 
         raise FileNotFoundError(f"{imgs_dir} is not a valid directory.")
     if not os.path.isdir(label_dir):
         raise FileNotFoundError(f"{label_dir} is not a valid directory.")
+    
+    dataset_name = get_available_dir_name(imgs_dir, dataset_name)
     
     # Create new directory structure inside the base directory.
     create_directory_structure(imgs_dir, dataset_name)
@@ -1203,6 +1320,20 @@ def process_images(imgs_dir, subsets, dataset_name):
             os.remove(src)
             print(f"Removed image {img} (no matching label file found)")
 
+#------------------------------
+
+def get_available_dir_name(imgs_dir, base_name):
+    """
+    Returns a unique dataset name by adding a numeric suffix if necessary.
+    E.g., if 'base_name' exists, it returns 'base_name_01', 'base_name_02', etc.
+    """
+    candidate = base_name
+    counter = 1
+    while os.path.exists(os.path.join(imgs_dir, candidate)):
+        candidate = f"{base_name}_{counter:02d}"
+        counter += 1
+    return candidate
+
 
 #---------------------------------------------------------------
 # Execution context
@@ -1220,8 +1351,9 @@ if __name__ == "__main__":
     use_ortho      = False
 
     check_keypoint_visibility = True
-    keypoint_visible_percentage_threshold = 0.1
+    KEYPOINT_VISIBLE_THRESHOLD = 0.1
     draw_every_keypoint_vertex = False
+    draw_every_keypoint_face = True
     contour_threshold_dot_product_threshold = 0.1
     alphashape_alpha  = 2.0
     draw_lattice_for_kpt_annot = False
@@ -1266,6 +1398,7 @@ if __name__ == "__main__":
         if use_ortho:
             cam.data.ortho_scale = 30
 
+    cam_name_2_matrix = {cam_name: defaultdict() for cam_name in CAM_OBJECTS.keys()}
 
     bpy.utils.register_class(TimedRender)
     bpy.ops.render.timed_render()
