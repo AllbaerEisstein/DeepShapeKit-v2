@@ -1076,7 +1076,8 @@ class TimedRender(bpy.types.Operator):
                             dataset_name="keypoint_dataset_yolo",
                             train_pct=0.8,
                             test_pct=0.15,
-                            val_pct=0.05
+                            val_pct=0.05,
+                            class_list=["fish"]
                         )
                         create_yolo_dataset(
                             imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
@@ -1084,7 +1085,9 @@ class TimedRender(bpy.types.Operator):
                             dataset_name="masks_dataset_yolo",
                             train_pct=0.8,
                             test_pct=0.15,
-                            val_pct=0.05
+                            val_pct=0.05,
+                            class_list=["fish"],
+                            kpt_list=KEYPOINT_LIST
                         )
                         for cam_name in CAM_OBJECTS.keys():
                             cam_name_2_matrix[cam_name]['K'] = [list(row) for row in cam_name_2_matrix[cam_name]['K']]
@@ -1135,6 +1138,7 @@ class TimedRender(bpy.types.Operator):
                         bpy.ops.render.render(write_still=True)
 
                         # annotate keypoints
+                        keypoint_annot_source_file_path = bpy.path.abspath(render_out_file_path_bl)
                         keypoint_annot_out_file_path = os.path.join(
                             KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
                         )
@@ -1143,12 +1147,17 @@ class TimedRender(bpy.types.Operator):
 
                         if draw_every_keypoint_vertex:
                             keypoint_vertices = kpt_2_coords_cvimg.pop("vertices")
+                            draw_points_on_img(keypoint_vertices, keypoint_annot_source_file_path, keypoint_annot_out_file_path)
+                            keypoint_annot_source_file_path = keypoint_annot_out_file_path
+
                         if draw_every_keypoint_face:
                             keypoint_faces = kpt_2_coords_cvimg.pop("faces")
+                            draw_polygons(keypoint_annot_source_file_path, keypoint_annot_out_file_path, keypoint_faces)
+                            keypoint_annot_source_file_path = keypoint_annot_out_file_path
 
                         draw_kpts_on_img(
                             kpt2coords = kpt_2_coords_cvimg,
-                            img_path   = bpy.path.abspath(render_out_file_path_bl),
+                            img_path   = keypoint_annot_source_file_path,
                             out_path   = keypoint_annot_out_file_path
                         )
                         if draw_lattice_for_kpt_annot:
@@ -1156,11 +1165,7 @@ class TimedRender(bpy.types.Operator):
                                 image_path  = keypoint_annot_out_file_path,
                                 output_path = keypoint_annot_out_file_path,
                                 middle_thickness = 2
-                            )
-                        if draw_every_keypoint_vertex:
-                            draw_points_on_img(keypoint_vertices, keypoint_annot_out_file_path, keypoint_annot_out_file_path)
-                        if draw_every_keypoint_face:
-                            draw_polygons(keypoint_annot_out_file_path, keypoint_annot_out_file_path, keypoint_faces)
+                            )                            
 
                         kpt_label_out_path =  os.path.join(KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
                         write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, 0, kpt_label_out_path)
@@ -1200,7 +1205,7 @@ class TimedRender(bpy.types.Operator):
 #---------------------------------------------------------------
 
 
-def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, val_pct):  
+def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, val_pct, class_list, kpt_list=None):  
     # Validate percentages and sum
     if not (0 <= train_pct <= 1 and 0 <= test_pct <= 1 and 0 <= val_pct <= 1):
         raise ValueError("Percentages must be between 0 and 1.")
@@ -1229,6 +1234,8 @@ def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, 
     
     # Process images based on corresponding label assignments.
     process_images(imgs_dir, subsets, dataset_name)
+
+    create_dataset_yaml(class_list, dataset_dir, kpt_list)
 
 
 def create_directory_structure(imgs_dir, dataset_name):
@@ -1319,6 +1326,36 @@ def process_images(imgs_dir, subsets, dataset_name):
             os.remove(src)
             print(f"Removed image {img} (no matching label file found)")
 
+
+def create_dataset_yaml(class_list, dataset_path, kpt_list=None):
+    # Build the lines of the YAML file
+    lines = [
+        "train: images/train",
+        "val:   images/val",
+        "test:  images/test",
+    ]
+
+    if kpt_list is not None:
+        lines.append(f"kpt_shape: [{len(kpt_list)}, 3]")
+        lines.append(f"flip_idx: {list(range(len(kpt_list)))}")
+
+    lines.append("names:")
+    for idx, name in enumerate(class_list):
+        lines.append(f"  {idx}: {name}")
+
+    # Join with newlines
+    content = "\n".join(lines) + "\n"
+
+    # Ensure output directory exists
+    os.makedirs(dataset_path, exist_ok=True)
+    yaml_path = os.path.join(dataset_path, os.path.basename(dataset_path)+".yaml")
+
+    # Write out
+    with open(yaml_path, "w") as f:
+        f.write(content)
+
+    print(f"✔️  Wrote YAML to {yaml_path}")
+
 #------------------------------
 
 def get_available_dir_name(imgs_dir, base_name):
@@ -1365,7 +1402,7 @@ if __name__ == "__main__":
         SCENE.render.resolution_y * RENDER_SCALE,
     )
 
-    EVENT_TIMER_INTERVAL = 0.1
+    EVENT_TIMER_INTERVAL = 0.35
 
     RENDER_OUT_DIR_BL   = "//synthetic_data"
     ANNOT_OUT_DIR_BL = "//synthetic_data" + os.sep + "annot"
