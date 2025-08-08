@@ -33,6 +33,7 @@ KEYPOINT_LIST: list[str]
 COLLECTION_NAME: str
 OBJECT_NAME: str
 
+EVENT_TIMER_INTERVAL: float
 RENDER_OUT_DIR_BL: str
 ANNOT_OUT_DIR_BL: str
 KPT_LABEL_DIR: str
@@ -478,8 +479,8 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
         kpt_2_coords_image["vertices"] = []
         for vertex_list in kpt_2_verts_list_world.values():
             for vertex in vertex_list:
-                if (is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(vertex)) if check_keypoint_visibility else True):
-                    vertex_bl_cam = P_Blender_world_2_cv_image@Vector(tuple(vertex) + (1,))
+                if (not is_vertex_occluded(evaluated_depsgraph, cam_obj, Vector(vertex["co"])) if check_keypoint_visibility else True):
+                    vertex_bl_cam = P_Blender_world_2_cv_image@Vector(tuple(vertex["co"]) + (1,))
                     kpt_2_coords_image["vertices"].append((vertex_bl_cam.x / vertex_bl_cam.z, vertex_bl_cam.y / vertex_bl_cam.z))
     
     if draw_every_keypoint_face:
@@ -489,9 +490,7 @@ def get_projected_keypoint_coords_cv(collection_name, object_name, cam_name):
                 projected_face = []
                 for vertex_world in face:
                     ph = P_Blender_world_2_cv_image @ Vector((*vertex_world, 1))
-                    u = ph.x / ph.z
-                    v = ph.y / ph.z
-                    projected_face.append((u, v))
+                    projected_face.append((ph.x / ph.z, ph.y / ph.z))
                 kpt_2_coords_image["faces"].append(projected_face)
 
     # DEBUGGING
@@ -564,7 +563,7 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
     return kpt_2_visibility_pct, kpt_2_visible_faces
 
 
-def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-5):
+def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-4):
     # 1) Get depsgraph
     if deps is None:
         deps = bpy.context.evaluated_depsgraph_get()
@@ -1030,7 +1029,7 @@ class TimedRender(bpy.types.Operator):
         bpy.types.RenderSettings.use_lock_interface = True
 
         # Add a timer to the given window, to generate periodic ‘TIMER’ events
-        self.timer_event = bpy.context.window_manager.event_timer_add(0.5, window=bpy.context.window)
+        self.timer_event = bpy.context.window_manager.event_timer_add(EVENT_TIMER_INTERVAL, window=bpy.context.window)
         # Add a modal handler to the window manager, for the given modal operator (this is expected to be a class that extends bpy.types.Operator!) (called by invoke() with self, just before returning {‘RUNNING_MODAL’})
         # -> A modal handler handles events!
         context.window_manager.modal_handler_add(self)  # <- This is key
@@ -1365,6 +1364,8 @@ if __name__ == "__main__":
         SCENE.render.resolution_x * RENDER_SCALE,
         SCENE.render.resolution_y * RENDER_SCALE,
     )
+
+    EVENT_TIMER_INTERVAL = 0.1
 
     RENDER_OUT_DIR_BL   = "//synthetic_data"
     ANNOT_OUT_DIR_BL = "//synthetic_data" + os.sep + "annot"
