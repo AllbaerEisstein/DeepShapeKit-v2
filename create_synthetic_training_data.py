@@ -593,22 +593,6 @@ def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-4):
     return dist_hit < (dist_to_pt - eps)
 
 
-def _polygon_area_3d(coords: list[tuple[float,float,float]]) -> float:
-    """
-    Compute area of a planar polygon in 3D by triangulation fan.
-    Assumes polygon is convex and vertices ordered.
-    """
-    if len(coords) < 3:
-        return 0.0
-    area = 0.0
-    v0 = Vector(coords[0])
-    for i in range(1, len(coords)-1):
-        v1 = Vector(coords[i])   - v0
-        v2 = Vector(coords[i+1]) - v0
-        area += v1.cross(v2).length / 2.0
-    return area
-
-
 def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int = 1):
     """
     Args:
@@ -959,6 +943,7 @@ class TimedRender(bpy.types.Operator):
 
     cancel_render:  bool | None = None
     rendering:      bool | None = None
+    force_update:   bool        = False
     render_queue:   list | None = None
     timer_event                 = None
     total:           int | None = None
@@ -982,9 +967,15 @@ class TimedRender(bpy.types.Operator):
         print("RENDER CANCEL")
 
 
-    def make_prefix_cam_frame(self, qitem):
-        prefix_for_cam = qitem['view'].split('.')[1]+'_'+qitem['view'].split('.')[0]
-        return f"{prefix_for_cam}_{str(qitem['frame']).zfill(4)}" 
+    def make_prefix_cam_frame(self, cam_or_qitem, frame_number=None):
+        if frame_number is None:
+            cam_name = cam_or_qitem['view']
+            frame_number = cam_or_qitem['frame']
+        else:
+            cam_name = cam_or_qitem
+
+        prefix_for_cam = cam_name.split('.', 1)[1] + '_' + cam_name.split('.', 1)[0]
+        return f"{prefix_for_cam}_{str(frame_number).zfill(4)}"
     
 
     def execute(self, context):
@@ -997,15 +988,32 @@ class TimedRender(bpy.types.Operator):
 # --- Build render queue ------------------------------------------------------
 
         modes = ["regular", "binary"] if render_binary else ["regular"]
+        skipped_count = 0
         for cam in cam_objects:
             for frame_index in range(bpy.context.scene.frame_start,
                                     bpy.context.scene.frame_end+1):
                 for mode in modes: # an additional entry for the binary render (used for mask annotation) appended to the end of the queue
-                    self.render_queue.append({
-                        "view":  cam.name,
-                        "frame": frame_index,
-                        "mode":  mode
-                    })
+                    render_prefix = self.make_prefix_cam_frame(cam.name, frame_index)
+                    render_path_os = os.path.join(bpy.path.abspath(RENDER_OUT_DIR_BL), render_prefix + ".png")
+                    mask_label_path_os = os.path.join(MASK_LABEL_DIR, render_prefix + ".txt")
+                    kpt_label_path_os  = os.path.join(KPT_LABEL_DIR,  render_prefix + ".txt")
+
+                    for file in [render_path_os, mask_label_path_os, kpt_label_path_os]:
+                        if not os.path.exists(file):
+                            self.render_queue.append({
+                                "view":            cam.name,
+                                "frame":           frame_index,
+                                "mode":            mode,
+                                "render_path_bl":  os.path.join(RENDER_OUT_DIR_BL, render_prefix + ".png"),
+                                "render_path_os":  render_path_os,
+                                "mask_annot_path": os.path.join(MASK_LABEL_DIR, render_prefix + ".png"),
+                                "kpt_annot_path":  os.path.join(KPT_LABEL_DIR,  render_prefix + ".png"),
+                                "mask_label_path": mask_label_path_os,
+                                "kpt_label_path":  kpt_label_path_os,
+                            })
+                            break
+                        else:
+                            skipped_count += 1
 
         # for entry in self.render_queue:
         #     for key, value in entry.items():
@@ -1013,7 +1021,10 @@ class TimedRender(bpy.types.Operator):
         #     print("\n")
         
         self.total = len(self.render_queue)
-        print("number of images to render: "+str(self.total))
+        print(f"\n\n\n\nnumber of images to render: {str(self.total)} \nskipping {str(skipped_count)} renders because they already exist \n-------------------------------------------------")
+        self.report(
+            {'INFO'}, message=f"Number of images to render: {str(self.total)} \nSkipping {str(skipped_count)} renders because they already exist."
+        )
 
 # -----------------------------------------------------------------------------
 
@@ -1045,163 +1056,178 @@ class TimedRender(bpy.types.Operator):
         # remove timer
         context.window_manager.event_timer_remove(self.timer_event)
         bpy.types.RenderSettings.use_lock_interface = False
+    
+    def handle_timer(self, context):
+        if self.render_queue is None:
+            self.report(
+                {'ERROR_INVALID_INPUT'}, message=f"Render queue is empty!"
+            )
+            return {'CANCELLED'}
+        else:
+            # if cancelled or there are no items left to render, first cleanup and finish, then create the yolo datasets
+            if len(self.render_queue) == 0 or self.cancel_render == True:
+                self.cleanup(context)
+                self.report(
+                    {'INFO'}, message=f"Done! Render queue is empty."
+                )
+                if create_yolo_datasets:
+                    create_yolo_dataset(
+                        imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
+                        label_dir=KPT_LABEL_DIR,
+                        dataset_name="keypoint_dataset_yolo",
+                        train_pct=0.8,
+                        test_pct=0.15,
+                        val_pct=0.05,
+                        class_list=["fish"]
+                    )
+                    create_yolo_dataset(
+                        imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
+                        label_dir=MASK_LABEL_DIR,
+                        dataset_name="masks_dataset_yolo",
+                        train_pct=0.8,
+                        test_pct=0.15,
+                        val_pct=0.05,
+                        class_list=["fish"],
+                        kpt_list=KEYPOINT_LIST
+                    )
+
+                    # 1) Load existing data (or start with empty dict)
+                    json_path = os.path.join(bpy.path.abspath(ANNOT_OUT_DIR_BL), 'cam_matrices.json')
+                    if os.path.exists(json_path):
+                        with open(json_path, 'r') as f_in:
+                            cams_json = json.load(f_in)
+                    else:
+                        cams_json = {}
+
+                    # 2) Add any cameras not already in cams_json
+                    for cam_name, M in cam_name_2_matrix.items():
+                        if cam_name not in cams_json:
+                            # convert any numpy-style matrices (or nested tuples) to lists
+                            cams_json[cam_name] = {
+                                'K': [list(row) for row in M['K']],
+                                'R': [list(row) for row in M['R']],
+                                'T': [list(row) for row in M['T']],
+                                'P': [list(row) for row in M['P']],
+                                'view_prefix': cam_name.split('.', 1)[1] + '_' + cam_name.split('.', 1)[0]
+                            }
+
+                    # 3) Write the updated dict back out (truncates the file)
+                    with open(json_path, 'w') as f_out:
+                        json.dump(cams_json, f_out, indent=4)
+
+                return {'FINISHED'}
+            
+            # nothing is rendering and there are items in queue
+            elif self.rendering == False:
+                sc = SCENE
+
+                qitem = self.render_queue.pop(0)
+                cam_name    = qitem["view"]
+                frame_index = qitem["frame"]
+                mode        = qitem["mode"]
+
+                render_prefix_cam_frame = self.make_prefix_cam_frame(qitem)
+                render_out_file_path_bl = os.path.join(RENDER_OUT_DIR_BL, render_prefix_cam_frame + ".png")
+                sc.render.filepath = render_out_file_path_bl
+
+                # switch camera
+                sc.camera = bpy.data.objects.get(cam_name)
+                if not sc.camera:
+                    self.report({'ERROR'}, f"Camera {cam_name} not found!")
+                    return {'CANCELLED'}
+                # set frame
+                sc.frame_set(frame_index)
+
+                def reset_render_settings():
+                    sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 0)
+                    sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 0
+                    sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 0
+
+
+                if mode == "regular":
+                    print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'regular\'')
+
+                    reset_render_settings()
+                    bpy.ops.render.render(write_still=True)
+
+                    # annotate keypoints
+                    keypoint_annot_source_file_path = bpy.path.abspath(render_out_file_path_bl)
+                    keypoint_annot_out_file_path = os.path.join(
+                        KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
+                    )
+
+                    kpt_2_coords_cvimg = get_projected_keypoint_coords_cv(COLLECTION_NAME, OBJECT_NAME, cam_name)
+
+                    if draw_every_keypoint_vertex:
+                        keypoint_vertices = kpt_2_coords_cvimg.pop("vertices")
+                        draw_points_on_img(keypoint_vertices, keypoint_annot_source_file_path, keypoint_annot_out_file_path)
+                        keypoint_annot_source_file_path = keypoint_annot_out_file_path
+
+                    if draw_every_keypoint_face:
+                        keypoint_faces = kpt_2_coords_cvimg.pop("faces")
+                        draw_polygons(keypoint_annot_source_file_path, keypoint_annot_out_file_path, keypoint_faces)
+                        keypoint_annot_source_file_path = keypoint_annot_out_file_path
+
+                    draw_kpts_on_img(
+                        kpt2coords = kpt_2_coords_cvimg,
+                        img_path   = keypoint_annot_source_file_path,
+                        out_path   = keypoint_annot_out_file_path
+                    )
+                    if draw_lattice_for_kpt_annot:
+                        draw_lattice_lines(
+                            image_path  = keypoint_annot_out_file_path,
+                            output_path = keypoint_annot_out_file_path,
+                            middle_thickness = 2
+                        )                            
+
+                    kpt_label_out_path =  os.path.join(KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                    write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, 0, kpt_label_out_path)
+
+                elif mode == "binary":
+                    print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'binary\'')
+
+                    sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
+                    sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
+                    sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
+
+                    render_binary_out_path_bl = os.path.join(
+                        MASK_LABEL_DIR, render_prefix_cam_frame + "_annot_poly.png"
+                    )
+                    sc.render.filepath = render_binary_out_path_bl
+
+                    bpy.ops.render.render(write_still=True)
+
+                    polygons = get_mask_polygons_from_binary_image(bpy.path.abspath(render_binary_out_path_bl))
+                    draw_polygons(
+                        polygons = polygons,
+                        img_path = bpy.path.abspath(render_out_file_path_bl),
+                        out_path = bpy.path.abspath(render_binary_out_path_bl)
+                    )
+                    
+                    mask_label_out_path =  os.path.join(MASK_LABEL_DIR, render_prefix_cam_frame + ".txt")
+                    write_polygons_to_yolo(polygons, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, mask_label_out_path)
+
+                    reset_render_settings()
 
     def modal(self, context, event):
         # cancelling manually via pressing escape
         if event.type == 'ESC':
             self.cleanup(context)
-            print("CANCELLED")
+            print("\nCANCELLED\n")
             self.report(
                 {'INFO'}, message=f"Cancelled via pressing ESC."
             )
             return {'CANCELLED'}
         # react to timer event
         elif event.type == 'TIMER':
-            if self.render_queue is None:
-                self.report(
-                    {'ERROR_INVALID_INPUT'}, message=f"Render queue is empty!"
-                )
-                return {'CANCELLED'}
-            else:
-                # if cancelled or there are no items left to render, first cleanup and finish, then create the yolo datasets
-                if len(self.render_queue) == 0 or self.cancel_render == True:
-                    self.cleanup(context)
-                    self.report(
-                        {'INFO'}, message=f"Done! Render queue is empty."
-                    )
-                    if create_yolo_datasets:
-                        create_yolo_dataset(
-                            imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
-                            label_dir=KPT_LABEL_DIR,
-                            dataset_name="keypoint_dataset_yolo",
-                            train_pct=0.8,
-                            test_pct=0.15,
-                            val_pct=0.05,
-                            class_list=["fish"]
-                        )
-                        create_yolo_dataset(
-                            imgs_dir=bpy.path.abspath(RENDER_OUT_DIR_BL),
-                            label_dir=MASK_LABEL_DIR,
-                            dataset_name="masks_dataset_yolo",
-                            train_pct=0.8,
-                            test_pct=0.15,
-                            val_pct=0.05,
-                            class_list=["fish"],
-                            kpt_list=KEYPOINT_LIST
-                        )
-                        for cam_name in CAM_OBJECTS.keys():
-                            cam_name_2_matrix[cam_name]['K'] = [list(row) for row in cam_name_2_matrix[cam_name]['K']]
-                            cam_name_2_matrix[cam_name]['R'] = [list(row) for row in cam_name_2_matrix[cam_name]['R']]
-                            cam_name_2_matrix[cam_name]['T'] = [list(row) for row in cam_name_2_matrix[cam_name]['T']]
-                            cam_name_2_matrix[cam_name]['P'] = [list(row) for row in cam_name_2_matrix[cam_name]['P']]
-                            cam_name_2_matrix[cam_name]['view_prefix'] = cam_name.split('.')[1]+'_'+cam_name.split('.')[0]
-                        with open(os.path.join(bpy.path.abspath(ANNOT_OUT_DIR_BL), 'cam_matrices.json'),'wt') as f:
-                            json.dump(cam_name_2_matrix, f, indent=4)
-                    return {'FINISHED'}
-                # nothing is rendering and there are items in queue
-                elif self.rendering == False:
-                    sc = context.scene
-                                        
-                    # # skip if the file exists
-                    # if self.exists(img_out_file):
-                    #     self.render_queue.pop(0)
-                    #     print("Skipping " + render_filename)
-                    
-                    #else:
-                    qitem       = self.render_queue.pop(0)
-                    frame_index = qitem["frame"]
-                    cam_name    = qitem["view"]
-                    mode        = qitem["mode"]
-
-                    # switch camera
-                    sc.camera = bpy.data.objects.get(cam_name)
-                    if not sc.camera:
-                        self.report({'ERROR'}, f"Camera {cam_name} not found!")
-                        return {'CANCELLED'}
-                    # set frame
-                    sc.frame_set(frame_index)
-                    # render to that exact path
-                    render_prefix_cam_frame = self.make_prefix_cam_frame(qitem)
-                    render_out_file_path_bl = os.path.join(RENDER_OUT_DIR_BL, render_prefix_cam_frame + ".png")
-                    sc.render.filepath = render_out_file_path_bl
-
-                    def reset_render_settings():
-                        sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 0)
-                        sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 0
-                        sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 0
-
-
-                    if mode == "regular":
-                        print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'regular\'')
-
-                        reset_render_settings()
-                        bpy.ops.render.render(write_still=True)
-
-                        # annotate keypoints
-                        keypoint_annot_source_file_path = bpy.path.abspath(render_out_file_path_bl)
-                        keypoint_annot_out_file_path = os.path.join(
-                            KPT_LABEL_DIR, render_prefix_cam_frame + "_annot_kpt.png"
-                        )
-
-                        kpt_2_coords_cvimg = get_projected_keypoint_coords_cv(COLLECTION_NAME, OBJECT_NAME, cam_name)
-
-                        if draw_every_keypoint_vertex:
-                            keypoint_vertices = kpt_2_coords_cvimg.pop("vertices")
-                            draw_points_on_img(keypoint_vertices, keypoint_annot_source_file_path, keypoint_annot_out_file_path)
-                            keypoint_annot_source_file_path = keypoint_annot_out_file_path
-
-                        if draw_every_keypoint_face:
-                            keypoint_faces = kpt_2_coords_cvimg.pop("faces")
-                            draw_polygons(keypoint_annot_source_file_path, keypoint_annot_out_file_path, keypoint_faces)
-                            keypoint_annot_source_file_path = keypoint_annot_out_file_path
-
-                        draw_kpts_on_img(
-                            kpt2coords = kpt_2_coords_cvimg,
-                            img_path   = keypoint_annot_source_file_path,
-                            out_path   = keypoint_annot_out_file_path
-                        )
-                        if draw_lattice_for_kpt_annot:
-                            draw_lattice_lines(
-                                image_path  = keypoint_annot_out_file_path,
-                                output_path = keypoint_annot_out_file_path,
-                                middle_thickness = 2
-                            )                            
-
-                        kpt_label_out_path =  os.path.join(KPT_LABEL_DIR, render_prefix_cam_frame + ".txt")
-                        write_pose_labels_yolo([kpt_2_coords_cvimg], KEYPOINT_LIST, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, 0, kpt_label_out_path)
-
-                    elif mode == "binary":
-                        print(f'Rendering {str(self.total + 1 - len(self.render_queue))} / {str(self.total)}: {render_out_file_path_bl} in mode \'binary\'')
-
-                        sc.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
-                        sc.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
-                        sc.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
-
-                        render_binary_out_path_bl = os.path.join(
-                            MASK_LABEL_DIR, render_prefix_cam_frame + "_annot_poly.png"
-                        )
-                        sc.render.filepath = render_binary_out_path_bl
-
-                        bpy.ops.render.render(write_still=True)
-
-                        polygons = get_mask_polygons_from_binary_image(bpy.path.abspath(render_binary_out_path_bl))
-                        draw_polygons(
-                            polygons = polygons,
-                            img_path = bpy.path.abspath(render_out_file_path_bl),
-                            out_path = bpy.path.abspath(render_binary_out_path_bl)
-                        )
-                        
-                        mask_label_out_path =  os.path.join(MASK_LABEL_DIR, render_prefix_cam_frame + ".txt")
-                        write_polygons_to_yolo(polygons, IMAGE_WIDTH_PX, IMAGE_HEIGHT_PX, mask_label_out_path)
-
-                        reset_render_settings()
+            self.handle_timer(context)
 
 
         return {'PASS_THROUGH'}
     
 
 #---------------------------------------------------------------
-# Yolo dataset creation
+# YOLO dataset creation
 #---------------------------------------------------------------
 
 
@@ -1291,7 +1317,7 @@ def move_label_files(label_dir, dataset_dir, train_labels, test_labels, val_labe
         for filename in file_list:
             src = os.path.join(label_dir, filename)
             dst = os.path.join(dataset_dir, "labels", subset, filename)
-            shutil.move(src, dst)
+            shutil.copy2(src, dst)
             print(f"Moved label file {filename} to labels/{subset}")
 
 
