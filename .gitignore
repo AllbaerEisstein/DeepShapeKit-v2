@@ -1,5 +1,6 @@
 bluegill_data/videos/*.mp4
 bluegill_data/synthetic_data/*.png
+bluegill_data/synthetic_data/*.txt
 *.blend1
 # free_fish_et/src/results/*
 .vscode
