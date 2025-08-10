@@ -153,6 +153,12 @@ class SYNTH_PropertyGroup(PropertyGroup):
         max=1.0
     )
 
+    keep_occluded_keypoints: BoolProperty(
+        name="Keep Occluded Keypoints",
+        description="If checked, keep coordinates of occluded keypoints and set their 'visibility' to 1. YOLO allows three 'visibility' values for each keypoint; 0 for missing / not inside the image bounds, 1 for occluded but ininside the image bounds, and 2 for visible. This will influence the inference of visibility score calculation.",
+        default=False
+    )
+
     draw_every_keypoint_vertex: BoolProperty(
         name="Draw Every Visible Keypoint Vertex",
         default=False
@@ -738,7 +744,7 @@ def draw_points_on_img(points, img_path, out_path, annot_radius = 1):
     cv2.imwrite(str(out_path), img)
 
 
-def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int = 1):
+def draw_kpts_on_img(kpt2coords, kpt_2_vis_status, kpt_2_vis_ptg, img_path, out_path, tenth_of_annot_radius: int = 1):
     """
     Args:
         kpts (List[List[np.ndarray]]): List of the lists of keypoint tuples (x, y, visibility) per detected instance.
@@ -748,46 +754,91 @@ def draw_kpts_on_img(kpt2coords, img_path, out_path, tenth_of_annot_radius: int 
     #cmap = create_discrete_color_map(list(kpt2coords))
     annot_radius = tenth_of_annot_radius * 10
 
-    for name,((x,y),c) in kpt2coords.items():
+    for name, (x,y) in kpt2coords.items():
+        if kpt_2_vis_status[name] == 0:
+            continue
+        conf = kpt_2_vis_ptg[name]
+        color = (255, 0, 0) if kpt_2_vis_status[name] == 2 else (255, 0, 216) if kpt_2_vis_status[name] == 1 else (69, 0, 255)
         conf_scaled_annot_radius = int(
-            int(c*10)/10   # will cut off second decimal (e.g 0.72 -> 0.7)
+            int(conf*10)/10   # will cut off second decimal (e.g 0.72 -> 0.7)
             *annot_radius  # if annot_radius is k*10 with k in N, this will yield an int
         )
-        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=(255, 0, 0), lineType=-1)
-        cv2.putText(img, f"{int(c*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=(255, 0, 0), thickness=1)
+        cv2.circle(img=img, center=(int(x),int(y)), radius=1, color=color, lineType=-1) # center
+        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=color, lineType=-1)
+        cv2.putText(img, f"{int(conf*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=color, thickness=1)
 
     cv2.imwrite(str(out_path), img)
 
 
-def write_pose_labels_yolo(instances, kpt_order, image_width, image_height, class_idx, out_path):
+def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_width, image_height, instances_class_idx, out_path):
+    """
+    Write YOLO-style pose labels.
+
+    Each line (one instance) is:
+      <class-index> <x> <y> <width> <height> <px1> <py1> <p1-vis> ... <pxN> <pyN> <pN-vis>
+
+    - x,y and width,height are normalized to [0,1] (image dimensions).
+    - Each keypoint triple is: normalized_x normalized_y visibility (0..1).
+    - visibility can have one of three values:
+        0: The keypoint is not labeled or is out-of-view (not visible and not labeled).
+        1: The keypoint is labeled but not visible (occluded).
+        2: The keypoint is labeled and visible (fully visible).
+        During training, both 1 (occluded) and 2 (visible) are treated as present and contribute to the loss calculation, 
+        while 0 means the keypoint is ignored in training. The model learns to predict keypoint locations and a visibility score.
+    - Missing keypoints are written as 0 0 0.
+    """
+    # basic validation to avoid division by zero
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image_width and image_height must be positive numbers")
+
     lines = []
-    for inst in instances:
+    for kpt_2_coords, kpt_2_vis_status, class_idx in zip(instances, instances_vis_status, instances_class_idx):
+        # collect all present keypoint coordinates to compute bbox
         pts = []
-        for ((x, y), _) in inst.values():
+        for x, y in kpt_2_coords.values():
             pts.append((x, y))
+
         if pts:
             xs, ys = zip(*pts)
             xmin, xmax = min(xs), max(xs)
             ymin, ymax = min(ys), max(ys)
-            x_ctr = ((xmin + xmax) / 2) / image_width
-            y_ctr = ((ymin + ymax) / 2) / image_height
-            w_box = (xmax - xmin) / image_width
-            h_box = (ymax - ymin) / image_height
+
+            # normalized center and size
+            x_ctr = ((xmin + xmax) / 2.0) / float(image_width)
+            y_ctr = ((ymin + ymax) / 2.0) / float(image_height)
+            w_box = (xmax - xmin) / float(image_width)
+            h_box = (ymax - ymin) / float(image_height)
         else:
+            # fallback: full image
             x_ctr, y_ctr, w_box, h_box = 0.5, 0.5, 1.0, 1.0
-        parts = [str(class_idx), f"{x_ctr:.6f}", f"{y_ctr:.6f}", f"{w_box:.6f}", f"{h_box:.6f}"]
+
+        parts = [
+            str(int(class_idx)),
+            f"{x_ctr:.6f}",
+            f"{y_ctr:.6f}",
+            f"{w_box:.6f}",
+            f"{h_box:.6f}"
+        ]
+
+        # append each keypoint in the fixed order as: x y visibility (all normalized / scaled)
         for kpt in kpt_order:
-            if kpt in inst:
-                (x, y), _ = inst[kpt]
-                parts.append(f"{x / image_width:.6f}")
-                parts.append(f"{y / image_height:.6f}")
+            if kpt in kpt_2_coords:
+                x, y = kpt_2_coords[kpt]
+                vis_status = kpt_2_vis_status[kpt]
+                parts.append(f"{(x / float(image_width)):.6f}" if vis_status > 0 else "0.00000")
+                parts.append(f"{(y / float(image_height)):.6f}" if vis_status > 0 else "0.00000")
+                parts.append("2.00000" if vis_status == 2 else "1.00000" if vis_status == 1 else "0.00000")
             else:
+                # missing → three zeros
                 parts.append("0.000000")
                 parts.append("0.000000")
+                parts.append("0.000000")
+
         lines.append(" ".join(parts))
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as f:
-        f.write("\n".join(lines) + "\n")
+        f.write("\n".join(lines))
 
 
 # --------------------------- TimedRender Operator ---------------------------
@@ -804,8 +855,7 @@ In addition to rendering, the renders get annotated with keypoint and silhouette
 Keypoints are determined by projecting average coordinates of visible keypoints (vertex groups) 
 onto the image plane using each camera's camera calibration matrix. 
 Silhouette annotation is achieved by rendering a binary image with white just where the animated object is so that 
-using opencv's contour detection can create a silhouette annotation from the binary image.
-    """
+using opencv's contour detection can create a silhouette annotation from the binary image."""
 
     render_queue: list | None = None
     timer_event = None
@@ -920,41 +970,76 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 else ({k: 1.0 for k in kpt_2_verts_list_world.keys()}, kpt_2_faces_list_world)
             )
 
-            # keep keypoint if visible_area/total_area ≥ threshold
-            kpt_2_coords_list_world_visible = {
+            # no filtering yet
+            kpt_2_visible_vert_coords_list_world = {
                 kpt: list(set([
                     point 
                     for poly in kpt_2_visible_faces[kpt] 
                     for point in poly
                 ]))
                 for kpt, vis in kpt_2_visibility_pct.items() 
-                if vis >= p.keypoint_visible_threshold
+            }
+            kpt_2_coords_list_world = {
+                kpt: list(set([
+                    point 
+                    for poly in kpt_2_faces_list_world[kpt] 
+                    for point in poly["coords"]
+                ]))
+                for kpt, vis in kpt_2_visibility_pct.items() 
             }
 
-            kpt_2_coord_world = get_avg_kpt_coords_3d(kpt_2_coords_list_world_visible)
-
+            # avg over the visible vertices coords
+            kpt_2_avg_coords_world_visible = get_avg_kpt_coords_3d(kpt_2_visible_vert_coords_list_world)
+            # avg over all the verts
+            kpt_2_avg_coords_world = get_avg_kpt_coords_3d(kpt_2_coords_list_world)
 
             # compute camera matrix P and project using matrix (keeps parity with original script)
             cam_mats = get_cam_matrix_for_cam(cam_obj, scene)
             P = cam_mats['P']
 
-            EPS_Z = 1e-8
+            EPS = 1e-8
             img_w = int(scene.render.resolution_x * (scene.render.resolution_percentage / 100.0))
             img_h = int(scene.render.resolution_y * (scene.render.resolution_percentage / 100.0))
-            kpt_2_coords_image = {}
-            for kpt, coords in kpt_2_coord_world.items():
-                ph = P @ Vector((*coords, 1.0))
-                # require a meaningful positive depth (z)
-                if not (ph.z > EPS_Z):
-                    # either skip or explicitly mark as missing; write_pose_labels_yolo expects missing keys possible
-                    # continue  # -> skipping is fine because writer fills missing kpts with zeros
-                    continue
-                x_img = ph.x / ph.z
-                y_img = ph.y / ph.z
-                # clamp to image bounds (optional but prevents extreme values)
-                x_img_clamped = max(0.0, min(float(x_img), float(img_w - 1)))
-                y_img_clamped = max(0.0, min(float(y_img), float(img_h - 1)))
-                kpt_2_coords_image[kpt] = ((x_img_clamped, y_img_clamped), float(kpt_2_visibility_pct.get(kpt, 1.0)))
+            def is_outside_image_bounds(x, y):
+                return x < EPS or x > (img_w-EPS) or y < EPS or y > (img_h-EPS)
+            
+            def project_world_keypoints(kpt_2_coords):
+                kpt_2_projected = {}
+                for kpt, coords in kpt_2_coords.items():
+                    ph = P @ Vector((*coords, 1.0))
+                    # require a meaningful positive depth (z)
+                    if not (ph.z > EPS):
+                        # either skip or explicitly mark as missing; write_pose_labels_yolo expects missing keys possible
+                        # skipping is fine
+                        continue
+                    x_img = ph.x / ph.z
+                    y_img = ph.y / ph.z
+                    kpt_2_projected[kpt] = (x_img, y_img)
+                return kpt_2_projected
+                
+            kpt_2_coords_image_filtered_by_vis = project_world_keypoints(kpt_2_avg_coords_world_visible)
+            kpt_2_coords_image_all_faces_count = project_world_keypoints(kpt_2_avg_coords_world)
+
+            # 0: The keypoint is not labeled or is out-of-view (not visible and not labeled).
+            # 1: The keypoint is labeled but not visible (occluded).
+            # 2: The keypoint is labeled and visible (fully visible).
+            occluded_status = 1 if p.keep_occluded_keypoints else 0 # status 1 may only occur if the flag is set
+            kpt_2_vis_status = {
+                kpt: 
+                    0 if is_outside_image_bounds(*coords)
+                    else 
+                    occluded_status if kpt_2_visibility_pct[kpt] < p.keypoint_visible_threshold
+                    else 
+                    2
+                for kpt, coords in kpt_2_coords_image_filtered_by_vis.items() 
+            }
+            # if the keypoint is occluded, its coordinates are considered to be the center of all its vertices, not only the visible ones (because there are possible none visible)
+            for kpt, status in kpt_2_vis_status.items():
+                if status == 1:
+                    kpt_2_coords_image_filtered_by_vis[kpt] = kpt_2_coords_image_all_faces_count[kpt]
+                elif status == 0:
+                    kpt_2_coords_image_filtered_by_vis[kpt] = (0,0)
+            
 
             img_annot_source_file_path = render_out_file_path_os
 
@@ -982,13 +1067,21 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 img_annot_source_file_path = kpt_annot_out_file_path
 
             if p.create_annotated_images:
-                draw_kpts_on_img(kpt_2_coords_image, img_annot_source_file_path, kpt_annot_out_file_path)
+                draw_kpts_on_img(
+                    kpt_2_coords_image_filtered_by_vis, 
+                    kpt_2_vis_status, 
+                    kpt_2_visibility_pct, 
+                    img_annot_source_file_path, 
+                    kpt_annot_out_file_path
+                )
+                
             write_pose_labels_yolo(
-                [kpt_2_coords_image], 
+                [kpt_2_coords_image_filtered_by_vis],
+                [kpt_2_vis_status],
                 kpt_list, 
                 int(p.image_width_px), 
                 int(p.image_height_px), 
-                0, 
+                [0], 
                 kpt_label_out_path
             )
 
@@ -1211,6 +1304,7 @@ class SYNTH_OT_apply_settings(Operator):
             'check_keypoint_visibility': p.check_keypoint_visibility,
             'KEYPOINT_VISIBLE_THRESHOLD': p.keypoint_visible_threshold,
             'draw_every_keypoint_vertex': p.draw_every_keypoint_vertex,
+            'keep_occluded_keypoints': p.keep_occluded_keypoints,
             'draw_every_keypoint_face': p.draw_every_keypoint_face,
             'test_mode': p.test_mode,
             'draw_lattice_for_kpt_annot': p.draw_lattice_for_kpt_annot,
@@ -1275,11 +1369,12 @@ class SYNTH_OT_load_config(Operator):
             'OBJECT_NAME': 'object_name',
             'EVENT_TIMER_INTERVAL': 'event_timer_interval',
             'render_binary': 'render_binary',
-            'use_compositor': 'use_compositor',  # if you added this property
+            'use_compositor': 'use_compositor',
             'create_annotated_images': 'create_annotated_images',
             'check_keypoint_visibility': 'check_keypoint_visibility',
             'KEYPOINT_VISIBLE_THRESHOLD': 'keypoint_visible_threshold',
             'draw_every_keypoint_vertex': 'draw_every_keypoint_vertex',
+            'keep_occluded_keypoints':'keep_occluded_keypoints',
             'draw_every_keypoint_face': 'draw_every_keypoint_face',
             'test_mode': 'test_mode',
             'draw_lattice_for_kpt_annot': 'draw_lattice_for_kpt_annot',
@@ -1396,6 +1491,7 @@ class SYNTH_PT_main_panel(Panel):
         box.label(text="Keypoint Options")
         box.prop(p, 'check_keypoint_visibility')
         box.prop(p, 'keypoint_visible_threshold')
+        box.prop(p, 'keep_occluded_keypoints')
         box.prop(p, 'draw_every_keypoint_vertex')
         box.prop(p, 'draw_every_keypoint_face')
         box.prop(p, 'draw_lattice_for_kpt_annot')
