@@ -68,7 +68,7 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
 
         files_csv_path       = video_folder / 'files.csv'
         with files_csv_path.open('w', newline='') as csv_out_file:
-            csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
             csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder'])
 
             capture = cv2.VideoCapture(str(video_path))
@@ -108,7 +108,7 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
         if also_create_frame2video_csv:
             frame2video_csv_path = video_folder / 'frame2video_1.csv'
             with frame2video_csv_path.open('w', newline='') as csv_out_file:
-                csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+                csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
                 csvwriter.writerow(['origin_frame', 'new_frame'])
 
                 for i in range(image_count):
@@ -170,8 +170,7 @@ def process_input_folder(data_folder):
 
     # process bottom images
     with open(os.path.join(data_folder, 'bottom', 'frame2video_1.csv'), 'w') as csv_out_file:
-        csvwriter = csv.writer(csv_out_file, delimiter=',',
-                               quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         csvwriter.writerow(['origin_frame', 'new_frame'])
 
         for i in range(n_frames):
@@ -201,8 +200,7 @@ def process_input_folder(data_folder):
 
     # process front images
     with open(os.path.join(data_folder, 'front', 'frame2video_1.csv'), 'w') as csv_out_file:
-        csvwriter = csv.writer(csv_out_file, delimiter=',',
-                               quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
         csvwriter.writerow(['origin_frame', 'new_frame'])
 
         for i in range(n_frames):
@@ -452,21 +450,15 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
 
     model = infer_mask.load_model(Path(model_path))
 
-    csvwriters = {}
     for folder in image_folders:
         print(f"   processing frames for video {folder}...")
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
             if not os.path.exists(dataset_path / folder / new_dir):
                 os.mkdir(dataset_path / folder / new_dir)
 
-        csv_out_file = open(dataset_path / folder / 'files_crop.csv', 'w')
-        csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar=' ', quoting=csv.QUOTE_MINIMAL)
-        # write the headers
-        csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
-        csvwriters[folder] = csvwriter
+        csv_rows = []  # <-- Collect rows here instead of writing immediately
 
         img_path2prediction: dict[str, dict[str, list]] = run_infer_mask(model=model, input_path=dataset_path / folder / "origin")
-
         files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
 
         for img_path, prediction in tqdm(sorted(img_path2prediction.items())):
@@ -494,15 +486,24 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
                     # Save outputs
                     save_crops(dataset_path, folder, frame_number, instance_number,
                             crop_img, crop_mask, mask_img_np)
-                    # Record CSV entries
+                    # Collect CSV entries
                     rel_crop       = f"{folder}/cropped/image_{frame_number}_{instance_number}.png"
                     rel_mask       = f"{folder}/mask/image_{frame_number}_{instance_number}_mask.png"
                     rel_mask_full  = f"{folder}/mask_full/image_{frame_number}_{instance_number}_mask_full.png"
                     rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
-                    csvwriter.writerow([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
-                    csvwriter.writerow([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
-                    csvwriter.writerow([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
-                    csvwriter.writerow([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
+                    csv_rows.append([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
+                    csv_rows.append([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
+                    csv_rows.append([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
+                    csv_rows.append([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
+
+        csv_rows.sort(key=lambda row: row[0])
+
+        # Write to CSV
+        with open(dataset_path / folder / 'files_crop.csv', 'w', newline='') as csv_out_file:
+            csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
+            csvwriter.writerows(csv_rows)
+
 
 def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
     img_name = str(Path(img_path).name)
