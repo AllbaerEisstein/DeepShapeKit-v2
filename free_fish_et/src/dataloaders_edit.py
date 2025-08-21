@@ -96,22 +96,22 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
         # mask crop entries per view, grouped by origin frame
         self.masks_full_meta: dict[str, dict] = {
-            #                  │    └──> the rows of the files_crop.csv with category mask_full
-            #                  └──> frame number string
+            #                       │    └──> the rows of the files_crop.csv with category mask_full
+            #                       └──> frame number string
             v: self._group_csv(v, 'files_crop.csv', filter_cat='mask_full')
             for v in self.views
         }
 
         self.cropped_meta: dict[str, dict] = {
-            #                  │    └──> the rows of the files_crop.csv with category cropped
-            #                  └──> frame number string
+            #                    │    └──> the rows of the files_crop.csv with category cropped
+            #                    └──> frame number string
             v: self._group_csv(v, 'files_crop.csv', filter_cat='cropped')
             for v in self.views
         }
 
         self.bbox_masked_meta: dict[str, dict] = {
-            #                  │    └──> the rows of the files_crop.csv with category bbox-masked
-            #                  └──> frame number string
+            #                       │    └──> the rows of the files_crop.csv with category bbox-masked
+            #                       └──> frame number string
             v: self._group_csv(v, 'files_crop.csv', filter_cat='bbox-masked')
             for v in self.views
         }

@@ -775,10 +775,10 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
     Write YOLO-style pose labels.
 
     Each line (one instance) is:
-      <class-index> <x> <y> <width> <height> <px1> <py1> <p1-vis> ... <pxN> <pyN> <pN-vis>
+      <class-index> <bbox_center_x> <bbox_center_y> <bbox_width> <bbox_height> <px1> <py1> <p1-vis> ... <pxN> <pyN> <pN-vis>
 
     - x,y and width,height are normalized to [0,1] (image dimensions).
-    - Each keypoint triple is: normalized_x normalized_y visibility (0..1).
+    - Each keypoint triple is: normalized_x normalized_y visibility (0, 1, 2).
     - visibility can have one of three values:
         0: The keypoint is not labeled or is out-of-view (not visible and not labeled).
         1: The keypoint is labeled but not visible (occluded).
@@ -795,8 +795,13 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
     for kpt_2_coords, kpt_2_vis_status, class_idx in zip(instances, instances_vis_status, instances_class_idx):
         # collect all present keypoint coordinates to compute bbox
         pts = []
-        for x, y in kpt_2_coords.values():
-            pts.append((x, y))
+        for kpt in kpt_order:
+            if kpt not in kpt_2_coords or kpt not in kpt_2_vis_status:
+                continue
+            x, y = kpt_2_coords[kpt]
+            vis = kpt_2_vis_status[kpt]
+            if vis > 0:  # only consider visible or occluded keypoints
+                pts.append((x, y))
 
         if pts:
             xs, ys = zip(*pts)
@@ -822,17 +827,17 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
 
         # append each keypoint in the fixed order as: x y visibility (all normalized / scaled)
         for kpt in kpt_order:
-            if kpt in kpt_2_coords:
+            if kpt in kpt_2_coords and kpt in kpt_2_vis_status:
                 x, y = kpt_2_coords[kpt]
                 vis_status = kpt_2_vis_status[kpt]
-                parts.append(f"{(x / float(image_width)):.6f}" if vis_status > 0 else "0.00000")
-                parts.append(f"{(y / float(image_height)):.6f}" if vis_status > 0 else "0.00000")
-                parts.append("2.00000" if vis_status == 2 else "1.00000" if vis_status == 1 else "0.00000")
+                parts.append(f"{(x / float(image_width)):.6f}" if vis_status > 0 else "0.000000")
+                parts.append(f"{(y / float(image_height)):.6f}" if vis_status > 0 else "0.000000")
+                parts.append("2" if vis_status == 2 else "1" if vis_status == 1 else "0")
             else:
                 # missing → three zeros
                 parts.append("0.000000")
                 parts.append("0.000000")
-                parts.append("0.000000")
+                parts.append("0")
 
         lines.append(" ".join(parts))
 
@@ -1033,6 +1038,10 @@ using opencv's contour detection can create a silhouette annotation from the bin
                     2
                 for kpt, coords in kpt_2_coords_image_filtered_by_vis.items() 
             }
+            for kpt in [kp.strip() for kp in context.scene.synth_props.keypoint_list_csv.split(',') if kp.strip()]:
+                if kpt not in kpt_2_vis_status:
+                    kpt_2_vis_status[kpt] = occluded_status
+                    
             # if the keypoint is occluded, its coordinates are considered to be the center of all its vertices, not only the visible ones (because there are possible none visible)
             for kpt, status in kpt_2_vis_status.items():
                 if status == 1:
@@ -1043,7 +1052,7 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
             img_annot_source_file_path = render_out_file_path_os
 
-            if p.draw_every_keypoint_vertex:
+            if p.create_annotated_images and p.draw_every_keypoint_vertex:
                 visible_verts = []
                 for vertex_list in kpt_2_verts_list_world.values():
                     for vertex in vertex_list:
@@ -1054,7 +1063,7 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 img_annot_source_file_path = kpt_annot_out_file_path
 
             
-            if p.draw_every_keypoint_face:
+            if p.create_annotated_images and p.draw_every_keypoint_face:
                 visible_faces = []
                 for face_list in kpt_2_visible_faces.values():
                     for face in face_list:

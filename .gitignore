@@ -4,3 +4,4 @@ bluegill_data/synthetic_data/*.txt
 *.blend1
 # free_fish_et/src/results/*
 .vscode
+*yolo11*.pt
