@@ -15,7 +15,8 @@ import bmesh
 import os
 import json
 import shutil
-import math
+import re
+import glob
 from collections import defaultdict
 from mathutils import Vector, Matrix
 from bpy.props import (
@@ -1516,6 +1517,7 @@ class SYNTH_PT_main_panel(Panel):
         row = layout.row()
         row.operator('render.timed_render', icon='RENDER_STILL')
         row.operator('synth.unregister_timed_render', icon='CANCEL')
+        row.operator('synth.create_videos', icon='SEQUENCE')
         row.operator('synth.export_camera_matrices', icon='FILE_FOLDER')
         row.operator('synth.export_mesh', icon='FILE_FOLDER')
 
@@ -1568,6 +1570,150 @@ class SYNTH_OT_export_mesh(Operator):
         except Exception as e:
             self.report({'WARNING'}, f"Failed to export mesh: {e}")
             return {'CANCELLED'}
+        
+
+# --------------------------- Create Videos Operator --------------------------
+
+class SYNTH_OT_create_videos(Operator):
+    bl_idname = "synth.create_videos"
+    bl_label = "Create Videos from Renders"
+    bl_description = "Create one MP4 video per camera from rendered frames in render_out_dir"
+
+    def _prefix_for_cam(self, cam_name: str) -> str:
+        return cam_name.split('.', 1)[1] + '_' + cam_name.split('.', 1)[0] if '.' in cam_name else cam_name
+
+    def _find_frames_for_prefix(self, folder: str, prefix: str):
+        """
+        Return sorted list of tuples (frame_int, filepath) for files in folder that match prefix_{frame}.{ext}.
+        Accepts .png/.jpg/.jpeg (case-insensitive). Returns empty list if none found.
+        """
+        candidates = []
+        # search for common image extensions
+        for ext in ("png", "jpg", "jpeg", "bmp", "tiff"):
+            pattern = os.path.join(folder, f"{prefix}_*.{ext}")
+            for fp in glob.glob(pattern):
+                base = os.path.basename(fp)
+                # look for trailing _<digits>.<ext>
+                m = re.search(r'_(\d+)\.[^.]+$', base)
+                if not m:
+                    continue
+                frame_str = m.group(1)
+                try:
+                    frame_i = int(frame_str)
+                except Exception:
+                    continue
+                candidates.append((frame_i, fp))
+        # sort by frame number
+        candidates.sort(key=lambda x: x[0])
+        return candidates
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        # Resolve output folder
+        render_dir = resolve(p.render_out_dir)  # use your resolve helper to expand // paths
+        if not os.path.isdir(render_dir):
+            self.report({'ERROR'}, f"Render out dir not found: {render_dir}")
+            return {'CANCELLED'}
+
+        # Determine camera list: prefer Cameras collection if present
+        cam_collection = bpy.data.collections.get('Cameras')
+        cam_objs = cam_collection.objects if cam_collection else [o for o in bpy.data.objects if o.type == 'CAMERA']
+
+        if not cam_objs:
+            self.report({'WARNING'}, "No cameras found in scene.")
+            return {'CANCELLED'}
+
+        # Determine desired fps from Blender scene
+        try:
+            fps = scene.render.fps / scene.render.fps_base
+        except Exception:
+            fps = float(scene.render.fps)  # fallback
+
+        # target folder for videos (use render_dir itself)
+        out_folder = render_dir
+        os.makedirs(out_folder, exist_ok=True)
+
+        videos_created = 0
+        cameras_skipped_no_frames = 0
+        failed = []
+
+        for cam in sorted(cam_objs, key=lambda c: c.name):
+            if getattr(cam, "type", None) != 'CAMERA':
+                continue
+
+            prefix = self._prefix_for_cam(cam.name)
+            frames = self._find_frames_for_prefix(render_dir, prefix)
+
+            if not frames:
+                cameras_skipped_no_frames += 1
+                continue
+
+            # frames is list of (frame_int, filepath), sorted
+            frame_nums = [f for f, _ in frames]
+            min_frame, max_frame = frame_nums[0], frame_nums[-1]
+
+            # choose output name: prefix.mp4 if full range present, else prefix_min-max.mp4
+            expected_frames_count = scene.frame_end - scene.frame_start + 1
+            has_full_range = (min_frame == scene.frame_start and max_frame == scene.frame_end and len(frame_nums) == expected_frames_count)
+
+            if has_full_range:
+                out_name = f"{prefix}.mp4"
+            else:
+                out_name = f"{prefix}_{min_frame}-{max_frame}.mp4"
+
+            out_path = os.path.join(out_folder, out_name)
+
+            # read first image to get frame size (width,height)
+            first_img_path = frames[0][1]
+            img0 = cv2.imread(first_img_path)
+            if img0 is None:
+                failed.append((prefix, "Could not read first image"))
+                continue
+            h, w = img0.shape[:2]
+            # ensure integer fps for VideoWriter; VideoWriter accepts float fps but some backends prefer ints
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+            try:
+                writer = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+            except Exception as e:
+                failed.append((prefix, f"Failed to create VideoWriter: {e}"))
+                continue
+
+            # write frames in order; if any frame differs in size, resize to first image size
+            try:
+                for frame_i, fp in frames:
+                    img = cv2.imread(fp)
+                    if img is None:
+                        # skip missing/unreadable frames but report
+                        self.report({'WARNING'}, f"Skipping unreadable frame {fp} for {prefix}")
+                        continue
+                    if img.shape[0] != h or img.shape[1] != w:
+                        # resize to first image size
+                        img = cv2.resize(img, (w, h))
+                    writer.write(img)
+                writer.release()
+                videos_created += 1
+                self.report({'INFO'}, f"Wrote video: {out_path}")
+            except Exception as e:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
+                failed.append((prefix, str(e)))
+                continue
+
+        summary = f"Created {videos_created} videos"
+        if cameras_skipped_no_frames:
+            summary += f", skipped {cameras_skipped_no_frames} cameras with no frames"
+        if failed:
+            summary += f", {len(failed)} failures"
+            for (cam_pref, msg) in failed:
+                self.report({'WARNING'}, f"{cam_pref}: {msg}")
+
+        self.report({'INFO'}, summary)
+        return {'FINISHED'}
+
 
 
 # --------------------------- Registration ----------------------------------
@@ -1581,6 +1727,7 @@ classes = (
     TimedRender,
     SYNTH_OT_export_camera_matrices,
     SYNTH_OT_export_mesh,
+    SYNTH_OT_create_videos,
 )
 
 
