@@ -1,3 +1,4 @@
+from collections import defaultdict
 import cv2
 import csv
 import json
@@ -296,10 +297,14 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) 
     return np.array(mask_img, dtype=np.uint8)
 
 
+# TODO: Instance tracking across views
 def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8):
     """
     Use a pre-trained YOLO11n-seg model (model_path) to infer the segmentation masks of the dataset.
-    Augment the dataset as follows:
+    This step is responsible for instance identification! 
+    The subsequent steps rely on the correctness of the detected number of instances from this step.
+
+    Augments the dataset as follows:
 
     <dataset_path>/
     ├── index.json          # Summary file already created in extract_frames()
@@ -447,6 +452,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
         idx_json = json.load(jf)
     image_folders   = idx_json['frame_folders']
     image_size      = idx_json['image_size']
+    max_n_instances = 0
 
     model = infer_mask.load_model(Path(model_path))
 
@@ -496,6 +502,8 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
                     csv_rows.append([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
                     csv_rows.append([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
 
+                    max_n_instances = max(max_n_instances, instance_number + 1)
+
         csv_rows.sort(key=lambda row: row[0])
 
         # Write to CSV
@@ -503,6 +511,11 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
             csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
             csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
             csvwriter.writerows(csv_rows)
+        
+        idx_json['status'] = 'masks_detected'
+        idx_json['max_n_instances'] = max_n_instances
+        with open(dataset_path / 'index.json', 'w') as jf:
+            json.dump(idx_json, jf, indent=2)
 
 
 def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
@@ -513,7 +526,7 @@ def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
     return -1
 
 
-def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict):
+def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str]):
     """
     └── keypoint_results/
         └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
@@ -539,38 +552,53 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
         print(f"processing frames for video {view}...")
         files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / "files_crop.csv")))
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        frame2prediction: KeypointsDict = KeypointsDict()
+        frame2prediction: dict[str, KeypointsDict] = defaultdict(KeypointsDict)
         input_path = dataset_path / view / 'bbox-masked_image'
 
         for img in sorted(input_path.iterdir()):
             frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
+            instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                frame2prediction[frame_number] = {}
+                frame2prediction[frame_number] = KeypointsDict()
                 _, instances = infer_keypoints.inference(model, img)
 
-                if len(instances) == 0:
+                if len(instances) != 1:
                     """
-                    this means no instance was detected - however, 
-                    we know that there is an instance in the image because all images used here 
-                    are pre-filtered for containing instances by the instance segmentation step.
-                    so we indicate that with -1-confidences. 
+                    this means either:
+                        no instance was detected - however, 
+                        we know that there is an instance in the image because all images used here 
+                        are pre-filtered for containing instances by the instance segmentation step.
+                    or:
+                        multiple instances were detected - however,
+                        we get a separate image per instance from the instance segmentation step,
+                        so this is a false positive.
+                    In both cases, we indicate that with a -1 instance number and all -1 coordinate and conf values.
                     """
                     print(f"   keypoint-detection missed all instances in frame {frame_number} ({Path(img).name})")
                     frame2prediction[frame_number]['-1'] = no_instance_detected_dict
-
-                for instance_number, kpts in enumerate(instances):
-                    print(f"   processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
-                    if len(kpts) == 0:
-                        print("      keypoint-detection missed this instance")
-                        frame2prediction[frame_number][str(instance_number)] = no_instance_detected_dict
-                    else:
-                        frame2prediction[frame_number][str(instance_number)] = zero_dict
+                    continue       
+                
+                # TODO: If keypoint detection detected multiple instances, get the instance with the best criteria, e.g. most keypoints detected. The other instance is considered a wrong detection.
+                kpts = instances[0]
+                print(f"   processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
+                if len(kpts) == 0:
+                    # we know there is an instance in the image because of the instance segmentation step,
+                    # but keypoint detection missed it.
+                    print("      keypoint-detection missed this instance")
+                    frame2prediction[frame_number][str(instance_number)] = no_instance_detected_dict
+                else:
+                    frame2prediction[frame_number][str(instance_number)] = zero_dict
                     for index, (x, y, c) in enumerate(kpts):
                         print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
                         frame2prediction[frame_number][str(instance_number)][kpt_names_dict[index]] = [
-                            x, y, (c if (x > 0 or y > 0) else 0) # undetected keypoints indicated by x=y=0
+                            x, y, (c if (x > 0 or y > 0) else 0.0) # undetected keypoints indicated by x=y=0 -> also conf=0.0
                         ] 
 
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             pickle.dump(frame2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        index_json['keypoint_list'] = list(kpt_names_dict.values())
+        index_json['status'] = 'keypoints_detected'
+        with open(dataset_path / 'index.json', 'w') as jf:
+            json.dump(index_json, jf, indent=2)

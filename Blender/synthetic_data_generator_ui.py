@@ -156,7 +156,12 @@ class SYNTH_PropertyGroup(PropertyGroup):
 
     keep_occluded_keypoints: BoolProperty(
         name="Keep Occluded Keypoints",
-        description="If checked, keep coordinates of occluded keypoints and set their 'visibility' to 1. YOLO allows three 'visibility' values for each keypoint; 0 for missing / not inside the image bounds, 1 for occluded but ininside the image bounds, and 2 for visible. This will influence the inference of visibility score calculation.",
+        description="""
+        If checked, keep coordinates of occluded keypoints and set their 'visibility' to 1. This reflects the convention 0=missing, 1=occluded, 2=visible.
+        In context of YOLO pose model training/inference:
+        Ultralytics models generally treat visibility/confidence as a continuous value, not strictly as discrete 0/1/2 flags. However, in practice, datasets like COCO and hand-keypoints may use such flags for annotation. For training, Ultralytics typically treats both 1 (occluded) and 2 (visible) as present and contributing to loss calculation, while 0 means the keypoint is ignored.
+        Visibility information for keypoints in Ultralytics is indicated by the has_visible attribute of the Keypoints class, which tells you if the keypoint data includes a visibility/confidence value. This information is typically stored as the third value in the keypoints tensor (shape [N, K, 3]), where the three elements are (x, y, conf) or (x, y, visibility).
+        """,
         default=False
     )
 

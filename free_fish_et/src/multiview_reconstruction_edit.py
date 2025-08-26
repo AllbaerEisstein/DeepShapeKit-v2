@@ -40,7 +40,7 @@ def initialize_model(mesh_file: str, device: str) -> tuple:
         bone_weight=200,
         mask_weight=200,
         smooth_weights=[100, 100, 20],
-        device=device,
+        device=torch.device(device),
         fish_model_obj=fish
     )
     renderer = Silhouette_Renderer(device=device)
@@ -126,7 +126,7 @@ def reconstruct(
         mesh_path: str,
         dataset_dir: str,
         outdir: str,
-        index: list[int],
+        frame_indices: list[int],
         instance_number: int,
         seed: int = 1,
         save_models: bool = False
@@ -144,11 +144,11 @@ def reconstruct(
 
     parameters = []
     sample_data = []
-    start_idx = index[0]
+    start_idx = frame_indices[0]
 
-    pbar = tqdm(total=len(index), desc=f'video {os.path.basename(dataset_dir)}')
+    pbar = tqdm(total=len(frame_indices), desc=f'video {os.path.basename(dataset_dir)}')
 
-    for idx in index:
+    for idx in frame_indices:
         try:
             sample = dataset[idx]
         except IndexError:
@@ -190,13 +190,13 @@ def reconstruct(
     pbar.close()
     save_pose_pickle(
         outdir      = outdir, 
-        start       = index[0], 
-        end         = index[-1],
+        start       = frame_indices[0], 
+        end         = frame_indices[-1],
         fish_place  = instance_number, 
         parameters  = parameters, 
         sample_data = sample_data, 
         mesh_file   = mesh_path, 
-        index       = index
+        index       = frame_indices
     )
 
 
@@ -217,7 +217,7 @@ if __name__ == '__main__':
         mesh_path=args.mesh,
         dataset_dir=args.datadir,
         outdir=args.outdir,
-        index=args.index,
+        frame_indices=args.index,
         instance_number=args.fish_place,
         seed=args.seed,
         save_models=args.save_models

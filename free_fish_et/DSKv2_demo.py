@@ -13,16 +13,22 @@ if __name__ == '__main__':
     videos = [
         Path(path) for path in 
             [
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/left.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/bottom.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/top_right.mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/left.mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/bottom.mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/top_right.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/006_Positive Z (Fish Ventral Side).mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/004a_Positive X (Fish Front).mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/003_Fish Top R.mp4',
             ]
     ]
 
-    segmentation_model_path = Path('src/DSKv2/segment_bluegill.pt')
-    pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
-    mesh_path               = '../../bluegill_data/bluegill_mesh.json'
-    out_path                = Path('src/results')
+    # segmentation_model_path = Path('src/DSKv2/segment_bluegill.pt')
+    # pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
+    segmentation_model_path = Path('src/DSKv2/cygill_seg.pt')
+    pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
+    mesh_path               = 'DSKv2/Bluegill_Body.json'
+    cam_matrices_path       = 'src/DSKv2/cam_matrices.json'
+    out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'
     dataset_folder_path     = (out_path / dataset_folder_name).absolute()
     final_output_folder     = 'src/results/output/'
@@ -91,7 +97,7 @@ if __name__ == '__main__':
             mesh_path       = mesh_path,
             dataset_dir     = str(dataset_folder_path),
             outdir          = final_output_folder,
-            index           = index,
+            frame_indices           = index,
             instance_number = instance_number,
             seed            = seed,
             save_models     = save_models

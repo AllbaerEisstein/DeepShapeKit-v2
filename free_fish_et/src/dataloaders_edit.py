@@ -1,3 +1,4 @@
+from collections import defaultdict
 import csv
 import os
 import cv2
@@ -28,7 +29,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             │   └── ...
             ├── mask_full/      # raw masks full-frame (optional: you could save them here)
             │   └── ... one full-frame mask per detection, size HxW (2048x1040)
-            ├── bbox-masked_image/      # images at original size as but black everywhere
+            ├── bbox-masked_image/      # images at original size but black everywhere
             │   │                         except inside the bounding boxes, where the original content is kept.
             |   ├── image_0_1_bbox-masked.png
             │   └── ... one full-frame bbox-masked image per detection, size HxW
@@ -70,9 +71,9 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         print("DATASET ROOT: "+str(self.root))
         with open(self.root / 'index.json', 'r') as jf:
             self.index_json = json.load(jf)
-        self.views = self.index_json["frame_folders"]
+        self.views: list[str] = self.index_json["frame_folders"]
 
-        self.keypoints_confs: dict[str, KeypointsDict] = {
+        self.view_2_kpts: dict[str, dict[str, KeypointsDict]] = {
             v: pickle.load(
                 open(self.root / v / 'keypoints_results' / f'keypoints_confs.pickle', 'rb')
             ) for v in self.views
@@ -87,31 +88,35 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         }
 
         # mask crop entries per view, grouped by origin frame
-        self.masks_meta: dict[str, dict] = {
-            #                  │    └──> the rows of the files_crop.csv with category mask
-            #                  └──> frame number string
+        self.masks_meta: dict[str, dict[str, list[dict]]] = {
+            #                  |         |     └──> the rows of the files_crop.csv for this view and this frame with category mask
+            #                  |         └──> frame number string
+            #                  └──> view name
             v: self._group_csv(v, 'files_crop.csv', filter_cat='mask')
             for v in self.views
         }
 
         # mask crop entries per view, grouped by origin frame
-        self.masks_full_meta: dict[str, dict] = {
-            #                       │    └──> the rows of the files_crop.csv with category mask_full
-            #                       └──> frame number string
+        self.masks_full_meta: dict[str, dict[str, list[dict]]] = {
+            #                       |         |     └──> the rows of the files_crop.csv for this view and this frame with category mask
+            #                       |         └──> frame number string
+            #                       └──> view name
             v: self._group_csv(v, 'files_crop.csv', filter_cat='mask_full')
             for v in self.views
         }
 
-        self.cropped_meta: dict[str, dict] = {
-            #                    │    └──> the rows of the files_crop.csv with category cropped
-            #                    └──> frame number string
+        self.cropped_meta: dict[str, dict[str, list[dict]]] = {
+            #                    |         |     └──> the rows of the files_crop.csv for this view and this frame with category mask
+            #                    |         └──> frame number string
+            #                    └──> view name
             v: self._group_csv(v, 'files_crop.csv', filter_cat='cropped')
             for v in self.views
         }
 
-        self.bbox_masked_meta: dict[str, dict] = {
-            #                       │    └──> the rows of the files_crop.csv with category bbox-masked
-            #                       └──> frame number string
+        self.bbox_masked_meta: dict[str, dict[str, list[dict]]] = {
+            #                        |         |     └──> the rows of the files_crop.csv for this view and this frame with category mask
+            #                        |         └──> frame number string
+            #                        └──> view name
             v: self._group_csv(v, 'files_crop.csv', filter_cat='bbox-masked')
             for v in self.views
         }
@@ -136,11 +141,13 @@ class Multiview_Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict:
         frame_key = str(idx)
 
-        views_missing = 0
+        # raise an index error if we don't have at least two views with annotations
+        views_with_annot = len(self.views)
         for view in self.views:
-            if frame_key not in self.masks_meta[view]:
-                views_missing += 1
-            if views_missing > 1:
+            if frame_key not in [str(frame_with_annot) for frame_with_annot in self.masks_meta[view]]:
+                views_with_annot -= 1
+            # two views are the minimum to perform 3d reconstruction
+            if views_with_annot < 2:
                 raise IndexError # to be handled by the caller
     
         sample = {'frames': [], 'imgpaths': [], 'instances': None}
@@ -156,7 +163,35 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             masks_rows      = self.masks_meta[view].get(origin_frame_number, [])
             crops_rows      = self.cropped_meta[view].get(origin_frame_number, [])
             full_masks_rows = self.masks_full_meta[view].get(origin_frame_number, [])
+
             # sort by sub_index to keep instance order
+            for inst in range(self.index_json['max_n_instances']):
+                if not any(r['sub_index'] == str(inst) for r in masks_rows):
+                    # add empty entries for missing instances
+                    masks_rows.append({
+                        'frame':        origin_frame_number,
+                        'file_loc':     '', # no mask
+                        'category':     'mask',
+                        'sub_index':    str(inst),
+                        'folder':       view,
+                        'bbox':         '[0,0,0,0]',
+                    })
+                if not any(r['sub_index'] == str(inst) for r in crops_rows):
+                    crops_rows.append({
+                        'frame':        origin_frame_number,
+                        'file_loc':     '', # no crop
+                        'category':     'cropped',
+                        'sub_index':    str(inst),
+                        'folder':       view,
+                    })
+                if not any(r['sub_index'] == str(inst) for r in full_masks_rows):
+                    full_masks_rows.append({
+                        'frame':        origin_frame_number,
+                        'file_loc':     '', # no full mask
+                        'category':     'mask_full',
+                        'sub_index':    str(inst),
+                        'folder':       view,
+                    })
             masks_rows      = sorted(masks_rows, key=lambda r: int(r['sub_index']))
             crops_rows      = sorted(crops_rows, key=lambda r: int(r['sub_index']))
             full_masks_rows = sorted(full_masks_rows, key=lambda r: int(r['sub_index']))
@@ -164,42 +199,51 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             # parse bboxes and load crops/full masks
             bboxes, crops, masks, full_masks = [], [], [], []
             for (crops_rows, masks_rows, full_masks_rows) in zip(crops_rows, masks_rows, full_masks_rows):
+                if crops_rows['file_loc'] == '' or masks_rows['file_loc'] == '' or full_masks_rows['file_loc'] == '':
+                    # missing instance -> add empty entries
+                    bboxes.append([0,0,0,0])
+                    crops.append(np.zeros((1, 1), dtype=np.uint8))
+                    masks.append(np.zeros((1, 1), dtype=np.uint8))
+                    full_masks.append(np.zeros((self.index_json['image_size'][1], self.index_json['image_size'][0]), dtype=np.uint8))
+                    continue
                 bbox = self._parse_bbox(masks_rows['bbox'])
                 bboxes.append(bbox)
                 crops.append(self._load_grayscale_image(view, crops_rows['file_loc']))
                 masks.append(self._load_grayscale_image(view, masks_rows['file_loc']))
                 full_masks.append(self._load_grayscale_image(view, full_masks_rows['file_loc']))
 
-            # extract DLC keypoints for each instance
-            kpt_list = self._extract_keypoints(view, 
-                                               self.keypoints_confs, 
+            # extract keypoints for each instance
+            kpt_list: list[torch.Tensor] = self._extract_keypoints(view, 
+                                               self.view_2_kpts, 
                                                idx, 
-                                               len(bboxes), 
-                                               flip=(view=='bottom')
+                                               flip=False
             )            
 
             view_data[view] = {
                 'img_path':     str(origin_img_path),
                 'bboxes':       torch.tensor(bboxes, dtype=torch.int64),              # (N,4)
-                'crops':        torch.stack([torch.from_numpy(c) for c in crops]),   # (N,Hc,Wc)
-                'masks':        torch.stack([torch.from_numpy(m) for m in masks]),
+                #'crops':        torch.stack([torch.from_numpy(c) for c in crops]),   # (N,Hc,Wc)
+                #'masks':        torch.stack([torch.from_numpy(m) for m in masks]),
                 'masks_full':   torch.stack([torch.from_numpy(m) for m in full_masks]),
                 'keypoints':    torch.stack(kpt_list),                             # (N,K,3)
-                'instances':    len(bboxes)
             }
 
         sample['imgpaths']    = [view_data[v]['img_path'] for v in self.views]
         sample['frames']      = list(range(len(self.views)))
-        sample['instances']   = max(view_data[v]['instances'] for v in self.views)
-        # stack per-view data for use by pipeline
-        # view2n_instances = {v: data['bboxes'].shape[0] for v, data in view_data.items()}
-        # sample['instances']   = torch.stack([view2n_instances[v]        for v in self.views])
+        sample['instances']   = self.index_json['max_n_instances']
         sample['bboxes']      = torch.stack([view_data[v]['bboxes']     for v in self.views])      # (V,N,4)
-        sample['crops']       = torch.stack([view_data[v]['crops']      for v in self.views])
-        sample['masks']       = torch.stack([view_data[v]['masks']      for v in self.views])      # (V,N,Hc,Wc)
+        #sample['crops']       = torch.stack([view_data[v]['crops']      for v in self.views])
+        #sample['masks']       = torch.stack([view_data[v]['masks']      for v in self.views])      # (V,N,Hc,Wc)
         sample['masks_full']  = torch.stack([view_data[v]['masks_full'] for v in self.views])      # (V,N,Hf,Wf)
         sample['keypoints']   = torch.stack([view_data[v]['keypoints']  for v in self.views])      # (V,N,K,3)
         sample['full_kpts']   = True
+        # -> sample["masks_full"][<view_index>][<instance_index>] gives the mask image loaded as matrix of that instance in that view
+        # -> sample["keypoints"][<view_index>][<instance_index>][<keypoint_index>] gives the (x,y,conf) of that keypoint of that instance in that view
+
+        for attr in ['bboxes', 'masks_full', 'keypoints']:
+            sample[attr]     = sample[attr].transpose(0, 1)
+        # -> sample["masks_full"][<instance_index>][<view_index>] gives the mask image loaded as matrix of that instance in that view
+        # -> sample["keypoints"][<instance_index>][<view_index>][<keypoint_index>] gives the (x,y,conf) of that keypoint of that instance in that view
 
         self.prev_data = sample
         return sample
@@ -207,30 +251,30 @@ class Multiview_Dataset(torch.utils.data.Dataset):
     def _read_csv_dict(self, view: str, filename: str, key: str, val: str|None = None) -> dict:
         """
         Return a dict that has keys which are the values of a csv in a specific column (key).
-        The values of the dict are either the complete row of the csv or an of the row in column 'value'.
+        The values of the dict are either the complete row of the csv or the value of the row in column 'value'.
         """
         path = self.root / view / filename
         with open(path) as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, quotechar='"')
             d = {}
             for row in reader:
                 d[row[key]] = row if val is None else row[val]
             return d
 
-    def _group_csv(self, view: str, filename: str, filter_cat: str) -> dict[int, dict]:
+    def _group_csv(self, view: str, filename: str, filter_cat: str) -> dict[str, list[dict]]:
         """
         Returns a dict with one entry per frame if the frame has the specified category.
         {frame_number1: <files_crop.csv row for that file if the file has the specified category>}
         """
         path = self.root / view / filename
-        d = {}
+        d = defaultdict(list)
         with open(path) as f:
-            reader = csv.DictReader(f, quotechar=' ')
+            reader = csv.DictReader(f, quotechar='"')
             for row in reader:
                 if row['category'] != filter_cat:
                     continue
-                frame = row['frame']
-                d.setdefault(frame, []).append(row)
+                frame = str(row['frame'])
+                d[frame].append(row)
         return d
 
     def _parse_bbox(self, bbox_str: str) -> list[int]:
@@ -247,53 +291,71 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         # except Exception as e:
         #     print("PIL failed:", e)
         return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE))
+    
+    def _get_present_instances(self, f_idx: int) -> list[int]:
+        """
+        Get the instances that shall be reconstructed in frame f_idx.
+        This is determined by the maximum number of detected instances across all views.
+        """
+        present_instances = set()
+        for view in self.views:
+            n = set(int(row["sub_index"]) for row in self.masks_meta[view].get(str(f_idx), []) if row['category']=='mask')
+            present_instances = n.union(present_instances)
+        return list(present_instances)
 
     def _extract_keypoints(
         self,
         view: str,
-        keypoints_dict: dict,
-        idx: int,
-        n_instances: int,
+        view_2_kpts: dict[str, dict[str, KeypointsDict]],
+        f_idx: int,
         flip: bool = False
     ) -> list[torch.Tensor]:
         """
         args:
-            - keypoints_dict: dict containing keypoints and confidences per view(!), format:
+            - view_2_kpts: dict containing keypoints and confidences per view(!), format:
                 {
-                    '0': {                          x      y    conf
+                    'view1': {                      x      y    conf
                             'individual1': {        ↓      ↓     ↓
                                 'mouth tip':    [123.5,  87.2, 0.998],
                                 'gill':         [0.0,    0.0,  0.0],   <- keypoint was not detected (occluded)
                                 … 
                             },
-                            'individual2': {
-                                'mouth tip':    [-1.0,  -1.0, -1.0,],  <- keypoint detection missed this instance
+
+                            OR:
+                            '-1': {                                    <- keypoint detection detected the wrong number of instances
+                                'mouth tip':    [-1.0,  -1.0, -1.0,],  
+                                'gill':         [-1.0,  -1.0, -1.0,],
+                                … 
+                            },
+
+                            OR: 
+                            'individual1': {
+                                'mouth tip':    [-1.0,  -1.0, -1.0,],  <- keypoint detection detected no keypoints for this (definitly present) instance
                                 'gill':         [-1.0,  -1.0, -1.0,],
                                 … 
                             },
                             …
                         },
-                    '1': {…}
+                    'view2': {…}
                 }
-            - idx: index of the frame of which the keypoints shall be extracted
-            - n_instances:
+            - f_idx: index of the frame of which the keypoints shall be extracted
             - flip: 
-        Build a list of (K,3) tensors for each instance from keypoints outputs:
-            - keypoints_dict['coordinates']: list of length K each shape (M,2)
-            - keypoints_dict['confidence']:   list of length K each shape (M,1)
+        Build a list of (K,3) tensors for each instance from keypoints outputs.
         """
         #filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view]['bbox_masked'][idx][0]
-        coords = keypoints_dict[view][str(idx)]
+        inst_2_kpts: KeypointsDict = view_2_kpts[view][str(f_idx)]
         kpt_list = []
-        for inst in range(n_instances):
+        for inst in range(self.index_json['max_n_instances']):
             inst = str(inst)
             pts = []
-            for kpt_name in coords[inst]:
-                x,y     = (coords[inst][kpt_name][0], coords[inst][kpt_name][1])
-                conf    = coords[inst][kpt_name][2]
+            if inst_2_kpts.get(inst, None) is None:
+                # instance was not detected by keypoint detection
+                pts = [[-1.0, -1.0, -1.0] for _ in range(len(self.index_json['keypoint_list']))]
+                kpt_list.append(torch.tensor(pts, dtype=torch.float32))
+                continue
+            for x,y,conf in inst_2_kpts[inst].values():
                 if flip:
-                    # assume width-known; you may parametrize
-                    x = 2048 - x
+                    x = self.index_json["image_size"][0] - x
                 pts.append([x,y,conf])                              # one tuple for each kpt
             kpt_list.append(torch.tensor(pts, dtype=torch.float32)) # one tensor for reach instance
         return kpt_list

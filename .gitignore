@@ -5,3 +5,4 @@ bluegill_data/synthetic_data/*.txt
 # free_fish_et/src/results/*
 .vscode
 *yolo11*.pt
+train_yolo/runs
