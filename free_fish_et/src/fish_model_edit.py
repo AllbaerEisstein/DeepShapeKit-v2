@@ -22,10 +22,7 @@ class fish_model():
     def __init__(self, mesh, device=torch.device('cpu')):
         self.device = device
 
-        # read in fish model from the same dir
-        this_dir = os.path.dirname(__file__)
-        mesh_file = os.path.join(this_dir, mesh)
-        with open(mesh_file, 'r') as infile:
+        with open(mesh, 'r') as infile:
             dd = json.load(infile)
 
         self.dd = dd

@@ -235,7 +235,7 @@ def get_calibration_matrix_K_Blendercam2Blenderimage(camd, scene):
     v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
     skew = 0.0
     K = Matrix(((s_u, skew, u_0), (0.0, s_v, v_0), (0.0, 0.0, 1.0)))
-    return K
+    return f_in_mm, K
 
 
 def get_3x4_RT_matrix_Blender2Blendercam(cam):
@@ -251,9 +251,9 @@ def get_3x4_RT_matrix_Blender2Blendercam(cam):
 
 
 def get_3x4_P_matrix_Blendercam2Blenderimage(cam, scene):
-    K = get_calibration_matrix_K_Blendercam2Blenderimage(cam.data, scene)
+    f, K = get_calibration_matrix_K_Blendercam2Blenderimage(cam.data, scene)
     RT, R, T = get_3x4_RT_matrix_Blender2Blendercam(cam)
-    return K @ RT, K, R, T, RT
+    return f, K @ RT, K, R, T, RT
 
 
 def export_cam_matrices(context):
@@ -284,18 +284,21 @@ def export_cam_matrices(context):
                 # fallback: try to construct 4x4 translation matrix from T if it's a Vector
                 T_list = None
         P = mats.get('P')
+        f = mats.get('f')
         entry = {
+            'f': float(f) if f is not None else None,
             'K': mat_to_list(mats['K']),
             'R': mat_to_list(mats['R']),
             'T': T_list,
             'P': mat_to_list(P),
-            'view_prefix': cam.name.split('.', 1)[1] + '_' + cam.name.split('.', 1)[0] if '.' in cam.name else cam.name
+            'camera_name': cam.name
         }
-        out[cam.name] = entry
+        video_name = cam.name.split('.', 1)[1] + '_' + cam.name.split('.', 1)[0] if '.' in cam.name else cam.name
+        out[video_name] = entry
     try:
         out_path = os.path.join(resolve(p.annot_out_dir), 'cam_matrices.json')
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, 'wt') as f:
+        with open(out_path, 'w') as f:
             json.dump(out, f, indent=2)
         return out_path
     except Exception as e:
@@ -540,16 +543,16 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
 
 def get_cam_matrix_for_cam(cam_obj, scene):
     """Compute and cache camera matrices for a camera object.
-    Returns dict with keys 'K','R','T','P' where P maps Blender world -> CV image homogeneous coords.
+    Returns dict with keys 'f','K','R','T','P' where P maps Blender world -> CV image homogeneous coords.
     """
     cam_name = cam_obj.name
     if cam_name in cam_name_2_matrix and cam_name_2_matrix[cam_name].get('P') is not None:
         return cam_name_2_matrix[cam_name]
 
-    KRT, K, R, T, RT = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
+    f, KRT, K, R, T, RT = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
     # P: we want mapping from Blender world -> cv image (with y down and positive z forward)
     P = K @ BLENDER_CAM_2_CV_CAM @ RT
-    cam_name_2_matrix[cam_name] = {'K': K, 'R': R, 'T': T, 'P': P, 'RT': RT}
+    cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': R, 'T': T, 'P': P, 'RT': RT}
     return cam_name_2_matrix[cam_name]
 
 

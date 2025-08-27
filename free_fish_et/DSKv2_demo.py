@@ -26,8 +26,8 @@ if __name__ == '__main__':
     # pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
     segmentation_model_path = Path('src/DSKv2/cygill_seg.pt')
     pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
-    mesh_path               = 'DSKv2/Bluegill_Body.json'
-    cam_matrices_path       = 'src/DSKv2/cam_matrices.json'
+    mesh_path               = str(Path('src/DSKv2/Bluegill_Body.json'))
+    cam_matrices_path       = Path('src/DSKv2/cam_matrices.json')
     out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'
     dataset_folder_path     = (out_path / dataset_folder_name).absolute()
@@ -54,6 +54,7 @@ if __name__ == '__main__':
         print('extracting frames from video...')
         extract_from_video(
             videos, 
+            cam_matrices_path,
             out_path, 
             dataset_folder_name, 
             also_create_frame2video_csv=True

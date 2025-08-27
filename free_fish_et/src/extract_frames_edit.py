@@ -15,7 +15,7 @@ import src.infer_keypoints as infer_keypoints
 from src.types import *
 
 
-def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
+def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
@@ -114,6 +114,10 @@ def extract_from_video(videos: list[Path], out_dir: Path, dataset_folder_name: s
 
                 for i in range(image_count):
                     csvwriter.writerow([i, i])
+
+    with open(cam_matrices_json_path) as jf:
+        cam_matrices = json.load(jf)
+    json_index['camera_matrices'] = cam_matrices
 
     json_index['status'] = 'origin'
     json_index['image_count'] = image_count

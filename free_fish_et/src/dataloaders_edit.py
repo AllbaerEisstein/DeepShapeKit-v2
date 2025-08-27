@@ -128,6 +128,29 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             for v in self.views
         }
 
+        self.cam_matrices = self.index_json['camera_matrices']
+        self.P_list = []
+        self.f_list = []
+        self.K_list = []
+        self.principal_points_list = []
+        for v in self.views:
+            matrices_json = self.cam_matrices.get(v, None)
+            if matrices_json is None:
+                raise ValueError(f'No camera matrices found for view "{v}" in index.json')
+            P = matrices_json.get('P', None)
+            f = matrices_json.get('f', None)
+            K = matrices_json.get('K', None)
+            if P is None:
+                raise ValueError(f'No P matrix found for view "{v}" in index.json')
+            if f is None:
+                raise ValueError(f'No focal length "f" found for view "{v}" in index.json')
+            if K is None:
+                raise ValueError(f'No intrinsic matrix "K" found for view "{v}" in index.json')
+            self.P_list.append(torch.tensor(P))
+            self.f_list.append(f)
+            self.K_list.append(torch.tensor(K))
+            self.principal_points_list.append((K[0][2], K[1][2]))
+
         self.prev_data = None
 
 
@@ -136,6 +159,26 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         # assume same length across views
         return len(self.index_json["image_count"])
     
+    
+    def get_camera_matrices(self):
+        """
+        Return camera matrices for all views.
+        """
+        P_stack = torch.stack(self.P_list, 0)
+        focals = torch.tensor(self.f_list)
+        centers = torch.tensor(self.principal_points_list)
+
+        # radial distortion:
+        #   x_distorted = x * (1 + k_1*r² + k_2*r⁴ + k_3*r⁶)
+        #   y_distorted = y * (1 + k_1*r² + k_2*r⁴ + k_3*r⁶)
+        # -> zero radial distortion: k_1 = k_2 = k_3 = 0
+        # tangential distortion:
+        #   x_distorted = x + (2*p_1*x*y + p_2(r² + 2x²))
+        #   y_distorted = y + (p_1(r² + 2y²) + 2*p_2*x*y)
+        # -> zero tangetntial distortion: p_1 = p_2 = 0
+        distortion = torch.tensor([[0.0]*5]*len(self.views))
+
+        return  P_stack, focals, centers, distortion
 
 
     def __getitem__(self, idx: int) -> dict:

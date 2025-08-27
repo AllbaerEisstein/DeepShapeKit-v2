@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import torch
 
 
-import src.multiview as multiview
+import src.multiview_edit as multiview
 import src.multiview_utils as mutil
 
 from tqdm import tqdm
@@ -32,7 +32,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
 
 
 def initialize_model(mesh_file: str, device: str) -> tuple:
-    fish = fish_model(mesh=mesh_file)
+    fish = fish_model(mesh=mesh_file, device=torch.device(device))
     optimizer = OptimizeMV(
         num_iters=100,
         lim_weight=200,
@@ -60,6 +60,8 @@ def process_frame(sample: dict, instance_number: int):
 
     # Normalize mask to [0,1] on appropriate device
     masks = masks.to(device) / 255.
+    keypoints = keypoints.to(device)
+    bboxes = bboxes.to(device)
     return sample['frames'], sample['imgpaths'], keypoints, masks, bboxes
 
 
@@ -142,6 +144,8 @@ def reconstruct(
     fish, optimizer, renderer = initialize_model(mesh_path, device)
     dataset = load_multiview_dataset(dataset_dir)
 
+    Ps, focals, centers, distortion = dataset.get_camera_matrices()
+
     parameters = []
     sample_data = []
     start_idx = frame_indices[0]
@@ -167,8 +171,9 @@ def reconstruct(
         # initialize from previous solution if available
         init = None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
 
+        # fish, keypoints, masks, bboxes already on device
         result = multiview.fit_mesh(
-            fish, optimizer, keypoints, frames, masks,
+            fish, optimizer, Ps, keypoints, frames, masks,
             renderer, device, *([] if init is None else init),
             img_filenames=img_paths, index=idx, bboxs=bboxes
         )
