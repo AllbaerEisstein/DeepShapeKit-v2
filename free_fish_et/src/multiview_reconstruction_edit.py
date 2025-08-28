@@ -32,7 +32,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
 
 
 def initialize_model(mesh_file: str, device: str) -> tuple:
-    fish = fish_model(mesh=mesh_file, device=torch.device(device))
+    fish = fish_model(mesh=mesh_file, device=device)
     optimizer = OptimizeMV(
         num_iters=100,
         lim_weight=200,

@@ -68,11 +68,22 @@ class OptimizeMV:
           keypoints: tensor (V, K, 3) 2D keypoints + confidence
           masks: tensor (V, H, W) silhouette masks
         """
+        # ===== Move data to device =====
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        init_pose  =    init_pose.to(device)
+        init_bone  =    init_bone.to(device)
+        init_t     =    init_t.to(device)
+        init_scale =    init_scale.to(device)
+        proj_m     =    proj_m.to(device)
+        keypoints  =    keypoints.to(device)
+        masks      =    masks.to(device)
+
         # ===== Prepare data =====
         batch_size = proj_m.shape[0]
         kpts_2d = keypoints[..., :2]
         kpts_conf = keypoints[..., 2].clone()
         # Disable unreliable keypoints
+        # TODO: what is this?
         kpts_conf[0, -3] = 0
         kpts_conf[1, -1] = 0
 
@@ -104,6 +115,7 @@ class OptimizeMV:
                 model_kpts, proj_m, kpts_2d, kpts_conf) \
                 + self.prior_weight * (global_t - init_t).abs().sum()
             # Silhouette loss
+            # TODO: expand to multiple views
             sil_f = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t, 'front')
             sil_b = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t, 'bottom')
             loss += mask_fitting_loss(
