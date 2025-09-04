@@ -22,7 +22,19 @@ from src.pose_optimizer_edit import OptimizeMV
 from src.Silhouette_Renderer import Silhouette_Renderer
 
 
-def fit_geometry(fish: fish_model, keypoints, Ps, init_pose=None, init_bone=None):
+def fit_geometry(
+    fish: fish_model,
+    keypoints: torch.Tensor,
+    Ps: torch.Tensor, 
+    Ks: torch.Tensor, 
+    Rs: torch.Tensor, 
+    Ts: torch.Tensor, 
+    focals: torch.Tensor, 
+    centers: torch.Tensor, 
+    distortions: torch.Tensor,
+    init_pose=None,
+    init_bone_l=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Initial fit with geometry: triangulation + Procrustes
     Input:
@@ -32,23 +44,25 @@ def fit_geometry(fish: fish_model, keypoints, Ps, init_pose=None, init_bone=None
     """
 
     # 3D kpts on bird
-    if init_pose == None and init_bone == None:
-        fish_kpts = torch.matmul(fish.vert2kpt, fish.V[0])
+    if init_pose == None and init_bone_l == None:
+        # initial position: rest pose
+        fish_mesh_kpts_local = torch.matmul(fish.vert2kpt, fish.V[0])
     else:
+        # no global orientation - because fish mesh coordinates are local coordinates?
         init_ori = torch.zeros([1, 3]).float()
-
-        bird_output = fish(init_ori, init_pose, init_bone)
-        fish_kpts = bird_output["keypoints"][0]
+        fish_articulated = fish(init_ori, init_pose, init_bone_l)
+        fish_mesh_kpts_local = fish_articulated["keypoints"][0]
 
     # Triangulation with LBFGS
-    kpts_3d = mutils.get_gt_3d(keypoints, Ps, LBFGS=True)
+    observed_kpts_3d = mutils.get_gt_3d(keypoints, Ps, Ks, Rs, Ts, focals, centers, distortions, LBFGS=True)
 
-    valid_3d = kpts_3d[:, -1] > 0
-    valid_kpts_3d = kpts_3d[valid_3d, :3]
-    fish_kpts = fish_kpts[valid_3d, :]
+    valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0
+    valid_kpts_3d = observed_kpts_3d[valid_kpts_3d_boolmask, :3]
+    fish_mesh_kpts_local = fish_mesh_kpts_local[valid_kpts_3d_boolmask, :]
 
     # Procrustes with available 3D kpts
-    R, t, s = mutils.Procrustes(fish_kpts, valid_kpts_3d)
+    # procrustes 
+    R, t, s = mutils.Procrustes(fish_mesh_kpts_local, valid_kpts_3d)
     aa, _ = cv2.Rodrigues(R.numpy())
 
     init_ori = torch.tensor(aa).reshape(1, 3).float()
@@ -61,9 +75,14 @@ def fit_geometry(fish: fish_model, keypoints, Ps, init_pose=None, init_bone=None
 def fit_mesh(
     fish: fish_model,
     optimizer: OptimizeMV,
-    Ps: torch.Tensor,
+    Ps: torch.Tensor, 
+    Ks: torch.Tensor, 
+    Rs: torch.Tensor, 
+    Ts: torch.Tensor, 
+    focals: torch.Tensor, 
+    centers: torch.Tensor, 
+    distortions: torch.Tensor,
     keypoints: torch.Tensor,
-    frames: torch.Tensor,
     masks: torch.Tensor,
     renderer: Silhouette_Renderer,
     device: str,
@@ -83,19 +102,21 @@ def fit_mesh(
         init_bone (vn, 4): bone length
     """
     # move to device
-    keypoints = keypoints.to(device)
-    Ps = Ps.to(device)
+    keypoints, masks, Ps, Ks, Rs, Ts, focals, centers, distortions = keypoints.to(device), masks.to(device), Ps.to(device), Ks.to(device), Rs.to(device), Ts.to(device), focals.to(device), centers.to(device), distortions.to(device)
     fish.to_device(device)
-    
+    cam_params = [Ps, Ks, Rs, Ts, focals, centers, distortions]
     assert (
-        Ps.device
-        == keypoints.device
-        == fish.device
-        == device
+        all(keypoints.device == param.device for param in cam_params+[masks, fish])
         and fish.device_active == True
-    ), "All inputs must be on the same device as specified"
+    ), "keypoints, Ps, Ks, Rs, Ts, focals, centers, distortions, masks, fish must be on the same device as specified"
 
-    if (init_ori != None or init_t != None or init_s != None or init_pose != None or init_bone != None):
+    if (
+        init_ori != None
+        or init_t != None
+        or init_s != None
+        or init_pose != None
+        or init_bone != None
+    ):
         has_prev = True
         # optimizer.prior_weight = 80
     else:
@@ -104,14 +125,14 @@ def fit_mesh(
     ### Triangulation + Procrustes as initialization
     if init_ori == None and init_t == None and init_s == None:
         init_ori, init_t, init_s = fit_geometry(
-            fish, keypoints, frames, init_pose=init_pose, init_bone=init_bone
+            fish, keypoints, *cam_params, init_pose=init_pose, init_bone_l=init_bone
         )
 
     ### If not provided (as in multiview), initialize with canonical
     if init_pose is None:
-        init_pose = torch.zeros([1, c.num_bone * 3])
+        init_pose = torch.zeros([1, fish.n_bones * 3])
     if init_bone is None:
-        init_bone = torch.ones([1, c.num_bone])
+        init_bone = torch.ones([1, fish.n_bones])
 
     #### Change suitable format for optimizer
     ###### particularly, combine orient and body pose
@@ -122,14 +143,7 @@ def fit_mesh(
     init_t = init_t.float().to(device)
 
     assert (
-        init_pose.device
-        == init_bone.device
-        == init_t.device
-        == init_s.device
-        == Ps.device
-        == keypoints.device
-        == fish.device
-        == device
+        all(keypoints.device == param.device for param in cam_params+[masks, fish, init_pose, init_bone, init_s, init_t])
         and fish.device_active == True
     ), "All inputs must be on the same device as specified"
 
@@ -177,7 +191,7 @@ def multiview_rigid_alignment(
 
     ### Triangulation + Procrustes for global alignemnt
     global_orient, global_t, scale = fit_geometry(
-        fish, keypoints, frames, init_pose=pose, init_bone=bone
+        fish, keypoints, frames, init_pose=pose, init_bone_l=bone
     )
 
     ### Optimization to improve alignment

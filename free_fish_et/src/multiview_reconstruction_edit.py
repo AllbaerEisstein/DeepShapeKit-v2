@@ -144,7 +144,8 @@ def reconstruct(
     fish, optimizer, renderer = initialize_model(mesh_path, device)
     dataset = load_multiview_dataset(dataset_dir)
 
-    Ps, focals, centers, distortion = dataset.get_camera_matrices()
+    # Ps, Ks, Rs, Ts, focals, centers, distortions = dataset.get_camera_matrices()
+    cam_params = dataset.get_camera_matrices()
 
     parameters = []
     sample_data = []
@@ -171,9 +172,8 @@ def reconstruct(
         # initialize from previous solution if available
         init = None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
 
-        # fish, keypoints, masks, bboxes already on device
         result = multiview.fit_mesh(
-            fish, optimizer, Ps, keypoints, frames, masks,
+            fish, optimizer, *cam_params, keypoints, masks,
             renderer, device, *([] if init is None else init),
             img_filenames=img_paths, index=idx, bboxs=bboxes
         )

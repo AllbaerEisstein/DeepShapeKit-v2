@@ -129,10 +129,13 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         }
 
         self.cam_matrices = self.index_json['camera_matrices']
-        self.P_list = []
-        self.f_list = []
-        self.K_list = []
-        self.principal_points_list = []
+        self.P_list:                list[torch.Tensor]  = []
+        self.f_list:                list[float]         = []
+        self.K_list:                list[torch.Tensor]  = []
+        self.R_list:                list[torch.Tensor]  = []
+        self.T_list:                list[torch.Tensor]  = []
+        self.principal_points_list: list[tuple]         = []
+        self.distortions_list:      list[tuple]         = []
         for v in self.views:
             matrices_json = self.cam_matrices.get(v, None)
             if matrices_json is None:
@@ -140,45 +143,70 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             P = matrices_json.get('P', None)
             f = matrices_json.get('f', None)
             K = matrices_json.get('K', None)
+            R = matrices_json.get('R', None)
+            T = matrices_json.get('T', None)
+            d = matrices_json.get('distortion', None)
+            if d is not None:
+                rad_1 = d.get('rad_1', None)
+                rad_2 = d.get('rad_2', None)
+                tan_1 = d.get('tan_1', None)
+                tan_2 = d.get('tan_2', None)
+                rad_3 = d.get('rad_3', None)
+                for coeff, name in [ (rad_1, 'rad_1'), (rad_2, 'rad_2'), (tan_1, 'tan_1'), (tan_2, 'tan_2'), (rad_3, 'rad_3') ]:
+                    if coeff is None:
+                        raise ValueError(f'Distortion coefficient "{name}" not found in index.json')
+                self.distortions_list.append( (rad_1, rad_2, tan_1, tan_2, rad_3) )
+            else: # if distortion is not specified, set distortion coefficients to 0, i.e. no distortion.
+                # radial distortion:
+                #   x_distorted = x * (1 + rad_1*r² + rad_2*r⁴ + rad_3*r⁶)
+                #   y_distorted = y * (1 + rad_1*r² + rad_2*r⁴ + rad_3*r⁶)
+                # -> zero radial distortion: rad_1 = rad_2 = rad_3 = 0
+                # tangential distortion:
+                #   x_distorted = x + (2*tan_1*x*y + tan_2(r² + 2x²))
+                #   y_distorted = y + (tan_1(r² + 2y²) + 2*tan_2*x*y)
+                # -> zero tangetntial distortion: tan_1 = tan_2 = 0
+                # self.distortions_list might be [(0,0,0,0,0)]*len(self.views) or [(0,0,0,0,0), some_dist, (0,0,0,0,0), some_other_dist],
+                # so a mix of cameras with distortions and cameras without distortions is allowed.
+                self.distortions_list.append((0.0,)*5)
             if P is None:
                 raise ValueError(f'No P matrix found for view "{v}" in index.json')
             if f is None:
                 raise ValueError(f'No focal length "f" found for view "{v}" in index.json')
             if K is None:
                 raise ValueError(f'No intrinsic matrix "K" found for view "{v}" in index.json')
+            if R is None:
+                raise ValueError(f'No rotation matrix "R" found for view "{v}" in index.json')
+            if T is None:
+                raise ValueError(f'No translation matrix "T" found for view "{v}" in index.json')
             self.P_list.append(torch.tensor(P))
             self.f_list.append(f)
             self.K_list.append(torch.tensor(K))
+            self.R_list.append(torch.tensor(R))
+            self.T_list.append(torch.tensor(T))
             self.principal_points_list.append((K[0][2], K[1][2]))
 
         self.prev_data = None
 
 
 
-    def __len__(self) -> int:
-        # assume same length across views
-        return len(self.index_json["image_count"])
-    
-    
     def get_camera_matrices(self):
         """
         Return camera matrices for all views.
         """
         P_stack = torch.stack(self.P_list, 0)
+        K_stack = torch.stack(self.K_list, 0)
+        R_stack = torch.stack(self.R_list, 0)
+        T_stack = torch.stack(self.T_list, 0)
         focals = torch.tensor(self.f_list)
         centers = torch.tensor(self.principal_points_list)
+        dists = torch.tensor(self.distortions_list)
 
-        # radial distortion:
-        #   x_distorted = x * (1 + k_1*r² + k_2*r⁴ + k_3*r⁶)
-        #   y_distorted = y * (1 + k_1*r² + k_2*r⁴ + k_3*r⁶)
-        # -> zero radial distortion: k_1 = k_2 = k_3 = 0
-        # tangential distortion:
-        #   x_distorted = x + (2*p_1*x*y + p_2(r² + 2x²))
-        #   y_distorted = y + (p_1(r² + 2y²) + 2*p_2*x*y)
-        # -> zero tangetntial distortion: p_1 = p_2 = 0
-        distortion = torch.tensor([[0.0]*5]*len(self.views))
+        return  P_stack, K_stack, R_stack, T_stack, focals, centers, dists
 
-        return  P_stack, focals, centers, distortion
+
+    def __len__(self) -> int:
+        # assume same length across views
+        return len(self.index_json["image_count"])
 
 
     def __getitem__(self, idx: int) -> dict:

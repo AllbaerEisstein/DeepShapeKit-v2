@@ -41,6 +41,8 @@ class fish_model():
 
         self.dd = dd
 
+        self.n_bones = dd["n_bones"]
+
         # triangulate if input mesh has quad faces
         fish_faces = dd['F']
         triangle_faces = []
@@ -62,6 +64,7 @@ class fish_model():
         self.weights = torch.tensor(dd['weights'])
         self.vert2kpt = torch.tensor(dd['vert2kpt'])
 
+        # TODO: there used to be an unsqueeze(0) added and output V used to be (1, V, 3) - same for J
         self.J = torch.tensor(dd['J']).unsqueeze(0)
 
         self.V = torch.tensor(dd['V']).unsqueeze(0)
@@ -75,11 +78,17 @@ class fish_model():
     
     def to_device(self, device: str):
         self.device = torch.device(device)
+        self.kintree_table = self.kintree_table.to(device)
+        self.parents = self.parents.to(device)
         self.faces = self.faces.to(self.device)
         self.weights = self.weights.to(self.device)
         self.vert2kpt = self.vert2kpt.to(self.device)
         self.J = self.J.to(self.device)
         self.V = self.V.to(self.device)
+        if not all(self.faces.device == attr.device for attr in [self.kintree_table, self.parents, self.weights, self.vert2kpt, self.J, self.V]):
+            raise ValueError("failed to move all fish object attributes to the same device")
+        self.LBS = LBS(self.J, self.parents, self.weights)
+        self.device = self.faces.device
         self.device_active = True
 
     def __call__(self, global_pose, body_pose, bone_length, scale=1, pose2rot=True):
@@ -91,11 +100,13 @@ class fish_model():
             scale: (B, 1) scale factor
             pose2rot: if True, convert axis-angle to rotation matrix inside LBS
         """
+        assert all(self.faces.device == attr.device for attr in [global_pose, body_pose, bone_length]), "All inputs must be on the same device as specified"
+        
         batch_size = global_pose.shape[0]
         V = self.V.repeat([batch_size, 1, 1]) * scale
 
         # concatenate bone and pose
-        bone = torch.cat([torch.ones([batch_size, 1]).to(self.device), bone_length], dim=1)
+        bone = torch.cat([torch.ones([batch_size, 1], device=self.device), bone_length], dim=1)
         pose = torch.cat([global_pose, body_pose], dim=1)
 
         # LBS

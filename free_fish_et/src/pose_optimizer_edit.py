@@ -41,17 +41,17 @@ class OptimizeMV:
 
         # Load parametric fish mesh and faces
         self.fish = fish_model_obj
-        self.faces = self.fish.faces.to(self.device)
+
 
     def __call__(
         self,
-        init_pose,
-        init_bone,
-        init_t,
-        init_scale,
-        proj_m,
-        keypoints,
-        masks,
+        init_pose: torch.Tensor,
+        init_bone: torch.Tensor,
+        init_t: torch.Tensor,
+        init_scale: torch.Tensor,
+        proj_m: torch.Tensor,
+        keypoints: torch.Tensor,
+        masks: torch.Tensor,
         silhouette_renderer,
         has_prev=False,
         img_filenames=None,
@@ -68,15 +68,12 @@ class OptimizeMV:
           keypoints: tensor (V, K, 3) 2D keypoints + confidence
           masks: tensor (V, H, W) silhouette masks
         """
-        # ===== Move data to device =====
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        init_pose  =    init_pose.to(device)
-        init_bone  =    init_bone.to(device)
-        init_t     =    init_t.to(device)
-        init_scale =    init_scale.to(device)
-        proj_m     =    proj_m.to(device)
-        keypoints  =    keypoints.to(device)
-        masks      =    masks.to(device)
+        assert (
+            all(keypoints.device == param.device for param in [masks, self.fish, init_pose, init_bone, init_t, init_scale, proj_m])
+            and self.fish.device_active == True
+        ), "All inputs must be on the same device as specified"
+        if not "cuda" in str(keypoints.device):
+            print(f"\nWarning: running pose optimization on device {str(keypoints.device)}\n")
 
         # ===== Prepare data =====
         batch_size = proj_m.shape[0]
@@ -109,7 +106,7 @@ class OptimizeMV:
                             bone_length=bone_length,
                             scale=scale)
             # Reprojection loss
-            model_kpts = out['keypoints'] + global_t.unsqueeze(1)
+            model_kpts = out['keypoints'] + global_t
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             loss = camera_fitting_loss(
                 model_kpts, proj_m, kpts_2d, kpts_conf) \

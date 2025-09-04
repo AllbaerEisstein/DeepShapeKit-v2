@@ -62,17 +62,28 @@ def projection_loss(x, y):
     return loss
 
 
-def triangulation_LBFGS(points: torch.Tensor, Ps: torch.Tensor, distortion=None):
-    assert points.device == Ps.device, "All inputs should be on the same device"
+def triangulation_LBFGS(
+    points: torch.Tensor,    
+    Ps: torch.Tensor, 
+    Ks: torch.Tensor, 
+    Rs: torch.Tensor, 
+    Ts: torch.Tensor, 
+    focals: torch.Tensor, 
+    centers: torch.Tensor, 
+    distortions: torch.Tensor,
+):
+    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    assert all(points.device == param.device for param in cam_params), "All inputs should be on the same device"
+
     device = points.device
-    n = points.shape[0]
+    vn = points.shape[0]
     
     # Compute a better initial guess for X: mean of back-projected rays
     # Convert 2D points to homogeneous coordinates
-    points_h = torch.cat([points, torch.ones(n, 1, device=device)], dim=1)  # (n, 3)
+    points_h = torch.cat([points, torch.ones(vn, 1, device=device)], dim=1)  # (n, 3)
     # Back-project using pseudo-inverse of projection matrices
     Xs = []
-    for i in range(n):
+    for i in range(vn):
         P = Ps[i]  # (3, 4)
         # Least squares solution to PX ~ x
         X_h, _ = torch.lstsq(points_h[i].unsqueeze(1), P)  # (4, 1)
@@ -82,12 +93,11 @@ def triangulation_LBFGS(points: torch.Tensor, Ps: torch.Tensor, distortion=None)
 
     X = X_init.clone().detach().requires_grad_()
 
-
     losses = []
     optimizer = torch.optim.LBFGS([X], lr=1, max_iter=100, line_search_fn='strong_wolfe')
 
     def closure():
-        projected_points = perspective_projection(X.repeat(n, 1, 1), Ps)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
 
         optimizer.zero_grad()
@@ -97,7 +107,7 @@ def triangulation_LBFGS(points: torch.Tensor, Ps: torch.Tensor, distortion=None)
     optimizer.step(closure)
 
     with torch.no_grad():
-        projected_points = perspective_projection(X.repeat(n, 1, 1), Ps)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
         losses.append(loss.detach().item())
     X = X.detach().squeeze()
@@ -105,17 +115,28 @@ def triangulation_LBFGS(points: torch.Tensor, Ps: torch.Tensor, distortion=None)
     return X, losses
 
 
-def triangulation(points, Ps, distortion=None):
-    assert points.device == Ps.device, "All inputs should be on the same device"
+def triangulation(    
+    points: torch.Tensor,    
+    Ps: torch.Tensor, 
+    Ks: torch.Tensor, 
+    Rs: torch.Tensor, 
+    Ts: torch.Tensor, 
+    focals: torch.Tensor, 
+    centers: torch.Tensor, 
+    distortions: torch.Tensor
+):
+    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    assert all(points.device == param.device for param in cam_params), "All inputs should be on the same device"
+
     device = points.device
-    n = points.shape[0]
+    vn = points.shape[0]
 
     # Compute a better initial guess for X: mean of back-projected rays
     # Convert 2D points to homogeneous coordinates
-    points_h = torch.cat([points, torch.ones(n, 1, device=device)], dim=1)  # (n, 3)
+    points_h = torch.cat([points, torch.ones(vn, 1, device=device)], dim=1)  # (n, 3)
     # Back-project using pseudo-inverse of projection matrices
     Xs = []
-    for i in range(n):
+    for i in range(vn):
         P = Ps[i]  # (3, 4)
         # Least squares solution to PX ~ x
         X_h, _ = torch.lstsq(points_h[i].unsqueeze(1), P)  # (4, 1)
@@ -129,7 +150,7 @@ def triangulation(points, Ps, distortion=None):
     optimizer = torch.optim.Adam([X], lr=0.1)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [50, 90], gamma=0.1)
     for i in range(100):
-        projected_points = perspective_projection(X.repeat(n, 1, 1), Ps)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
 
         optimizer.zero_grad()
@@ -143,22 +164,36 @@ def triangulation(points, Ps, distortion=None):
     return X, losses
 
 
-def get_gt_3d(keypoints, Ps, LBFGS=False):
+def get_gt_3d(
+    keypoints: torch.Tensor,     
+    Ps: torch.Tensor, 
+    Ks: torch.Tensor, 
+    Rs: torch.Tensor, 
+    Ts: torch.Tensor, 
+    focals: torch.Tensor, 
+    centers: torch.Tensor, 
+    distortions: torch.Tensor,
+    LBFGS: bool = True
+):
     '''
     Triangulate 3D keypoints from multi-view 2D keypoints.
     !! This step sorts out low-confidence keypoints and only uses high-confidence ones for triangulation !!
     Input:
         keypoints (vn, kn, 2): 2D kpts from different views
         Ps (vn, 3, 4): camera projection matrices for each view
+        distortions (vn, 5): distortion coefficients in the order k_1, k_2, k_3, p_1, p_2
     Output:
         kpts_3d (kn, 4): ground truth 3D kpts, with validility (not per-view anymore because triangulated)
     '''
+    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    assert all(keypoints.device == param.device for param in cam_params), "All inputs should be on the same device"
+
     vn, kn, _ = keypoints.shape
     kpts_3d = torch.zeros([kn, 4])
 
     kpts_valid = [] # shape: (kn, ? , 2); second dimension is number of views where this kpt is valid
     views_valid_per_kpt = []
-    for i in range(kn):
+    for k in range(kn):
         # Check the confidence score for each keypoint at index i across all views.
         # (element in the last dimension: confidence score)
         # This produces a boolean array, valid, indicating which keypoints have a
@@ -166,22 +201,22 @@ def get_gt_3d(keypoints, Ps, LBFGS=False):
         # Next, keypoints[valid, i, :2] selects the x and y coordinates (the first
         # two elements) of the keypoints at index i, but only for those views where
         # the confidence score is positive.
-        views_where_this_kpt_is_valid = keypoints[:, i, -1] > 0
-        kpts_valid.append(keypoints[views_where_this_kpt_is_valid, i, :2])
+        views_where_this_kpt_is_valid = keypoints[:, k, -1] > 0
+        kpts_valid.append(keypoints[views_where_this_kpt_is_valid, k, :2])
         views_valid_per_kpt.append(views_where_this_kpt_is_valid)
 
-    for i in range(kn):
-        x = kpts_valid[i]
+    for k in range(kn):
+        x = kpts_valid[k]
         if len(x) >= 2: # need at least two views to triangulate
-            Ps_i = Ps[views_valid_per_kpt[i]]
+            cam_params_k = [param[views_valid_per_kpt[k]] for param in cam_params]
             
             if LBFGS:
-                X, _ = triangulation_LBFGS(x, Ps_i) 
+                X, _ = triangulation_LBFGS(x, *cam_params_k) 
             else:
-                X, _ = triangulation(x, Ps_i)
+                X, _ = triangulation(x, *cam_params_k)
 
-            kpts_3d[i, :3] = X
-            kpts_3d[i, -1] = 1
+            kpts_3d[k, :3] = X
+            kpts_3d[k, -1] = 1
 
     return kpts_3d
 
@@ -229,7 +264,7 @@ def Procrustes(X: torch.Tensor, Y: torch.Tensor):
 
     # back to tensor
     R = torch.tensor(R).float()
-    t = Y.mean(axis=0) - R @ X.mean(axis=0) * s
+    t = Y.mean(dim=0) - R @ X.mean(dim=0) * s
 
     return R, t, s
 
