@@ -1,5 +1,6 @@
 import torch
 from src import fish_model_edit as fish_model
+from src.Silhouette_Renderer_edit import Silhouette_Renderer
 from src.losses import (
     camera_fitting_loss,
     body_fitting_loss,
@@ -52,7 +53,7 @@ class OptimizeMV:
         proj_m: torch.Tensor,
         keypoints: torch.Tensor,
         masks: torch.Tensor,
-        silhouette_renderer,
+        silhouette_renderer: Silhouette_Renderer,
         has_prev=False,
         img_filenames=None,
         index=None,
@@ -112,12 +113,12 @@ class OptimizeMV:
                 model_kpts, proj_m, kpts_2d, kpts_conf) \
                 + self.prior_weight * (global_t - init_t).abs().sum()
             # Silhouette loss
-            # TODO: expand to multiple views
-            sil_f = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t, 'front')
-            sil_b = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t, 'bottom')
+            silhouette_renders = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t)
             loss += mask_fitting_loss(
-                torch.cat([sil_f, sil_b], 0), masks.float(),
-                0.1 * self.mask_weight)
+                silhouette_renders, 
+                masks.float(),
+                0.1 * self.mask_weight
+            )
             opt_global.zero_grad(); loss.backward(); opt_global.step()
 
         # Stage 2: refine body_pose, bone_length, global, scale

@@ -57,7 +57,8 @@ if __name__ == '__main__':
             cam_matrices_path,
             out_path, 
             dataset_folder_name, 
-            also_create_frame2video_csv=True
+            also_create_frame2video_csv=True,
+            undistort=True
         )
 
     if 'masks' in steps:

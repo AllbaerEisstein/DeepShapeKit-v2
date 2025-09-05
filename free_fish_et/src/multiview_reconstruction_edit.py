@@ -12,7 +12,7 @@ import src.multiview_utils as mutil
 from tqdm import tqdm
 from src.fish_model_edit import fish_model
 from src.pose_optimizer_edit import OptimizeMV
-from src.Silhouette_Renderer import Silhouette_Renderer
+from src.Silhouette_Renderer_edit import Silhouette_Renderer
 from src.dataloaders_edit import Multiview_Dataset
 
 
@@ -31,7 +31,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
     return Multiview_Dataset(root=root)
 
 
-def initialize_model(mesh_file: str, device: str) -> tuple:
+def initialize_model(mesh_file: str, device: str, image_size, Ks, Rs, Ts, focals, principal_points, distortions) -> tuple:
     fish = fish_model(mesh=mesh_file, device=device)
     optimizer = OptimizeMV(
         num_iters=100,
@@ -43,7 +43,7 @@ def initialize_model(mesh_file: str, device: str) -> tuple:
         device=torch.device(device),
         fish_model_obj=fish
     )
-    renderer = Silhouette_Renderer(device=device)
+    renderer = Silhouette_Renderer(device, image_size, Ks, Rs, Ts, focals, principal_points, distortions)
     return fish, optimizer, renderer
 
 
@@ -140,12 +140,15 @@ def reconstruct(
     device = setup_device(seed)
     print('Device:', device)
 
-    ensure_dir(outdir)
-    fish, optimizer, renderer = initialize_model(mesh_path, device)
     dataset = load_multiview_dataset(dataset_dir)
 
     # Ps, Ks, Rs, Ts, focals, centers, distortions = dataset.get_camera_matrices()
     cam_params = dataset.get_camera_matrices()
+    image_size = torch.tensor(dataset.index_json["image_size"])
+
+    ensure_dir(outdir)
+    fish, optimizer, renderer = initialize_model(mesh_path, device, image_size, *cam_params[1:])
+
 
     parameters = []
     sample_data = []

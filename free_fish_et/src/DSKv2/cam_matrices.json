@@ -106,6 +106,13 @@
     "camera_name": "Positive Z (Fish Ventral Side).006"
   },
   "003_Fish Top R": {
+    "distortion": {
+      "rad_1": 0.0,
+      "rad_2": 0.0,
+      "tan_1": 0.0,
+      "tan_2": 0.0,
+      "rad_3": 0.0
+    },
     "f": 50.0,
     "K": [
       [1422.22216796875, 0.0, 512.0],

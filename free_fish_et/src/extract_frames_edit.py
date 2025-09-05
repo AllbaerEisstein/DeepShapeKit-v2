@@ -15,7 +15,7 @@ import src.infer_keypoints as infer_keypoints
 from src.types import *
 
 
-def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False):
+def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False, undistort: bool = False):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
@@ -47,14 +47,17 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
     if not out_dir.exists():
         raise Exception('Output dir does not exist')
 
-    dist = out_dir / dataset_folder_name
-    dist.mkdir(exist_ok=True)
+    destination = out_dir / dataset_folder_name
+    destination.mkdir(exist_ok=True)
 
-    json_out_path = dist / 'index.json'
+    json_out_path = destination / 'index.json'
     json_index = {
         'frame_folders': [],
         'index_files': {},
     }
+
+    with open(cam_matrices_json_path) as jf:
+        cam_matrices = json.load(jf)
 
     for video_path in videos:
         if not video_path.exists():
@@ -62,12 +65,61 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
 
         print(f"processing video: {video_path}")
 
+        # read one frame to get vheight and vwidth
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            if not capture.isOpened():
+                raise ValueError(f"couldn't open video: {video_path}")
+            success, frame = capture.read()
+            if not success:
+                raise ValueError(f"video {video_path} couldn't be read.")
+            vheight, vwidth = frame.shape[:2]
+        finally:
+            capture.release()
+
         video_name      = video_path.stem
-        video_folder    = dist / video_name
+
+        needs_undistortion = False
+        if undistort:
+            matrices_json = cam_matrices.get(video_name.removesuffix("_undistorted"), None)
+            if matrices_json is None:
+                raise ValueError(f'No camera matrices found for view "{video_name}" in {cam_matrices_json_path}')
+            K = matrices_json.get('K', None)
+            f = matrices_json.get('f', None)
+            d = matrices_json.get('distortion', None)
+            if d is not None:
+                rad_1 = d.get('rad_1', None)
+                rad_2 = d.get('rad_2', None)
+                tan_1 = d.get('tan_1', None)
+                tan_2 = d.get('tan_2', None)
+                rad_3 = d.get('rad_3', None)
+                for coeff, name in [ (rad_1, 'rad_1'), (rad_2, 'rad_2'), (tan_1, 'tan_1'), (tan_2, 'tan_2'), (rad_3, 'rad_3') ]:
+                    if coeff is None:
+                        raise ValueError(f'Distortion coefficient "{name}" not found in {cam_matrices_json_path}')
+                distortions = (rad_1, rad_2, tan_1, tan_2, rad_3)
+            if K is None:
+                raise ValueError(f'No intrinsic matrix "K" found for view "{video_name}" in {cam_matrices_json_path}')
+            if d is None or distortions == (0.0,)*5:
+                print(f"No undistortion possible or necessary for video {video_name}. Distortion coefficients not specified or all 0.0.")
+                needs_undistortion = False
+            else:
+                # TODO: Which camera parameters are actually changed by getOptimalNewCameraMatrix?
+                newK, _ = cv2.getOptimalNewCameraMatrix(np.array(K), distortions, [int(vwidth), int(vheight)], 1, [int(vwidth), int(vheight)], False)
+                new_focal_mm = newK[0][0] * (f / K[0][0])
+                new_dist = (0.0,)*5
+                video_name = video_name + "_undistorted"
+                cam_matrices[video_name] = {}
+                cam_matrices[video_name]["K"] = [list(row) for row in newK]
+                cam_matrices[video_name]["f"] = new_focal_mm
+                cam_matrices[video_name]["d"] = new_dist
+                needs_undistortion = True
+
+
+        video_folder    = destination / video_name
         origin_folder   = video_folder / 'origin'
         origin_folder.mkdir(parents=True, exist_ok=True)
 
-        files_csv_path       = video_folder / 'files.csv'
+        files_csv_path  = video_folder / 'files.csv'
         with files_csv_path.open('w', newline='') as csv_out_file:
             csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
             csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder'])
@@ -78,10 +130,16 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
             frame_number = 0
             success = True
 
-            while capture.isOpened() and success:
-                success, frame = capture.read()
-                if success:
-                    vheight, vwidth = frame.shape[:2]
+            try:
+                if not capture.isOpened():
+                    raise ValueError(f"couldn't open video: {video_path}")
+                while capture.isOpened() and success:
+                    success, frame = capture.read()
+                    if not success:
+                        break
+                    if undistort and needs_undistortion:
+                        frame = cv2.undistort(frame, np.array(K), distortions, None, np.array(newK))
+                    
                     filename = f"{video_name}_{frame_number}.png"
                     abs_file_path = origin_folder / filename
                     rel_file_path = Path(video_name) / 'origin' / filename
@@ -96,15 +154,15 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                     ])
                     image_count += 1
 
-                frame_number += 1
-                print(f'frame out: {frame_number}, total image: {image_count}', end='\r')
+                    frame_number += 1
+                    print(f'frame out: {frame_number}, total image: {image_count}', end='\r')
 
-            print(f'total image: {image_count}, done                  ')
+                print(f'total image: {image_count}, done')
 
-            json_index['frame_folders'].append(video_name)
-            json_index['index_files'][video_name] = str(files_csv_path)
-
-            capture.release()
+                json_index['frame_folders'].append(video_name)
+                json_index['index_files'][video_name] = str(files_csv_path)
+            finally:
+                capture.release()
     
         if also_create_frame2video_csv:
             frame2video_csv_path = video_folder / 'frame2video_1.csv'
@@ -115,8 +173,6 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                 for i in range(image_count):
                     csvwriter.writerow([i, i])
 
-    with open(cam_matrices_json_path) as jf:
-        cam_matrices = json.load(jf)
     json_index['camera_matrices'] = cam_matrices
 
     json_index['status'] = 'origin'

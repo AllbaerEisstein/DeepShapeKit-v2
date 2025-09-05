@@ -407,9 +407,10 @@ def export_mesh_json(context):
         raise ValueError("Saving mesh to json failed. Specified object has no armature modifier.")
     bone_names = [b.name for b in arm.data.bones]
     joints = [list(arm.data.bones[n].head_local) for n in bone_names]
-    # append tail of last bone if you need it
-    # if bone_names:
-    #     joints.append(list(arm.data.bones[bone_names[-1]].tail_local))
+    # append tail of last bone - this is needed because bones are represented as vectors.
+    # so we need start and end position of each bone! (e.g., for seven bones, we need eight joints)
+    if bone_names:
+        joints.append(list(arm.data.bones[bone_names[-1]].tail_local))
 
     # -- rest-pose geometry
     verts = [[float(c) for c in v.co] for v in obj.data.vertices]
@@ -417,11 +418,15 @@ def export_mesh_json(context):
 
     # -- weights: efficient per-vertex iteration
     n_verts = len(obj.data.vertices)
-    n_groups = len(obj.vertex_groups)
-    weights = [[0.0]*n_groups for _ in range(n_verts)]
+    n_bone_groups = len(bone_names)
+    weights = [[0.0]*n_bone_groups for _ in range(n_verts)]
+    # Create a mapping from vertex group name → index in bone_names
+    bone_index_map = {name: i for i, name in enumerate(bone_names)}
     for v in obj.data.vertices:
         for g in v.groups:
-            weights[v.index][g.group] = float(g.weight)
+            group_name = obj.vertex_groups[g.group].name
+            if group_name in bone_index_map:
+                weights[v.index][bone_index_map[group_name]] = float(g.weight)
 
     # -- v2k
     v2k = np.zeros((len(kpt_list), n_verts))
@@ -450,7 +455,8 @@ def export_mesh_json(context):
         'J': joints,
         'vert2kpt': v2k,
         'kintree_table': kintree,
-        'weights': weights
+        'weights': weights,
+        'n_bones': n_bone_groups
     }
 
     os.makedirs(out_dir, exist_ok=True)

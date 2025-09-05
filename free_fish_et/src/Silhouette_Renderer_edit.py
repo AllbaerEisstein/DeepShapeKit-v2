@@ -3,7 +3,7 @@ import torch
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     SoftSilhouetteShader,
-    look_at_view_transform,
+    PerspectiveCameras,
     RasterizationSettings,
     MeshRenderer,
     MeshRasterizer,
@@ -15,13 +15,11 @@ from pytorch3d.renderer.fisheyecameras import FishEyeCameras
 class Silhouette_Renderer:
     """
     A class which is used to define differentiable silhoutte renderers for multiple cameras.
-    Args:
-        
     """
     def __init__(
         self,
+        device: str,
         image_size: torch.Tensor,
-        device: torch.Tensor,
         Ks: torch.Tensor,
         Rs: torch.Tensor,
         Ts: torch.Tensor,
@@ -30,65 +28,81 @@ class Silhouette_Renderer:
         distortions: torch.Tensor,
         deviation: torch.Tensor=torch.tensor([[0, 0, 0]]),
     ):
-        # old renderer
-        # R, T = look_at_view_transform(1.7, 0, 0)
-        # self.R = R.to(device)
-        # self.T = T.to(device)
-        self.device = device
-        # self.deviation = deviation.to(device)
-        #
-        # self.camera = FoVPerspectiveCameras(device=device, R=R, T=T)
-        #
-        # # renderer
-        # blend_params = BlendParams(sigma=1e-2, gamma=1e-4)
-        # raster_settings = RasterizationSettings(
-        #     image_size=size,
-        #     blur_radius=0,
-        #     faces_per_pixel=1)
-        # self.silhouette_renderer = MeshRenderer(
-        #     rasterizer=MeshRasterizer(
-        #         cameras=self.camera,
-        #         raster_settings=raster_settings
-        #     ),
-        #     shader=SoftSilhouetteShader(blend_params=blend_params)
-        # )
-
-        # new renderer
-        self.bottomR, self.bottomT = look_at_view_transform(1.95, 0, 0)  # bottom
-        self.frontR, self.frontT = look_at_view_transform(1.8, 90, 180)  # front
-        self.bottomR = self.bottomR.to(device)
-        self.frontR = self.frontR.to(device)
-        self.bottomT = self.bottomT.to(device) + torch.tensor(
-            [0.38, 0.084, -0.0], device=device
-        )
-        self.frontT = self.frontT.to(device) + torch.tensor(
-            [0.42, -0.05, 0], device=device
-        )  # front
+        """
+        Args:
+            image_size (2): rendered image pixel width and pixel height
+            Ks (cn, 3, 3): intrinsic camera matrices for cn different cameras
+            Rs (cn, 3, 3): rotation matrices in world coordinates for cn different cameras in the same reference frame
+            Ts (cn, 3): translation from world reference frame to the camera position of cn different cameras
+            focals (cn): focal lengths (mm) of cn different cameras
+            principal_points (cn, 2): principal point offsets in pixel coordinates of cn different cameras
+            distortions (cn, 5): distortion factors [rad1, rad2, tan1, tan2, rad3] of cn different cameras. Specify as all 0.0 if no distortion is present.
+            deviation: 
+        """
+        # move to device
+        self.device = torch.device(device)
+        self.image_size = image_size.to(self.device)
+        Ks = Ks.to(self.device)
+        Rs = Rs.to(self.device)
+        Ts = Ts.to(self.device)
+        focals = focals.to(self.device)
+        principal_points = principal_points.to(self.device)
+        distortions = distortions.to(self.device)
+        deviation = deviation.to(self.device)
 
         blend_params = BlendParams(sigma=1e-2, gamma=1e-4)
         raster_settings = RasterizationSettings(
-            image_size=size,
+            image_size= (int(image_size[0]), int(image_size[1])),
             blur_radius=0.0,  # np.log(1./1e-4 - 1.) * blend_params.sigma,
             faces_per_pixel=1,
-        )  # 00)
-
-        # camera = FoVPerspectiveCameras(device=device, R=R, T=T)
-        camera = PerspectiveCameras(
-            focal_length=focal[0],
-            principal_point=((center[1, 0], center[1, 1]),),
-            R=Rs[[1]],
-            T=Ts[[1]],
-            in_ndc=False,
-            image_size=(size,),
-            device=device,
         )
+        ### TODO: Cameras can be batch. (Ncams, params(Ncams, ..., ))
+        self.cameras = []
+        self.silhouette_renderers = []
+        cn = Ks.shape[0]
+        for c in range(cn):
+            if any(coeff != 0 for coeff in distortions[c]):
+                camera = FishEyeCameras(
+                    image_size=image_size.unsqueeze(0).repeat(cn,1),
+                    focal_length=focals[c],
+                    principal_point=principal_points[c],
+                    radial_params=torch.cat((distortions[c][:2], distortions[c][4])),
+                    tangential_params=distortions[c][2:4],
+                    use_radial = True,
+                    use_tangential = True,
+                    R=Rs[c],
+                    T=Ts[c],
+                    world_coordinates = True,
+                    use_thin_prism = False,
+                    device = device,
+                )
+            else:
+                camera = PerspectiveCameras(
+                    image_size=image_size.unsqueeze(0).repeat(cn,1),
+                    focal_length=focals[c],
+                    principal_point=principal_points[c],
+                    K=Ks[c],
+                    R=Rs[c],
+                    T=Ts[c],
+                    in_ndc=False,
+                    device=self.device
+                )
+            self.cameras.append(camera)
 
-        self.silhouette_renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=camera, raster_settings=raster_settings),
-            shader=SoftSilhouetteShader(blend_params=blend_params),
-        )
+            self.silhouette_renderers.append(MeshRenderer(
+                rasterizer=MeshRasterizer(cameras=camera, raster_settings=raster_settings),
+                shader=SoftSilhouetteShader(blend_params=blend_params),
+            ))
 
-    def __call__(self, vertices, faces, t, dir):
+
+    def __call__(self, vertices: torch.Tensor, faces: torch.Tensor, T: torch.Tensor):
+        """
+        Args:
+            vertices (vn, 3): coordinates of vn different vertices in world space.
+            faces (fn, 3): triangle faces with reference to the indices of the vertices from vertices that span them.
+            T (3): uniform translation that is going to be applied to the vertices.
+            view_index (scalar): view index
+        """
         assert (
             vertices.size(2) == 3 and faces.size(2) == 3
         ), "shape of vertices or faces is not (N, v/f, 3)"
@@ -110,7 +124,7 @@ class Silhouette_Renderer:
 
         # vertices = vertices[0] - torch.mean(vertices[0], 0) + t
         # vertices = vertices.unsqueeze(0)
-        vertices = vertices + t
+        vertices = vertices + T
         Rx_90 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]).to(
             self.device
         )
@@ -125,13 +139,11 @@ class Silhouette_Renderer:
 
         fish_mesh = Meshes(verts=vertices, faces=faces)
 
-        if dir == "front":
-            silhouette = self.silhouette_renderer(
-                meshes_world=fish_mesh.clone(), R=self.frontR, T=self.frontT
-            )  # , R=R, T=T)
-        elif dir == "bottom":
-            silhouette = self.silhouette_renderer(
-                meshes_world=fish_mesh.clone(), R=self.bottomR, T=self.bottomT
+        silhouette_renders = []
+        for silhouette_renderer in self.silhouette_renderers:
+            silhouette = silhouette_renderer(
+                meshes_world=fish_mesh.clone()
             )
+            silhouette_renders.append(silhouette[..., 3] * 1.99)
 
-        return silhouette[..., 3] * 1.99
+        return torch.stack(silhouette_renders)
