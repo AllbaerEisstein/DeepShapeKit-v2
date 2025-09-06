@@ -93,12 +93,15 @@ class fish_model():
 
     def __call__(self, global_pose, body_pose, bone_length, scale=1, pose2rot=True):
         """
-        Input:
+        Args:
             global_pose: (B, 3) axis-angle representation of global rotation
             body_pose: (B, P*3) axis-angle representation of body pose (exclude root joint orient)
             bone_length: (B, B) bone length
             scale: (B, 1) scale factor
             pose2rot: if True, convert axis-angle to rotation matrix inside LBS
+        Returns:
+            keypoints (1, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS
+            vertices (1, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS
         """
         assert all(self.faces.device == attr.device for attr in [global_pose, body_pose, bone_length]), "All inputs must be on the same device as specified"
         
@@ -120,6 +123,7 @@ class fish_model():
         keypoints = torch.stack(keypoints)
 
         # Final output after articulation
+        # TODO: Why send to cpu? -> return a tuple and leave on device
         output = {'vertices': verts.cpu(),
                   'keypoints': keypoints.cpu()}
 

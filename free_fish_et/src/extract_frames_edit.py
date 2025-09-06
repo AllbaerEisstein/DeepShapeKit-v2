@@ -54,6 +54,7 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
     json_index = {
         'frame_folders': [],
         'index_files': {},
+        'image_sizes': {}
     }
 
     with open(cam_matrices_json_path) as jf:
@@ -77,11 +78,11 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
         finally:
             capture.release()
 
-        video_name      = video_path.stem
+        video_name = video_path.stem
 
         needs_undistortion = False
         if undistort:
-            matrices_json = cam_matrices.get(video_name.removesuffix("_undistorted"), None)
+            matrices_json = cam_matrices.get(video_name, None)
             if matrices_json is None:
                 raise ValueError(f'No camera matrices found for view "{video_name}" in {cam_matrices_json_path}')
             K = matrices_json.get('K', None)
@@ -161,6 +162,7 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
 
                 json_index['frame_folders'].append(video_name)
                 json_index['index_files'][video_name] = str(files_csv_path)
+                json_index['image_sizes'][video_name] = [int(vwidth), int(vheight)]
             finally:
                 capture.release()
     
@@ -177,7 +179,6 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
 
     json_index['status'] = 'origin'
     json_index['image_count'] = image_count
-    json_index['image_size'] = [int(vwidth), int(vheight)]
 
     with json_out_path.open("w") as f:
         json.dump(json_index, f, indent=2)
@@ -511,13 +512,13 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
     with open(dataset_path / 'index.json') as jf:
         idx_json = json.load(jf)
     image_folders   = idx_json['frame_folders']
-    image_size      = idx_json['image_size']
     max_n_instances = 0
 
     model = infer_mask.load_model(Path(model_path))
 
     for folder in image_folders:
         print(f"   processing frames for video {folder}...")
+        image_size      = idx_json['image_sizes'][folder]
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
             if not os.path.exists(dataset_path / folder / new_dir):
                 os.mkdir(dataset_path / folder / new_dir)

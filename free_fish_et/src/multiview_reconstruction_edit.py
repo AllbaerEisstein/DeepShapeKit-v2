@@ -31,7 +31,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
     return Multiview_Dataset(root=root)
 
 
-def initialize_model(mesh_file: str, device: str, image_size, Ks, Rs, Ts, focals, principal_points, distortions) -> tuple:
+def initialize_model(mesh_file: str, device: str, image_sizes, Ks, Rs, Ts, focals, distortions) -> tuple:
     fish = fish_model(mesh=mesh_file, device=device)
     optimizer = OptimizeMV(
         num_iters=100,
@@ -43,7 +43,7 @@ def initialize_model(mesh_file: str, device: str, image_size, Ks, Rs, Ts, focals
         device=torch.device(device),
         fish_model_obj=fish
     )
-    renderer = Silhouette_Renderer(device, image_size, Ks, Rs, Ts, focals, principal_points, distortions)
+    renderer = Silhouette_Renderer(device, image_sizes, Ks, Rs, Ts, focals, distortions)
     return fish, optimizer, renderer
 
 
@@ -142,12 +142,13 @@ def reconstruct(
 
     dataset = load_multiview_dataset(dataset_dir)
 
-    # Ps, Ks, Rs, Ts, focals, centers, distortions = dataset.get_camera_matrices()
-    cam_params = dataset.get_camera_matrices()
-    image_size = torch.tensor(dataset.index_json["image_size"])
+    cam_params = dataset.cams.get_camera_matrices()
+    Ks = cam_params[1]
+    principal_points = torch.stack((Ks[:,0,2],Ks[:,1,2]),dim=1)
+    image_sizes = torch.stack([torch.tensor(size) for size in dataset.index_json["image_sizes"].values()])
 
     ensure_dir(outdir)
-    fish, optimizer, renderer = initialize_model(mesh_path, device, image_size, *cam_params[1:])
+    fish, optimizer, renderer = initialize_model(mesh_path, device, image_sizes, *cam_params[1:])
 
 
     parameters = []
@@ -176,7 +177,7 @@ def reconstruct(
         init = None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
 
         result = multiview.fit_mesh(
-            fish, optimizer, *cam_params, keypoints, masks,
+            fish, optimizer, *cam_params, principal_points, keypoints, masks,
             renderer, device, *([] if init is None else init),
             img_filenames=img_paths, index=idx, bboxs=bboxes
         )

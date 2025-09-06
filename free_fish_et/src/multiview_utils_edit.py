@@ -69,10 +69,10 @@ def triangulation_LBFGS(
     Rs: torch.Tensor, 
     Ts: torch.Tensor, 
     focals: torch.Tensor, 
-    centers: torch.Tensor, 
+    principal_points: torch.Tensor, 
     distortions: torch.Tensor,
 ):
-    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    cam_params = (Ps, Ks, Rs, Ts, focals, principal_points, distortions)
     assert all(points.device == param.device for param in cam_params), "All inputs should be on the same device"
 
     device = points.device
@@ -97,7 +97,7 @@ def triangulation_LBFGS(
     optimizer = torch.optim.LBFGS([X], lr=1, max_iter=100, line_search_fn='strong_wolfe')
 
     def closure():
-        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, principal_points, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
 
         optimizer.zero_grad()
@@ -107,7 +107,7 @@ def triangulation_LBFGS(
     optimizer.step(closure)
 
     with torch.no_grad():
-        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, principal_points, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
         losses.append(loss.detach().item())
     X = X.detach().squeeze()
@@ -122,10 +122,10 @@ def triangulation(
     Rs: torch.Tensor, 
     Ts: torch.Tensor, 
     focals: torch.Tensor, 
-    centers: torch.Tensor, 
+    principal_points: torch.Tensor, 
     distortions: torch.Tensor
 ):
-    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    cam_params = (Ps, Ks, Rs, Ts, focals, principal_points, distortions)
     assert all(points.device == param.device for param in cam_params), "All inputs should be on the same device"
 
     device = points.device
@@ -150,7 +150,7 @@ def triangulation(
     optimizer = torch.optim.Adam([X], lr=0.1)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [50, 90], gamma=0.1)
     for i in range(100):
-        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, centers, distortions)
+        projected_points = perspective_projection_ref(X.repeat(vn, 1, 1), Rs, Ts, focals, principal_points, distortions)
         loss = projection_loss(projected_points.squeeze(), points)
 
         optimizer.zero_grad()
@@ -171,7 +171,7 @@ def get_gt_3d(
     Rs: torch.Tensor, 
     Ts: torch.Tensor, 
     focals: torch.Tensor, 
-    centers: torch.Tensor, 
+    principal_points: torch.Tensor, 
     distortions: torch.Tensor,
     LBFGS: bool = True
 ):
@@ -185,7 +185,7 @@ def get_gt_3d(
     Output:
         kpts_3d (kn, 4): ground truth 3D kpts, with validility (not per-view anymore because triangulated)
     '''
-    cam_params = (Ps, Ks, Rs, Ts, focals, centers, distortions)
+    cam_params = (Ps, Ks, Rs, Ts, focals, principal_points, distortions)
     assert all(keypoints.device == param.device for param in cam_params), "All inputs should be on the same device"
 
     vn, kn, _ = keypoints.shape

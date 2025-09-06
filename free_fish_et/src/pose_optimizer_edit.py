@@ -42,6 +42,7 @@ class OptimizeMV:
 
         # Load parametric fish mesh and faces
         self.fish = fish_model_obj
+        self.faces = self.fish.faces
 
 
     def __call__(
@@ -107,7 +108,7 @@ class OptimizeMV:
                             bone_length=bone_length,
                             scale=scale)
             # Reprojection loss
-            model_kpts = out['keypoints'] + global_t
+            model_kpts = out['keypoints'].to(self.device) + global_t
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             loss = camera_fitting_loss(
                 model_kpts, proj_m, kpts_2d, kpts_conf) \
@@ -137,7 +138,7 @@ class OptimizeMV:
                             body_pose=body_pose,
                             bone_length=bone_length,
                             scale=scale)
-            m_kpts = out['keypoints'] + global_t.unsqueeze(1)
+            m_kpts = out['keypoints'].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
             loss = body_fitting_loss(
                 m_kpts, proj_m, kpts_2d, kpts_conf,
@@ -168,7 +169,7 @@ class OptimizeMV:
                             body_pose=body_pose,
                             bone_length=bone_length,
                             scale=scale)
-            m_kpts = out['keypoints'] + global_t.unsqueeze(1)
+            m_kpts = out['keypoints'].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
             loss = body_fitting_loss(
                 m_kpts, proj_m, kpts_2d, kpts_conf,

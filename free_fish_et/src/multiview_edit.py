@@ -19,7 +19,7 @@ from src.geometry import perspective_projection
 import src.multiview_utils_edit as mutils
 import src.constants as c
 from src.pose_optimizer_edit import OptimizeMV
-from src.Silhouette_Renderer import Silhouette_Renderer
+from src.Silhouette_Renderer_edit import Silhouette_Renderer
 
 
 def fit_geometry(
@@ -30,8 +30,8 @@ def fit_geometry(
     Rs: torch.Tensor, 
     Ts: torch.Tensor, 
     focals: torch.Tensor, 
-    centers: torch.Tensor, 
     distortions: torch.Tensor,
+    principal_points: torch.Tensor, 
     init_pose=None,
     init_bone_l=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -54,7 +54,7 @@ def fit_geometry(
         fish_mesh_kpts_local = fish_articulated["keypoints"][0]
 
     # Triangulation with LBFGS
-    observed_kpts_3d = mutils.get_gt_3d(keypoints, Ps, Ks, Rs, Ts, focals, centers, distortions, LBFGS=True)
+    observed_kpts_3d = mutils.get_gt_3d(keypoints, Ps, Ks, Rs, Ts, focals, principal_points, distortions, LBFGS=True)
 
     valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0
     valid_kpts_3d = observed_kpts_3d[valid_kpts_3d_boolmask, :3]
@@ -80,8 +80,8 @@ def fit_mesh(
     Rs: torch.Tensor, 
     Ts: torch.Tensor, 
     focals: torch.Tensor, 
-    centers: torch.Tensor, 
     distortions: torch.Tensor,
+    principal_points: torch.Tensor,
     keypoints: torch.Tensor,
     masks: torch.Tensor,
     renderer: Silhouette_Renderer,
@@ -102,9 +102,9 @@ def fit_mesh(
         init_bone (vn, 4): bone length
     """
     # move to device
-    keypoints, masks, Ps, Ks, Rs, Ts, focals, centers, distortions = keypoints.to(device), masks.to(device), Ps.to(device), Ks.to(device), Rs.to(device), Ts.to(device), focals.to(device), centers.to(device), distortions.to(device)
+    keypoints, masks, Ps, Ks, Rs, Ts, focals, principal_points, distortions = keypoints.to(device), masks.to(device), Ps.to(device), Ks.to(device), Rs.to(device), Ts.to(device), focals.to(device), principal_points.to(device), distortions.to(device)
     fish.to_device(device)
-    cam_params = [Ps, Ks, Rs, Ts, focals, centers, distortions]
+    cam_params = [Ps, Ks, Rs, Ts, focals, distortions, principal_points]
     assert (
         all(keypoints.device == param.device for param in cam_params+[masks, fish])
         and fish.device_active == True
