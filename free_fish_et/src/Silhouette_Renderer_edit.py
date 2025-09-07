@@ -66,6 +66,7 @@ class Silhouette_Renderer:
         )
         
         # TODO: possible to only set the cameras to fisheye where strictly necessary?
+        # TODO: where should distortion vs no distortion be handled?
         if any([coeff > 0.0 for coeffs in distortions for coeff in coeffs]):
             cameras = FishEyeCameras(
                 image_size = image_sizes,

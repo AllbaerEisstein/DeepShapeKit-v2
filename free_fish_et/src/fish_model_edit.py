@@ -13,38 +13,49 @@ https://github.com/marcbadger/avian-mesh
 import os
 import json
 import torch
-from .LBS import LBS
-#from .LBS_origin import LBS
+from .LBS_edit import LBS
+
+# from .LBS_origin import LBS
 
 
-class fish_model():
+class fish_model:
     """
     Parametric fish model.
-    !! Properties will only be on the device after calling to_device() !!
-    Input:
-        mesh: path to json file containing fish model
-        device: 'cpu' or 'cuda'
-    Output:
-        faces: (F, 3) faces of the fish mesh
-        J: (1, J, 3) joint locations in the rest pose
-        V: (1, V, 3) vertices in the rest pose
-        vert2kpt: (K, V) keypoint regression matrix
-        weights: (V, J) skinning weights
-    On call:
+    !! Members will only be on the device after calling to_device(target_device) !!
+    Args:
+        faces (F, 3): faces of the fish mesh each consisting of the indices of three vertices spanning it
+        J (1, J, 3): joint locations in the rest pose (note: unsqueezed)
+        V (1, V, 3): vertices in the rest pose (note: unsqueezed)
+        vert2kpt (K, V): keypoint regression matrix
+        weights (V, J): skinning weights
+        n_body_bones (1): number of bones in the fish mesh
+        bone_angle_min (nb*3): lower angle limits for each of the nb bones
+        bone_angle_max (nb*3): upper angle limits for each of the nb bones
+        bone_length_min (nb): lower length limit for each of the nb bones
+        bone_length_max (nb): upper length limit for each of the nb bones
+    On call perform linear blend skinning and return new vertex and keypoint positions.
     """
-    def __init__(self, mesh, device: str):
-        self.device = torch.device(device)
+
+    def __init__(self, mesh_json_path: str):
+        """
+        Args:
+            mesh: path to json file containing fish model
+            device: 'cpu' or 'cuda'
+        """
+        self.device = torch.device("cpu")
         self.device_active = False
 
-        with open(mesh, 'r') as infile:
+        with open(mesh_json_path, "r") as infile:
             dd = json.load(infile)
 
         self.dd = dd
 
-        self.n_bones = dd["n_bones"]
+        # the first bone is treated differently from all the other bones (first bone: global orientation fitting; body bones: pose fitting)
+        # So n_body_bones excludes the first bone
+        self.n_body_bones = dd["n_bones"] - 1
 
         # triangulate if input mesh has quad faces
-        fish_faces = dd['F']
+        fish_faces = dd["F"]
         triangle_faces = []
         for face in fish_faces:
             if len(face) == 4:
@@ -53,30 +64,64 @@ class fish_model():
             elif len(face) == 3:
                 triangle_faces.append(face)
             else:
-                raise Exception('face data incorrect: got vertices number not in [3,4]')
+                raise Exception("face data incorrect: got vertices number not in [3,4]")
         self.faces = torch.tensor(triangle_faces)
 
         # self.faces = torch.tensor(dd['F'])
 
-        self.kintree_table = torch.tensor(dd['kintree_table'])[:,:]
+        self.kintree_table = torch.tensor(dd["kintree_table"])[:, :]
         self.parents = self.kintree_table[0][:]
 
-        self.weights = torch.tensor(dd['weights'])
-        self.vert2kpt = torch.tensor(dd['vert2kpt'])
+        self.weights = torch.tensor(dd["weights"])
+        self.vert2kpt = torch.tensor(dd["vert2kpt"])
 
-        # TODO: there used to be an unsqueeze(0) added and output V used to be (1, V, 3) - same for J
-        self.J = torch.tensor(dd['J']).unsqueeze(0)
+        self.J = torch.tensor(dd["J"]).unsqueeze(0)
 
-        self.V = torch.tensor(dd['V']).unsqueeze(0)
-        self.V = self.V - self.J[0,0]
-        self.J = self.J - self.J[0,0]
+        self.V = torch.tensor(dd["V"]).unsqueeze(0)
+        self.V = self.V - self.J[0, 0]
+        self.J = self.J - self.J[0, 0]
 
         self.V = self.V * 0.01
         self.J = self.J * 0.01
 
         self.LBS = LBS(self.J, self.parents, self.weights)
-    
+
+        # Body_pose angle limit
+        # we minus index by 1 because we exclude root pose as it is modeled as global orient
+        self.bone_angle_min = [0.0] * (self.n_body_bones * 3)
+        self.bone_angle_max = [0.0] * (self.n_body_bones * 3)
+
+        # repeat the pattern 0.0, -0.05, 0.0 for every bone (every three entries in bone_angle_min/max)
+        for i in range(self.n_body_bones):
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.05, 0.0
+
+        # the last 3 bones should have different limits
+        for i in range(self.n_body_bones - 3, self.n_body_bones):
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.05, 0.0
+
+        # the last bone should have a different limit
+        for i in range(self.n_body_bones - 1, self.n_body_bones):
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.07, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.07, 0.0
+
+        # Body bone length limit
+        self.bone_length_min = [1.0] * (self.n_body_bones)
+        self.bone_length_max = [2.3] * (self.n_body_bones)
+
+        self.bone_angle_max = torch.tensor(self.bone_angle_max)
+        self.bone_angle_min = torch.tensor(self.bone_angle_min)
+        self.bone_length_min = torch.tensor(self.bone_length_min)
+        self.bone_length_max = torch.tensor(self.bone_length_max)
+
+
     def to_device(self, device: str):
+        """
+        Sends this fish_model instance to the specified device.
+        Returns:
+            None
+        """
         self.device = torch.device(device)
         self.kintree_table = self.kintree_table.to(device)
         self.parents = self.parents.to(device)
@@ -85,35 +130,73 @@ class fish_model():
         self.vert2kpt = self.vert2kpt.to(self.device)
         self.J = self.J.to(self.device)
         self.V = self.V.to(self.device)
-        if not all(self.faces.device == attr.device for attr in [self.kintree_table, self.parents, self.weights, self.vert2kpt, self.J, self.V]):
-            raise ValueError("failed to move all fish object attributes to the same device")
+        self.bone_angle_min = self.bone_angle_min.to(self.device)
+        self.bone_angle_max = self.bone_angle_max.to(self.device)
+        self.bone_length_min = self.bone_length_min.to(self.device)
+        self.bone_length_max = self.bone_length_max.to(self.device)
+        if not all(
+            self.faces.device == attr.device
+            for attr in [
+                self.kintree_table,
+                self.parents,
+                self.weights,
+                self.vert2kpt,
+                self.J,
+                self.V,
+                self.bone_angle_min,
+                self.bone_angle_max,
+                self.bone_length_min,
+                self.bone_length_max,
+            ]
+        ):
+            raise ValueError(
+                "failed to move all fish object attributes to the same device"
+            )
         self.LBS = LBS(self.J, self.parents, self.weights)
         self.device = self.faces.device
         self.device_active = True
 
-    def __call__(self, global_pose, body_pose, bone_length, scale=1, pose2rot=True):
+
+    def __call__(self, global_ori, body_pose, body_bone_length, scale=1, pose2rot=True):
         """
         Args:
-            global_pose: (B, 3) axis-angle representation of global rotation
-            body_pose: (B, P*3) axis-angle representation of body pose (exclude root joint orient)
-            bone_length: (B, B) bone length
-            scale: (B, 1) scale factor
+            global_ori (BS, 3): BS (batch-size) different axis-angle representations of global rotation
+            body_pose (BS, bbn*3): axis-angle representation of body pose (exclude root joint orient) -> orientation of bbn body bones
+            body_bone_length (BS, bbn): bone lengths for bbn body bones
+            scale (BS, 1): scale factor
             pose2rot: if True, convert axis-angle to rotation matrix inside LBS
         Returns:
             keypoints (1, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS
             vertices (1, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS
         """
-        assert all(self.faces.device == attr.device for attr in [global_pose, body_pose, bone_length]), "All inputs must be on the same device as specified"
-        
-        batch_size = global_pose.shape[0]
+        if not all(
+            self.device == attr.device
+            for attr in [self.faces, global_ori, body_pose, body_bone_length]
+        ):
+            global_ori = global_ori.to(self.device)
+            body_pose = body_pose.to(self.device)
+            body_bone_length = body_bone_length.to(self.device)
+
+        batch_size = global_ori.shape[0]
         V = self.V.repeat([batch_size, 1, 1]) * scale
 
-        # concatenate bone and pose
-        bone = torch.cat([torch.ones([batch_size, 1], device=self.device), bone_length], dim=1)
-        pose = torch.cat([global_pose, body_pose], dim=1)
+        # print(f"body_bone_length: {body_bone_length.size()}")
+        # print(f"body_pose: {body_pose.size()}")
+
+        # no need for global pose and body pose to be separate anymore
+        # -> insert one length at the front (first bone) of the bone length tensor of each batch
+        all_bone_lengths = torch.cat(
+            [torch.ones([batch_size, 1], device=self.device), body_bone_length], dim=1
+        )
+        # concatenate global pose and body pose
+        global_ori_plus_pose = torch.cat([global_ori, body_pose], dim=1)
+
+        # print(f"all_bone_lengths: {all_bone_lengths.size()}")
+        # print(f"global_ori_plus_pose: {global_ori_plus_pose.size()}")
+
 
         # LBS
-        verts = self.LBS(V, pose, bone, scale, to_rotmats=pose2rot)
+        verts = self.LBS(V, global_ori_plus_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
 
         # Calculate 3d keypoint from new vertices resulted from pose
         keypoints = []
@@ -124,7 +207,6 @@ class fish_model():
 
         # Final output after articulation
         # TODO: Why send to cpu? -> return a tuple and leave on device
-        output = {'vertices': verts.cpu(),
-                  'keypoints': keypoints.cpu()}
+        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu()}
 
         return output

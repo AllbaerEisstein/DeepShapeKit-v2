@@ -8,6 +8,7 @@ functions for multiview modified from Badger et al.
 }
 https://github.com/marcbadger/avian-mesh
 """
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -32,8 +33,8 @@ def fit_geometry(
     focals: torch.Tensor, 
     distortions: torch.Tensor,
     principal_points: torch.Tensor, 
-    init_pose=None,
-    init_bone_l=None,
+    init_pose: Optional[torch.Tensor] = None,
+    init_body_bone_l: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Initial fit with geometry: triangulation + Procrustes
@@ -44,13 +45,13 @@ def fit_geometry(
     """
 
     # 3D kpts on bird
-    if init_pose == None and init_bone_l == None:
+    if init_pose == None and init_body_bone_l == None:
         # initial position: rest pose
         fish_mesh_kpts_local = torch.matmul(fish.vert2kpt, fish.V[0])
     else:
-        # no global orientation - because fish mesh coordinates are local coordinates?
-        init_ori = torch.zeros([1, 3]).float()
-        fish_articulated = fish(init_ori, init_pose, init_bone_l)
+        # no initial guess for global position/orientation
+        init_ori = torch.zeros([1, 3]).float().to(keypoints.device)
+        fish_articulated = fish(init_ori, init_pose, init_body_bone_l)
         fish_mesh_kpts_local = fish_articulated["keypoints"][0]
 
     # Triangulation with LBFGS
@@ -65,7 +66,7 @@ def fit_geometry(
     R, t, s = mutils.Procrustes(fish_mesh_kpts_local, valid_kpts_3d)
     aa, _ = cv2.Rodrigues(R.numpy())
 
-    init_ori = torch.tensor(aa).reshape(1, 3).float()
+    init_ori = torch.tensor(aa).reshape(1, 3).float().to(keypoints.device)
     init_t = t
     init_s = s
 
@@ -86,14 +87,14 @@ def fit_mesh(
     masks: torch.Tensor,
     renderer: Silhouette_Renderer,
     device: str,
-    init_ori=None,
-    init_t=None,
-    init_s=None,
-    init_pose=None,
-    init_bone=None,
-    img_filenames=None,
-    index=None,
-    bboxs=None,
+    init_global_ori: Optional[torch.Tensor] = None,
+    init_t: Optional[torch.Tensor] = None,
+    init_s: Optional[torch.Tensor] = None,
+    init_body_pose: Optional[torch.Tensor] = None,
+    init_body_bone_length: Optional[torch.Tensor] = None,
+    img_filenames: Optional[torch.Tensor] = None,
+    index: Optional[torch.Tensor] = None,
+    bboxs: Optional[torch.Tensor] = None,
 ):
     """
     Only used in multiview and crossview fitting:
@@ -111,11 +112,11 @@ def fit_mesh(
     ), "keypoints, Ps, Ks, Rs, Ts, focals, centers, distortions, masks, fish must be on the same device as specified"
 
     if (
-        init_ori != None
+        init_global_ori != None
         or init_t != None
         or init_s != None
-        or init_pose != None
-        or init_bone != None
+        or init_body_pose != None
+        or init_body_bone_length != None
     ):
         has_prev = True
         # optimizer.prior_weight = 80
@@ -123,34 +124,34 @@ def fit_mesh(
         has_prev = False
 
     ### Triangulation + Procrustes as initialization
-    if init_ori == None and init_t == None and init_s == None:
-        init_ori, init_t, init_s = fit_geometry(
-            fish, keypoints, *cam_params, init_pose=init_pose, init_bone_l=init_bone
+    if init_global_ori == None and init_t == None and init_s == None:
+        init_global_ori, init_t, init_s = fit_geometry(
+            fish, keypoints, *cam_params, init_pose=init_body_pose, init_body_bone_l=init_body_bone_length
         )
 
     ### If not provided (as in multiview), initialize with canonical
-    if init_pose is None:
-        init_pose = torch.zeros([1, fish.n_bones * 3])
-    if init_bone is None:
-        init_bone = torch.ones([1, fish.n_bones])
+    if init_body_pose is None:
+        init_body_pose = torch.zeros([1, (fish.n_body_bones) * 3], device=device)
+    if init_body_bone_length is None:
+        init_body_bone_length = torch.ones([1, (fish.n_body_bones)], device=device)
 
     #### Change suitable format for optimizer
     ###### particularly, combine orient and body pose
-    init_pose = torch.cat([init_ori, init_pose], dim=1)
-    init_pose = init_pose.float().to(device)
-    init_bone = init_bone.float().to(device)
+    init_ori_plus_pose = torch.cat([init_global_ori, init_body_pose], dim=1).to(device)
+    init_body_pose = init_body_pose.float().to(device)
+    init_body_bone_length = init_body_bone_length.float().to(device)
     init_s = init_s.float().to(device)
     init_t = init_t.float().to(device)
 
     assert (
-        all(keypoints.device == param.device for param in cam_params+[masks, fish, init_pose, init_bone, init_s, init_t])
+        all(keypoints.device == param.device for param in cam_params+[masks, fish, init_ori_plus_pose, init_body_bone_length, init_s, init_t])
         and fish.device_active == True
     ), "All inputs must be on the same device as specified"
 
     ### Mesh fitting
-    vertices, pose_est, bone_est, scale_est, t, losses = optimizer(
-        init_pose,
-        init_bone,
+    vertices, global_ori_plus_pose_est, body_bone_est, scale_est, t, losses = optimizer(
+        init_ori_plus_pose,
+        init_body_bone_length,
         init_t,
         init_s,
         Ps,
@@ -164,12 +165,16 @@ def fit_mesh(
     )
 
     ### Generating mesh output
-    fish_output = fish(pose_est[:, 0:3], pose_est[:, 3:], bone_est, scale_est)
+    fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
 
+    # NOTE:
+    # things to check: Correct row-major, column major order always?
+    # pixel/mm/m? E.g. in fish model there seems to be a conversion cm -> m
+    # world/local coords for fish model?
     vertex_posed = fish_output["vertices"] + t
     mesh_keypoint = fish_output["keypoints"] + t
 
-    return vertex_posed, mesh_keypoint, t, pose_est, bone_est, scale_est, losses
+    return vertex_posed, mesh_keypoint, t, global_ori_plus_pose_est, body_bone_est, scale_est, losses
 
 
 def multiview_rigid_alignment(
@@ -191,7 +196,7 @@ def multiview_rigid_alignment(
 
     ### Triangulation + Procrustes for global alignemnt
     global_orient, global_t, scale = fit_geometry(
-        fish, keypoints, frames, init_pose=pose, init_bone_l=bone
+        fish, keypoints, frames, init_pose=pose, init_body_bone_l=bone
     )
 
     ### Optimization to improve alignment
@@ -212,7 +217,7 @@ def multiview_rigid_alignment(
     global_optimizer = torch.optim.Adam(global_params, lr=1e-2, betas=(0.9, 0.999))
     for i in range(num_iters):
         fish_output = fish(
-            global_pose=global_orient, body_pose=pose, bone_length=bone, scale=scale
+            global_ori=global_orient, body_pose=pose, body_bone_length=bone, scale=scale
         )
 
         model_keypoints = fish_output["keypoints"] + global_t.repeat(1, 1, 1)
@@ -228,7 +233,7 @@ def multiview_rigid_alignment(
 
     # Output
     fish_output = fish(
-        global_pose=global_orient, body_pose=pose, bone_length=bone, scale=scale
+        global_ori=global_orient, body_pose=pose, body_bone_length=bone, scale=scale
     )
     model_mesh = fish_output["vertices"] + global_t.repeat(1, 1, 1)
     model_keypoints = fish_output["keypoints"] + global_t.repeat(1, 1, 1)

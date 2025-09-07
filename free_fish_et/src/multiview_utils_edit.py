@@ -9,6 +9,7 @@ functions for multiview output from Badger et al.
 https://github.com/marcbadger/avian-mesh
 """
 # import trimesh
+from typing import Optional
 import yaml
 import os
 import numpy as np
@@ -86,7 +87,7 @@ def triangulation_LBFGS(
     for i in range(vn):
         P = Ps[i]  # (3, 4)
         # Least squares solution to PX ~ x
-        X_h, _ = torch.lstsq(points_h[i].unsqueeze(1), P)  # (4, 1)
+        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1))  # (4, 1)
         X_cart = X_h[:3] / X_h[3]
         Xs.append(X_cart.squeeze())
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, 3)
@@ -139,7 +140,7 @@ def triangulation(
     for i in range(vn):
         P = Ps[i]  # (3, 4)
         # Least squares solution to PX ~ x
-        X_h, _ = torch.lstsq(points_h[i].unsqueeze(1), P)  # (4, 1)
+        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1))  # (4, 1)
         X_cart = X_h[:3] / X_h[3]
         Xs.append(X_cart.squeeze())
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, 3)
@@ -268,135 +269,72 @@ def Procrustes(X: torch.Tensor, Y: torch.Tensor):
 
     return R, t, s
 
-def render_vertex_on_frame(img, vertex_posed, fish, frame, kpts=None, bboxs=None):
-    proj_m_set, focal, center, R, T, distortion = get_cam()
+def batch_render_reconstructions(
+    imgs: torch.Tensor,  # (vn, h, w, 3)
+    vertex_world_coors_reconstructed: torch.Tensor,  # (num_vertices, 3)
+    Ps: torch.Tensor,
+    Ks: torch.Tensor,
+    Rs: torch.Tensor,
+    Ts: torch.Tensor,
+    focals: torch.Tensor,
+    distortions: torch.Tensor,
+    principal_points: torch.Tensor,
+    kpts: Optional[torch.Tensor] = None,  # (num_keypoints, 3)
+    bboxs: Optional[torch.Tensor] = None,  # (vn, 4)
+) -> np.ndarray:
+    """
+    Overlay projected mesh vertices, keypoints, and bounding boxes onto a batch of images.
 
-    # Extrinsic
-    # R = trimesh.transformations.rotation_matrix(
-    #     np.radians(180), [1, 0, 0])
-    # transformed_points = torch.einsum('bij,bkj->bki', torch.tensor(R[:-1,:-1]).float().unsqueeze(0), vertex_posed)
-    # transformed_points = torch.einsum('bij,bkj->bki', R[frame], vertex_posed) + T[frame]#.unsqueeze(1).repeat(1,vertex_posed.size(1),1)
-    # transformed_points = torch.einsum('bij,bkj->bki', T[frame], torch.cat([vertex_posed,torch.tensor([[[1]]]).repeat(1,1306,1)],2))
-    # transformed_points = torch.div(transformed_points , torch.stack([transformed_points[:,:,-1]] * 4, -1))
+    Args:
+        imgs (vn, h, w, 3): Batch of images.
+        vertex_world_coors_reconstructed (1, num_vertices, 3): Mesh vertices in world coordinates.
+        kpts (1, num_keypoints, 3): Keypoints in world space.
+        bboxs (vn, 4): Bounding boxes per image.
 
-    # transformed_points = torch.matmul(R[frame], vertex_posed.permute(0,2,1)).permute(0,2,1) + T[frame]
-    # Distortion
-    # if distortion is not None:
-    #     kc = distortion
-    #     d = points[:, :, 2:]
-    #     points = points[:, :, :] / points[:, :, 2:]
-    #
-    #     r2 = points[:, :, 0] ** 2 + points[:, :, 1] ** 2
-    #     dx = (2 * kc[:, [2]] * points[:, :, 0] * points[:, :, 1]
-    #           + kc[:, [3]] * (r2 + 2 * points[:, :, 0] ** 2))
-    #
-    #     dy = (2 * kc[:, [3]] * points[:, :, 0] * points[:, :, 1]
-    #           + kc[:, [2]] * (r2 + 2 * points[:, :, 1] ** 2))
-    #
-    #     x = (1 + kc[:, [0]] * r2 + kc[:, [1]] * r2.pow(2) + kc[:, [4]] * r2.pow(3)) * points[:, :, 0] + dx
-    #     y = (1 + kc[:, [0]] * r2 + kc[:, [1]] * r2.pow(2) + kc[:, [4]] * r2.pow(3)) * points[:, :, 1] + dy
-    #
-    #     points = torch.stack([x, y, torch.ones_like(x)], dim=-1) * d
+    Returns:
+        imgs_with_overlay (vn, h, w, 3): Images with overlays.
+    """
+    vn, h, w, _ = imgs.shape
+    imgs_out = imgs.clone() if torch.is_tensor(imgs) else torch.tensor(imgs).clone()
 
-    # points = transformed_points[0,:,:]
-
-    points = torch.einsum('bij,bkj->bki', R[frame], vertex_posed[0]) + T[frame]
-    points = points[0]
-    # rot = np.array([[0, 1, 0],[-1, 0, 0],[0, 0, 1]])
-    rot = np.eye(3)
-    # print('middle point: {}'.format(torch.sum(points, axis=-2) / points.size(-2)))
-
-    # Rendering
-    bg_img = np.zeros((1040,2048,3))
-    bg_img[:img.shape[0], :img.shape[1],:] = torch.tensor(img)
-
-    # manual transform
-    # projected = perspective_projection(vertex_posed[0].repeat(2,1,1), proj_m_set)[ frame[0]]
-    projected_ref = perspective_projection_ref(vertex_posed[0].repeat(2,1,1), R, T, focal, center)[ frame[0]]
-    ix = (torch.minimum(torch.maximum(projected_ref[:, 1].int(), torch.tensor(0)), torch.tensor(1039))).tolist()
-    iy = (torch.minimum(torch.maximum(projected_ref[:, 0].int(), torch.tensor(0)), torch.tensor(2047))).tolist()
-    img[ix, iy] = np.array([0, 255, 0])
-
-    # points = torch.einsum('bij,bkj->bki', R[frame], vertex_posed[1]) + T[frame]
-    # points = points[0]
-    # # rot = np.array([[0, 1, 0],[-1, 0, 0],[0, 0, 1]])
-    # rot = np.eye(3)
-    # # print('middle point: {}'.format(torch.sum(points, axis=-2) / points.size(-2)))
-
-    # # Rendering
-    # bg_img = np.zeros((1040, 2048, 3))
-    # bg_img[:img.shape[0], :img.shape[1], :] = torch.tensor(img)
-    #
-    # # manual transform
-    # # projected = perspective_projection(vertex_posed[1].repeat(2,1,1), proj_m_set)[ frame[0]]
-    # projected_ref = perspective_projection_ref(vertex_posed[1].repeat(2, 1, 1), R, T, focal, center)[frame[0]]
-    # ix = (torch.minimum(torch.maximum(projected_ref[:, 1].int(), torch.tensor(0)), torch.tensor(1039))).tolist()
-    # iy = (torch.minimum(torch.maximum(projected_ref[:, 0].int(), torch.tensor(0)), torch.tensor(2047))).tolist()
-    # img[ix, iy] = np.array([0, 255, 125])
-
-    # global_p = torch.zeros(1,3)  # [rot_x, rot_y, rot_z]
-    # global_p[0,0] = 0
-    #
-    # local_p = torch.zeros(c.num_bone,3)
-    # local_p[0,2] = 1
-    # local_p = local_p.view(1,c.num_bone * 3)
-    #
-    # bones = torch.ones(1,c.num_bone)
-    # bones[0,2] = 1
-    # fish_posed = fish(global_p, local_p, bones, 0.01)
-
-    # init model
-    # projected = perspective_projection(fish.V.repeat(2, 1, 1) * 0.01 + torch.tensor([0,0.,0.0]), proj_m_set)[frame[0]]
-    # projected = perspective_projection(fish_posed['vertices'].repeat(2, 1, 1), proj_m_set)[frame[0]]
-    # ix = (torch.minimum(torch.maximum(projected[:, 1].int(), torch.tensor(0)), torch.tensor(1039))).tolist()
-    # iy = (torch.minimum(torch.maximum(projected[:, 0].int(), torch.tensor(0)), torch.tensor(2047))).tolist()
-    # img[ix, iy] = np.array([0, 0, 255])
-    #
-    # with open(os.path.join('data/output/multiview_demo', '{}_out_model.obj'.format('debug')), 'w') as modelfile:
-    #     for i in range(fish_posed['vertices'].size(1)):
-    #         modelfile.write(
-    #             "v {0} {1} {2}\n".format(fish_posed['vertices'][0, i, 0], fish_posed['vertices'][0, i, 1], fish_posed['vertices'][0, i, 2]))
-    #
-    #     for i in range(fish.faces.size(0)):
-    #         modelfile.write("f {0}//{0} {1}//{1} {2}//{2}\n".format(fish.faces[i, 0] + 1, fish.faces[i, 1] + 1,
-    #                                                                 fish.faces[i, 2] + 1))
-
-    # simulate pyrenderer
-    # K = torch.tensor([[7.67578125, 0., -1., 0.],
-    #                                [ 0.,15.11538462,1.,0.],
-    #                                [ 0.,0.,-1.00010001,-0.100005],
-    #                                [ 0.,0.,-1.,0.]]).repeat(2,1,1)
-    # projected_homo = - perspective_projection_homo(transformed_points.repeat(2, 1, 1), K.permute(0,2,1))[frame[0]]
-    # ix = (torch.minimum(torch.maximum(projected_homo[:, 1].int(), torch.tensor(0)), torch.tensor(1039))).tolist()
-    # iy = (torch.minimum(torch.maximum(projected_homo[:, 0].int(), torch.tensor(0)), torch.tensor(2047))).tolist()
-    # img[ix, iy] = np.array([0, 0, 255])
-
-    # visualize keypoints
+    # Project vertices and keypoints for all views
+    vertex_projections = perspective_projection_ref(
+        vertex_world_coors_reconstructed.repeat(vn, 1, 1), Rs, Ts, focals, principal_points
+    )  # (vn, num_vertices, 2)
     if kpts is not None:
-        for i in range(kpts[0].size(1)):
-            img[int(kpts[0][frame[0],i,1]), int(kpts[0][frame[0],i,0])] = np.array([255, 0, 0])
-        # for i in range(kpts[1].size(1)):
-        #     img[int(kpts[1][frame[0],i,1]), int(kpts[1][frame[0],i,0])] = np.array([255, 125, 0])
+        keypoint_projections = perspective_projection_ref(
+            kpts.repeat(vn, 1, 1), Rs, Ts, focals, principal_points
+        )  # (vn, num_keypoints, 2)
 
-    if bboxs is not None:
-        #print('draw bbox')
-        img[bboxs[1].item():bboxs[3].item(), bboxs[0].item()] = np.array([255, 255, 0])
-        img[bboxs[1].item():bboxs[3].item(), bboxs[2].item()] = np.array([255, 255, 0])
-        img[bboxs[1].item(), bboxs[0].item():bboxs[2].item()] = np.array([255, 255, 0])
-        img[bboxs[3].item(), bboxs[0].item():bboxs[2].item()] = np.array([255, 255, 0])
+    for view_idx in range(vn):
+        img = imgs_out[view_idx]
 
-    # renderer = Renderer(focal[0] * 500, center[0], img_w=2048, img_h=1040, faces=fish.faces)
-    # init_points = fish_posed['vertices']# torch.einsum('bij,bkj->bki', R[frame], fish_posed['vertices']) + T[frame]
-    # init_points = init_points - init_points[:,[0],:] - torch.tensor([[0,0,0.1]])
-    # img_pose, _ = renderer(points - torch.tensor([[0,0,0.2]]), rot, [0,0,0.00], img)  # T [0.10, -0.06, 0]
-    # img_pose = img_pose.astype(np.uint8)
-    img_pose = img.astype(np.uint8)
+        # Draw projected vertices (green)
+        verts_2d = vertex_projections[view_idx]  # (num_vertices, 2)
+        ix = torch.clamp(verts_2d[:, 1].long(), 0, h - 1)
+        iy = torch.clamp(verts_2d[:, 0].long(), 0, w - 1)
+        img[ix, iy] = torch.tensor([0, 255, 0], dtype=img.dtype)
 
-    # img_model, _ = renderer(points - torch.tensor([[0,0,0.2]]), rot, [0,0,0.00], np.zeros((1040,2048,3)))
-    # img_model = img_model.astype(np.uint8)
+        # Draw keypoints (red)
+        if kpts is not None:
+            kpts_2d = keypoint_projections[view_idx]  # (num_keypoints, 2)
+            kx = torch.clamp(kpts_2d[:, 0].long(), 0, w - 1)
+            ky = torch.clamp(kpts_2d[:, 1].long(), 0, h - 1)
+            img[ky, kx] = torch.tensor([255, 0, 0], dtype=img.dtype)
 
+        # Draw bounding box (yellow)
+        if bboxs is not None:
+            x1, y1, x2, y2 = bboxs[view_idx].tolist()
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            img[y1:y2, x1] = torch.tensor([255, 255, 0], dtype=img.dtype)
+            img[y1:y2, x2] = torch.tensor([255, 255, 0], dtype=img.dtype)
+            img[y1, x1:x2] = torch.tensor([255, 255, 0], dtype=img.dtype)
+            img[y2, x1:x2] = torch.tensor([255, 255, 0], dtype=img.dtype)
 
-    return img_pose, img_pose #img_model
+        imgs_out[view_idx] = img
+
+    imgs_out = imgs_out.cpu().numpy().astype(np.uint8)
+    return imgs_out
 
 
 # def render_mesh(bird, pose_est, bone_est, scale_est=1, camera_t=torch.tensor([[2, -7, 35]]).float()):

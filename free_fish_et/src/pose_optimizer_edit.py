@@ -1,11 +1,10 @@
+from typing import Optional
+
 import torch
 from src import fish_model_edit as fish_model
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
-from src.losses import (
-    camera_fitting_loss,
-    body_fitting_loss,
-    mask_fitting_loss
-)
+from src.losses_edit import camera_fitting_loss, body_fitting_loss, mask_fitting_loss
+
 
 class OptimizeMV:
     """
@@ -21,14 +20,14 @@ class OptimizeMV:
     def __init__(
         self,
         fish_model_obj: fish_model.fish_model,
-        lim_weight=1.0,
-        prior_weight=1.0,
-        bone_weight=1.0,
-        mask_weight=1.0,
+        lim_weight=1,
+        prior_weight=1,
+        bone_weight=1,
+        mask_weight=1,
         smooth_weights=None,
         step_size=1e-2,
         num_iters=100,
-        device=torch.device('cpu'),
+        device=torch.device("cpu"),
     ):
         # Store hyper-parameters
         self.device = device
@@ -44,38 +43,60 @@ class OptimizeMV:
         self.fish = fish_model_obj
         self.faces = self.fish.faces
 
-
     def __call__(
         self,
-        init_pose: torch.Tensor,
-        init_bone: torch.Tensor,
+        init_ori_plus_pose: torch.Tensor,
+        init_body_bone_length: torch.Tensor,
         init_t: torch.Tensor,
         init_scale: torch.Tensor,
         proj_m: torch.Tensor,
         keypoints: torch.Tensor,
         masks: torch.Tensor,
         silhouette_renderer: Silhouette_Renderer,
-        has_prev=False,
-        img_filenames=None,
-        index=None,
-        bboxes=None
+        has_prev: bool = False,
+        img_filenames: Optional[torch.Tensor] = None,
+        index: Optional[torch.Tensor] = None,
+        bboxes: Optional[torch.Tensor] = None,
     ):
         """
         Args:
-          init_pose: tensor (1, 3 + P) [global_orient + body_pose]
-          init_bone: tensor (1, B) bone lengths
-          init_t: tensor (1, 3) translation
-          init_scale: tensor (1,) scale factor
-          proj_m: tensor (V, 3, 4) projection matrices for V views
-          keypoints: tensor (V, K, 3) 2D keypoints + confidence
-          masks: tensor (V, H, W) silhouette masks
+            init_ori_plus_pose (1, 3 + bn*3): [global_orient + body_pose]
+            init_body_bone_length (1, bn): body bone lengths
+            init_t (1, 3): translation
+            init_scale (1,): scale factor
+            proj_m (vn, 3, 4): projection matrices for vn views
+            keypoints (vn, kn, 3): 2D keypoints + confidence
+            masks (vn, H, W): silhouette masks
         """
-        assert (
-            all(keypoints.device == param.device for param in [masks, self.fish, init_pose, init_bone, init_t, init_scale, proj_m])
+        if not (
+            all(
+                self.device == param.device
+                for param in [
+                    keypoints,
+                    masks,
+                    self.fish,
+                    init_ori_plus_pose,
+                    init_body_bone_length,
+                    init_t,
+                    init_scale,
+                    proj_m,
+                ]
+            )
             and self.fish.device_active == True
-        ), "All inputs must be on the same device as specified"
+        ):
+            masks = masks.to(self.device) 
+            
+            self.fish.to_device(self.device) 
+            init_ori_plus_pose = init_ori_plus_pose.to(self.device) 
+            init_body_bone_length = init_body_bone_length.to(self.device) 
+            init_t = init_t.to(self.device) 
+            init_scale = init_scale.to(self.device) 
+            proj_m = proj_m.to(self.device) 
+            
         if not "cuda" in str(keypoints.device):
-            print(f"\nWarning: running pose optimization on device {str(keypoints.device)}\n")
+            print(
+                f"\nWarning: running pose optimization on device {str(keypoints.device)}\n"
+            )
 
         # ===== Prepare data =====
         batch_size = proj_m.shape[0]
@@ -88,14 +109,14 @@ class OptimizeMV:
 
         # ===== Initialize parameters =====
         # global_orient: (1,3), body_pose: (1,P), bone_length: (1,B)
-        global_orient = init_pose[:, :3].clone().detach()
-        body_pose = init_pose[:, 3:].clone().detach()
+        global_orient = init_ori_plus_pose[:, :3].clone().detach()
+        body_pose = init_ori_plus_pose[:, 3:].clone().detach()
         global_t = init_t.clone().detach()
-        bone_length = init_bone.clone().detach()
+        body_bone_length = init_body_bone_length.clone().detach()
         scale = init_scale.clone().detach()
 
         # Stage 1: optimize global_orient, translation, scale
-        for param in [body_pose, bone_length]:
+        for param in [body_pose, body_bone_length]:
             param.requires_grad_(False)
         for param in [global_orient, global_t, scale]:
             param.requires_grad_(True)
@@ -103,89 +124,120 @@ class OptimizeMV:
             [global_orient, global_t, scale], lr=self.step_size
         )
         for _ in range(self.num_iters):
-            out = self.fish(global_pose=global_orient,
-                            body_pose=body_pose,
-                            bone_length=bone_length,
-                            scale=scale)
-            # Reprojection loss
-            model_kpts = out['keypoints'].to(self.device) + global_t
-            model_kpts = model_kpts.expand(batch_size, -1, -1)
-            loss = camera_fitting_loss(
-                model_kpts, proj_m, kpts_2d, kpts_conf) \
-                + self.prior_weight * (global_t - init_t).abs().sum()
-            # Silhouette loss
-            silhouette_renders = silhouette_renderer(out['vertices'], self.faces.unsqueeze(0), global_t)
-            loss += mask_fitting_loss(
-                silhouette_renders, 
-                masks.float(),
-                0.1 * self.mask_weight
+            out = self.fish(
+                global_ori=global_orient,
+                body_pose=body_pose,
+                body_bone_length=body_bone_length,
+                scale=scale,
             )
-            opt_global.zero_grad(); loss.backward(); opt_global.step()
+            # Reprojection loss
+            model_kpts = out["keypoints"].to(self.device) + global_t
+            model_kpts = model_kpts.expand(batch_size, -1, -1)
+            loss = (
+                camera_fitting_loss(model_kpts, proj_m, kpts_2d, kpts_conf)
+                + self.prior_weight * (global_t - init_t).abs().sum()
+            )
+            # Silhouette loss
+            silhouette_renders = silhouette_renderer(
+                out["vertices"], self.faces.unsqueeze(0), global_t
+            )
+            loss += mask_fitting_loss(
+                silhouette_renders, masks.float(), 0.1 * self.mask_weight
+            )
+            opt_global.zero_grad()
+            loss.backward()
+            opt_global.step()
 
         # Stage 2: refine body_pose, bone_length, global, scale
-        for param in [body_pose, bone_length, global_orient, global_t, scale]:
+        for param in [body_pose, body_bone_length, global_orient, global_t, scale]:
             param.requires_grad_(True)
         opt_body = torch.optim.Adam(
-            [body_pose, bone_length, global_orient, global_t, scale],
-            lr=self.step_size
+            [body_pose, body_bone_length, global_orient, global_t, scale], lr=self.step_size
         )
         # relax tail keypoints
         kpts_conf = kpts_conf.fill_(0.8)
-        kpts_conf[:, -3] = 0; kpts_conf[:, -1] = 0
+        kpts_conf[:, -3] = 0
+        kpts_conf[:, -1] = 0
         kpts_conf[keypoints[..., 2] == 0] = 0
         for _ in range(self.num_iters):
-            out = self.fish(global_pose=global_orient,
-                            body_pose=body_pose,
-                            bone_length=bone_length,
-                            scale=scale)
-            m_kpts = out['keypoints'].to(self.device) + global_t
+            out = self.fish(
+                global_ori=global_orient,
+                body_pose=body_pose,
+                body_bone_length=body_bone_length,
+                scale=scale,
+            )
+            m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
             loss = body_fitting_loss(
-                m_kpts, proj_m, kpts_2d, kpts_conf,
-                body_pose, bone_length,
+                m_kpts,
+                self.fish.bone_angle_min,
+                self.fish.bone_angle_max,
+                self.fish.bone_length_min,
+                self.fish.bone_length_max,
+                proj_m,
+                kpts_2d,
+                kpts_conf,
+                body_pose,
+                body_bone_length,
                 lim_weight=self.lim_weight,
                 prior_weight=self.prior_weight,
-                bone_weight=self.bone_weight
+                bone_weight=self.bone_weight,
             )
-            opt_body.zero_grad(); loss.backward(); opt_body.step()
+            opt_body.zero_grad()
+            loss.backward()
+            opt_body.step()
 
         # Stage 3: tail + silhouette offset
-        sil_offset = torch.zeros((2,3), device=self.device, requires_grad=True)
-        for p in [body_pose, bone_length, global_orient, global_t, scale, sil_offset]:
+        sil_offset = torch.zeros((2, 3), device=self.device, requires_grad=True)
+        for p in [body_pose, body_bone_length, global_orient, global_t, scale, sil_offset]:
             p.requires_grad_(True)
         opt_tail = torch.optim.Adam(
-            [body_pose, bone_length, global_orient, global_t, scale, sil_offset],
-            lr=self.step_size
+            [body_pose, body_bone_length, global_orient, global_t, scale, sil_offset],
+            lr=self.step_size,
         )
         # reweight tail points
         kpts_conf = kpts_conf.fill_(0.8)
-        kpts_conf[0, -3] = 0.1; kpts_conf[0, -1] = 1
-        kpts_conf[1, 0] = 1; kpts_conf[1, 2] = 1
+        kpts_conf[0, -3] = 0.1
+        kpts_conf[0, -1] = 1
+        kpts_conf[1, 0] = 1
+        kpts_conf[1, 2] = 1
         kpts_conf[keypoints[..., 2] == 0] = 0
         init_bp = body_pose.clone().detach()
-        init_bl = bone_length.clone().detach()
+        init_bl = body_bone_length.clone().detach()
         for _ in range(self.num_iters):
-            out = self.fish(global_pose=global_orient,
-                            body_pose=body_pose,
-                            bone_length=bone_length,
-                            scale=scale)
-            m_kpts = out['keypoints'].to(self.device) + global_t
+            out = self.fish(
+                global_ori=global_orient,
+                body_pose=body_pose,
+                body_bone_length=body_bone_length,
+                scale=scale,
+            )
+            m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
             loss = body_fitting_loss(
-                m_kpts, proj_m, kpts_2d, kpts_conf,
-                body_pose, bone_length,
+                m_kpts,
+                self.fish.bone_angle_min,
+                self.fish.bone_angle_max,
+                self.fish.bone_length_min,
+                self.fish.bone_length_max,
+                proj_m,
+                kpts_2d,
+                kpts_conf,
+                body_pose,
+                body_bone_length,
                 lim_weight=self.lim_weight,
                 prior_weight=self.prior_weight,
                 bone_weight=self.bone_weight,
                 pose_init=init_bp,
-                bone_init=init_bl
+                bone_init=init_bl,
             )
-            opt_tail.zero_grad(); loss.backward(); opt_tail.step()
+            opt_tail.zero_grad()
+            loss.backward()
+            opt_tail.step()
 
         # Gather final outputs
-        vertices = out['vertices'].detach().cpu()
+        vertices = out["vertices"].detach().cpu()
         pose = torch.cat([global_orient, body_pose], dim=-1).detach().cpu()
-        bone = bone_length.detach().cpu()
+        bone = body_bone_length.detach().cpu()
         scale = scale.detach().cpu()
         translation = global_t.detach().cpu()
         return vertices, pose, bone, scale, translation, (0, 0)

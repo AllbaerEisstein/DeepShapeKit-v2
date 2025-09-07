@@ -26,14 +26,19 @@ class LBS():
     '''
 
     def __init__(self, J, parents, weights):
+        """
+        Args:
+            parents (BS, jn): List of parent indices for jn joints for BS batches. Parent index of the first joint is -1 (no parent)
+        """
         self.n_joints = J.shape[1] - 1
         # rotation around joint
         # self.h_joints = F.pad(J[:,1:].unsqueeze(-1), [0, 0, 0, 1], value=0)
         # #self.kin_tree = torch.cat([J[:, [0], :], J[:, 1:] - J[:, parents[1:]]], dim=1).unsqueeze(-1)
         # self.kin_tree = (J[:, 1:] - J[:, parents[1:]]).unsqueeze(-1)
-
+        # print(f"Joints shape: {J.size()}")
         # rotation around parent
         self.h_joints = F.pad((J[:, parents[1:]]).unsqueeze(-1), [0, 0, 0, 1], value=0)
+        # kin_tree: positions of the body joints (first joint excluded!) relative to their parents
         self.kin_tree = (J[:, 1:] - J[:, parents[1:]]).unsqueeze(-1)
         self.joint_parent = F.pad((J[:, parents[1:]]).unsqueeze(-1), [0,0,0,1], value=1)
 
@@ -42,10 +47,20 @@ class LBS():
         self.weights = weights[None].float()
 
     def __call__(self, V, pose, bone, scale, to_rotmats=True):
+        """
+        Args:
+            V (BS, vn, 3): 3d coordinates (world) of vn vertices in BS batches
+            pose (BS, bn, 3): axis-angle poses of all bn bones of the mesh in BS batches
+            scale (1): scalar denoting the size factor
+        """
         batch_size = len(V)
         device = pose.device
         V = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
-        kin_tree = (scale * self.kin_tree) * bone[:, 1:, None, None]
+        # TODO: used to cut the first bone: bone[:, 1:, None, None]
+        # print(f"LBS: kintree shape: {self.kin_tree.size()}")
+        # print(f"LBS: bone length shape: {bone.size()}")
+        # print(f"LBS: pose shape: {pose.size()}")
+        kin_tree = (scale * self.kin_tree) * bone[:, :, None, None]
 
         # disable rotation around x-axis for fish parts
         for i in range(self.n_joints - 1):
@@ -56,7 +71,8 @@ class LBS():
         pose = pose.view([batch_size, -1, 3, 3])
         T = torch.zeros([batch_size, self.n_joints, 4, 4]).float().to(device)
         T[:, :, -1, -1] = 1
-        T[:, :, :3, :] = torch.cat([pose[:,1:,:,:], kin_tree], dim=-1)
+        # TODO: used to cut the first pose: pose[:,1:,:,:]
+        T[:, :, :3, :] = torch.cat([pose[:,:,:,:], kin_tree], dim=-1)
         T_rel = [T[:, 0]]
         for i in range(1, self.n_joints):
             T_rel.append(T_rel[self.parents[i]] @ T[:, i])
