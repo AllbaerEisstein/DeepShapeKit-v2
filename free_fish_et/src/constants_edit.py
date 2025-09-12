@@ -1,56 +1,42 @@
-"""
-parameters and constrains, modified from Badger et al.
-@Inproceedings{badger2020,
-  Title          = {3D Bird Reconstruction: a Dataset, Model, and Shape Recovery from a Single View},
-  Author         = {Badger, Marc and Wang, Yufu and Modh, Adarsh and Perkes, Ammon and Kolotouros, Nikos and Pfrommer, Bernd and Schmidt, Marc and Daniilidis, Kostas},
-  Booktitle      = {ECCV},
-  Year           = {2020}
-}
-https://github.com/marcbadger/avian-mesh
-"""
-
 import torch
 
-"""
-Body_pose angle limit
-we minus index by 1 because we exclude root pose as it is modeled as global orient
-"""
-max_lim = [0.] * (num_bone*3)
-min_lim = [0.] * (num_bone*3)
-
-# for i in range(num_bone):
-#     max_lim[i * 3: (i + 1) * 3] = 0, 1.2, 0.02
-#     min_lim[i * 3: (i + 1) * 3] = 0, -1.2, -0.02
-#
-# for i in range(num_bone - 4, num_bone):
-#     max_lim[i * 3: (i + 1) * 3] = 0, 1.5, 0.03
-#     min_lim[i * 3: (i + 1) * 3] = 0, -1.5, -0.03
-
-for i in range(num_bone):
-    max_lim[i * 3: (i + 1) * 3] = 0., -0.05, 0.
-    min_lim[i * 3: (i + 1) * 3] = -0., -0.05, 0.
-
-for i in range(num_bone - 3, num_bone):
-    max_lim[i * 3: (i + 1) * 3] = 0.0, -0.05, 0.
-    min_lim[i * 3: (i + 1) * 3] = -0.0, -0.05, 0.
-
-for i in range(num_bone - 1, num_bone):
-    max_lim[i * 3: (i + 1) * 3] = 0.0, -0.07, 0.
-    min_lim[i * 3: (i + 1) * 3] = -0.0, -0.07, 0.
 
 """
-Body bone length limit
+Coordinate system conventions:
+
+.    openCV: 
+.            
+.          .´ [Z camera: positive Z look-at]                                                                       .´ Z
+.        .´                                                                                                      .´    
+.        0/0---X--->                                                                                             0/0---X--->                  
+.        |                                                                                                       |                                   
+.        |    image:                                                                                             |     world:             
+.        Y    Point(x,y) -> column-major                                                                         Y     right-handed coordinate system, y pointing down
+.        |    Mat(y,x)   -> row-major                                                                            |     axes around positive x are clockwise Y, Z
+.        |                                                                                                       |     
+.        v                     ^    __                                                                           v        ^ 
+.                              |   |`.                                                                                    |
+.               (1,  0,  0)    |      `.                                                                                  |    (1,  0,  0)
+.               (0, -1,  0)----+        `.                                                                                +----(0,  0, -1)     = 90° ccw about x
+.               (0,  0, -1)    |          `.                   K @ Blcam2cvcam @ Rt                                       |    (0,  1,  0)
+.               Blcam2cvcam    |            `.                                                                            |  Blworld2cvworld
+.                              |              `.___________________________________________________________________       |                                              
+.    Blender:                                                                                                      `.                    
+.                                                                                                                    `.                   
+.        ^                                                                                                       ^     world:
+.        |                                    <---------------------------.----------------.------------         |     right-handed coordinate system, z pointing up                     
+.        |    image:                                                    .´                  `.                   |     axes around positive x are clockwise Y, Z             
+.        Y    Vector(x,y) -> column-major                      (  a_w,  skew,  u_0)   ( Rxx,  Rxy,  Rxz,  tx)    Z
+.        |    Matrix(y,x) -> row-major                         (   0 ,   a_u,  v_0) @ ( Ryx,  Ryy,  Ryz,  ty)    |   .´ Y
+.        |                                                     (   0 ,    0 ,   1 )   ( Rzx,  Rzy,  Rzz,  tz)    | .´
+.        0/0---X--->                                                     K                      Rt               0/0---X--->
+.      .´
+.    .´ [Z camera: negative Z look-at]   
+.          
+
 """
-# max_bone = [2.4] * (num_bone)
-max_bone = [2.3] * (num_bone)
-min_bone = [1.0] * (num_bone)
-
-# max_bone[0] = 2.7
-# max_bone[1] = 2.7
-# max_bone[2] = 2.7
-# max_bone[3] = 1.7
-
-# min_bone[0] = 0.3
-# min_bone[1] = 0.5
-# min_bone[2] = 0.4
-# min_bone[3] = 0.4
+BLENDERCAM_2_CV = torch.tensor([    
+    (1,  0,  0),
+    (0, -1,  0),
+    (0,  0, -1)
+])

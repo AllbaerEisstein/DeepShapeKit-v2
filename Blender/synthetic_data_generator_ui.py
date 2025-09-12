@@ -242,18 +242,18 @@ def get_3x4_RT_matrix_Blender2Blendercam(cam):
     location, rotation = cam.matrix_world.decompose()[0:2]
     R_world_2_blcam = rotation.to_matrix().transposed()
     loc_world_2_blcam = -1 * R_world_2_blcam @ location
-    RT = Matrix((
+    Rt = Matrix((
         R_world_2_blcam[0][:] + (loc_world_2_blcam[0],),
         R_world_2_blcam[1][:] + (loc_world_2_blcam[1],),
         R_world_2_blcam[2][:] + (loc_world_2_blcam[2],)
     ))
-    return RT, R_world_2_blcam, Matrix.Translation(tuple(loc_world_2_blcam))
+    return Rt, R_world_2_blcam.to_4x4(), Matrix.Translation(tuple(loc_world_2_blcam))
 
 
 def get_3x4_P_matrix_Blendercam2Blenderimage(cam, scene):
     f, K = get_calibration_matrix_K_Blendercam2Blenderimage(cam.data, scene)
-    RT, R, T = get_3x4_RT_matrix_Blender2Blendercam(cam)
-    return f, K @ RT, K, R, T, RT
+    Rt, R, T = get_3x4_RT_matrix_Blender2Blendercam(cam)
+    return f, K @ Rt, K, R, T, Rt
 
 
 def export_cam_matrices(context):
@@ -273,7 +273,6 @@ def export_cam_matrices(context):
             continue
         def mat_to_list(m):
             return [[float(v) for v in row] for row in m]
-        # Ensure T is 4x4 list
         T = mats.get('T')
         if T is None:
             T_list = None
@@ -281,7 +280,6 @@ def export_cam_matrices(context):
             try:
                 T_list = mat_to_list(T)
             except Exception:
-                # fallback: try to construct 4x4 translation matrix from T if it's a Vector
                 T_list = None
         P = mats.get('P')
         f = mats.get('f')
@@ -549,16 +547,16 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
 
 def get_cam_matrix_for_cam(cam_obj, scene):
     """Compute and cache camera matrices for a camera object.
-    Returns dict with keys 'f','K','R','T','P' where P maps Blender world -> CV image homogeneous coords.
+    Returns dict with keys 'f','K','R','T','P' in CV convention (y is down, z is positive camera look-at) where P maps Blender world -> CV image homogeneous coords.
     """
     cam_name = cam_obj.name
     if cam_name in cam_name_2_matrix and cam_name_2_matrix[cam_name].get('P') is not None:
         return cam_name_2_matrix[cam_name]
 
-    f, KRT, K, R, T, RT = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
+    f, KRT, K, R, T, Rt = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
     # P: we want mapping from Blender world -> cv image (with y down and positive z forward)
-    P = K @ BLENDER_CAM_2_CV_CAM @ RT
-    cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': R, 'T': T, 'P': P, 'RT': RT}
+    P = K @ BLENDER_CAM_2_CV_CAM @ Rt
+    cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': BLENDER_CAM_2_CV_CAM.to_4x4() @ R, 'T': BLENDER_CAM_2_CV_CAM.to_4x4() @ T, 'P': P, 'Rt': BLENDER_CAM_2_CV_CAM @ Rt}
     return cam_name_2_matrix[cam_name]
 
 
@@ -1557,12 +1555,12 @@ class SYNTH_OT_unregister_timed_render(Operator):
 class SYNTH_OT_export_camera_matrices(Operator):
     bl_idname = "synth.export_camera_matrices"
     bl_label = "Export Camera Matrices"
-    bl_description = "Export computed camera matrices (K, R, T, P) for all scene cameras to cam_matrices.json in the annotation folder"
+    bl_description = "Export computed camera parameters & matrices (f, K, R, T, P, Rt) for [Blender world -> CV image]-conversion for all scene cameras to cam_matrices.json in the annotation folder. -- NOTE -- K expects coordinates in CV-convention; y is down, z is positive camera look-at (forward), x is right -- P, R, T, Rt expect coordinates in Blender world convention: z is up, y is forward, x is right"
 
     def execute(self, context):
         try:
             path_matrices_were_saved_to = export_cam_matrices(context)
-            self.report({'INFO'}, f"Wrote camera matrices to {path_matrices_were_saved_to}")
+            self.report({'INFO'}, f"Wrote camera parameters & matrices to {path_matrices_were_saved_to}")
             return {'FINISHED'}
         except Exception as e:
             self.report({'WARNING'}, f"Failed to export camera matrices: {e}")

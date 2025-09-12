@@ -21,6 +21,7 @@ from .LBS_edit import LBS
 class fish_model:
     """
     Parametric fish model.
+    !! The fish model is expected to use the same coordinate system conventions as the camera matrices used !!
     !! Members will only be on the device after calling to_device(target_device) !!
     Args:
         faces (F, 3): faces of the fish mesh each consisting of the indices of three vertices spanning it
