@@ -54,7 +54,6 @@ class OptimizeMV:
         masks: torch.Tensor,
         silhouette_renderer: Silhouette_Renderer,
         has_prev: bool = False,
-        img_filenames: Optional[torch.Tensor] = None,
         index: Optional[torch.Tensor] = None,
         bboxes: Optional[torch.Tensor] = None,
     ):
@@ -97,6 +96,18 @@ class OptimizeMV:
             print(
                 f"\nWarning: running pose optimization on device {str(keypoints.device)}\n"
             )
+        
+        for param in [
+            keypoints,
+            masks,
+            self.fish,
+            init_ori_plus_pose,
+            init_body_bone_length,
+            init_t,
+            init_scale,
+            proj_m,
+        ]:
+            print(param)
 
         # ===== Prepare data =====
         batch_size = proj_m.shape[0]
@@ -240,4 +251,9 @@ class OptimizeMV:
         bone = body_bone_length.detach().cpu()
         scale = scale.detach().cpu()
         translation = global_t.detach().cpu()
+        print(f"optimzer vertices: {vertices}")
+        print(f"optimzer : {pose}")
+        print(f"optimzer bone: {bone}")
+        print(f"optimzer scale: {scale}")
+        print(f"translation: {translation}")
         return vertices, pose, bone, scale, translation, (0, 0)

@@ -174,8 +174,37 @@ def _parse_distortion(d_obj: Any) -> Tuple[float,float,float,float,float]:
         return (rad_1, rad_2, tan_1, tan_2, rad_3)
     raise ValueError(f'Could not parse distortion from {d_obj}')
 
+def _adjust_intrinsics_for_padding(K, orig_size, max_size, pad_mode="center"):
+    """
+    Shift the principal point to a new location suitable for the new image size `max_size`.
+    This assumes that the original image was padded where left and right padding was equal, and top and bottom padding was equal.
+    Args:
+        K: 3x3 numpy array
+        orig_size: (w, h)
+        max_size: (max_w, max_h)
+    """
+    w, h = orig_size
+    max_w, max_h = max_size
+
+    if pad_mode == "center":
+        pad_x = (max_w - w) / 2.0
+        pad_y = (max_h - h) / 2.0
+    else:
+        # specify left/top padding explicitly if needed
+        raise NotImplementedError("other pad modes: specify pad_x, pad_y manually")
+
+    Kp = K.copy().astype(float)
+    Kp[0,2] += pad_x
+    Kp[1,2] += pad_y
+    return Kp
+
+
 class CameraSet:
-    def __init__(self, index_json: Dict[str, Any], views: List[str]):
+    """
+    Parse a dict from index json to torch-stacked cam parameters.
+    If the input `uniform_image_size` is specified, alter the intrinsic matrices K to correctly project onto the new image size (the input images were padded to the maximum size in dataloaders).
+    """
+    def __init__(self, index_json: Dict[str, Any], views: List[str], uniform_img_size: None | torch.Tensor = None):
         self.index_json = index_json
         self.views = views
         self.cam_matrices = index_json.get('camera_matrices', {})
@@ -185,6 +214,7 @@ class CameraSet:
         self.R_list: list[torch.Tensor] = []
         self.T_list: list[torch.Tensor] = []
         self.distortions_list: list[Tuple[float,float,float,float,float]] = []
+        self.uniform_img_size = uniform_img_size
 
         for v in self.views:
             matrices_json = self.cam_matrices.get(v, None)
@@ -239,6 +269,9 @@ class CameraSet:
                 raise ValueError(f'Distortion for view "{v}" could not be parsed: {e}')
 
             self.P_list.append(torch.tensor(P_np, dtype=torch.float32))
+            if self.uniform_img_size:
+                image_size = self.index_json['image_sizes'][v]
+                K_np = _adjust_intrinsics_for_padding(K_np, image_size, self.uniform_img_size)
             self.K_list.append(torch.tensor(K_np, dtype=torch.float32))
             self.R_list.append(torch.tensor(R_np, dtype=torch.float32))
             self.T_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
@@ -248,21 +281,28 @@ class CameraSet:
     def get_camera_matrices(self, keep_focal_scalar: bool = True, focal_tol: float = 1e-6):
         """
         Return camera matrices and distortion parameters for all views.
+        
+        **In the context of DSKv2, the fish mesh is going to be sepcified in the Blender coordinate system.**
+        That means: x-axis points to the right, y-axis points forward, and z-axis points up.
+        **Thus, the camera parameters P, R, t, Rt all should be specified so that they expect input coordinates in Blender coordinate conventions and return coordinates in CV coordinate convention** (x-axis points right, y-axis points down, z-axis points forward)
+        
+        **The camera intrinsic matrix K expects CV coordinate convention input and returns CV image coordinate convention output.**
 
         Returns:
-            P_stack: (N, 3, 4) torch.float32
-            K_stack: (N, 3, 3) torch.float32
-            R_stack: (N, 3, 3) torch.float32
-            T_stack: (N, 3)    torch.float32  <-- non-homogeneous translations
-            focals:  either
-                    (N,)    torch.float32  if every fx == fy and keep_focal_scalar==True
-                    (N,2)   torch.float32  otherwise (fx,fy) per view
-            dists:   (N, 5)    torch.float32  <-- (rad_1, rad_2, tan_1, tan_2, rad_3)
+            P_stack (N, 3, 4): torch.float32
+            K_stack (N, 3, 3): torch.float32
+            R_stack (N, 3, 3): torch.float32
+            T_stack (N, 3):    torch.float32  <-- non-homogeneous translations
+            
+            focals  either
+                    (N,):    torch.float32  if every fx == fy and keep_focal_scalar==True
+                    (N,2):   torch.float32  otherwise (fx,fy) per view
+            dists   (N, 5):    torch.float32  <-- (rad_1, rad_2, tan_1, tan_2, rad_3)
         """
         P_stack = torch.stack(self.P_list, 0)
         K_stack = torch.stack(self.K_list, 0)
         R_stack = torch.stack(self.R_list, 0)
-        T_stack = torch.stack(self.T_list, 0)        # (N,3)
+        t_stack = torch.stack(self.T_list, 0)        # (N,3)
         focals_2 = torch.tensor(self.f_list, dtype=torch.float32)  # (N,2)
         dists = torch.tensor(self.distortions_list, dtype=torch.float32)  # (N,5)
 
@@ -270,6 +310,6 @@ class CameraSet:
             # check fx == fy for all views within tolerance
             if torch.allclose(focals_2[:,0], focals_2[:,1], atol=focal_tol, rtol=0):
                 focals = focals_2[:, 0].clone()  # (N,)
-                return P_stack, K_stack, R_stack, T_stack, focals, dists
+                return P_stack, K_stack, R_stack, t_stack, focals, dists
         # otherwise return (N,2)
-        return P_stack, K_stack, R_stack, T_stack, focals_2, dists
+        return P_stack, K_stack, R_stack, t_stack, focals_2, dists

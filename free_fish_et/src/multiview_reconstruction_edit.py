@@ -1,6 +1,8 @@
 import pickle
 import os
 import argparse
+from typing import List
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -32,7 +34,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
 
 
 def initialize_model(
-    mesh_file: str, device: str, image_sizes, Ks, Rs, Ts, focals, distortions
+    mesh_file: str, device: str, image_size, Ks, Rs, Ts, focals
 ) -> tuple:
     fish = fish_model(mesh_json_path=mesh_file)
     optimizer = OptimizeMV(
@@ -45,7 +47,7 @@ def initialize_model(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer = Silhouette_Renderer(device, image_sizes, Ks, Rs, Ts, focals, distortions)
+    renderer = Silhouette_Renderer(device, image_size, Ks, Rs, Ts, focals)
     return fish, optimizer, renderer
 
 
@@ -106,6 +108,112 @@ def save_rendered_views(
         ensure_dir(view_dir)
         save_path = os.path.join(view_dir, f"frame_{sample_index}_view_{view_idx}.png")
         plt.imsave(save_path, img_with_projection)
+
+
+def save_reconstruction_images(
+    orig_image_paths: List[str],
+    outdir: str,
+    renderer: Silhouette_Renderer,  # Silhouette_Renderer instance
+    instance_number: int,
+    Ps: torch.Tensor,  # (N,3,4)
+    reconstructed_keypoints_world: torch.Tensor,  # (1, K, 3)
+    reconstructed_vertices_world: torch.Tensor,  # (1, V, 3)
+    faces_from_vert_indices: torch.Tensor,  # (1, N, 3)
+    global_t: torch.Tensor, # (3)
+    keypoint_names: List[str],
+    view_names: List[str],
+    silhouette_threshold: float = 0.01,  # tiny alpha cutoff
+    blend_factor: float = 0.4,           # overlay opacity (40%)
+):
+    """
+    Render silhouettes, pad originals (zero padding) to silhouette size (centered),
+    overlay silhouette in red with given blend_factor, draw keypoints (blue), and save.
+    """
+
+    silhouettes = renderer(reconstructed_vertices_world, faces_from_vert_indices, global_t)
+
+    silhouettes_np = silhouettes.detach().cpu().numpy()
+
+    alpha = silhouettes_np  # (N, W, H)
+    n_views, W, H = alpha.shape
+
+    assert len(orig_image_paths) == n_views, "orig_image_paths length must match rendered views"
+    assert Ps.shape[0] == n_views, "Ps batch size must match number of views"
+    assert len(view_names) == n_views, "Number of view names must match number of views"
+
+    for i in range(n_views):
+        # Read original image (BGR)
+        orig_bgr = cv2.imread(str(orig_image_paths[i]), cv2.IMREAD_COLOR)
+        if orig_bgr is None:
+            raise FileNotFoundError(f"Could not read image {orig_image_paths[i]}")
+
+        h0, w0 = orig_bgr.shape[:2]
+        # Compute integer padding to center the resized image within (W,H)
+        pad_left = (W - w0) // 2
+        pad_right = W - w0 - pad_left
+        pad_top = (H - h0) // 2
+        pad_bottom = H - h0 - pad_top
+        
+        print(f"alpha: {alpha.shape}")
+        print(f"left, right, top, bottom: {pad_left}, {pad_right}, {pad_top}, {pad_bottom}")
+        print(f"orig_bgr: {orig_bgr.shape}")
+
+
+        # Pad with zeros (black). cv2.copyMakeBorder expects ints
+        padded = cv2.copyMakeBorder(
+            orig_bgr,
+            top=pad_top, bottom=pad_bottom, left=pad_left, right=pad_right,
+            borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        ).transpose(1,0,2)
+
+        a = np.clip(alpha[i], 0.0, 1.0)  # (H,W), float
+
+        # threshold tiny values
+        a[a < silhouette_threshold] = 0.0
+
+        # Build red overlay image (BGR) and blend: out = orig*(1 - bf * a) + red*(bf * a)
+        red_img = np.zeros_like(padded)
+        red_img[:, :, 2] = 255  # full red channel in BGR
+
+        a_exp = a[..., None]  # (H,W,1)
+        blended = (padded.astype(np.float32) * (1.0 - blend_factor * a_exp) +
+                   red_img.astype(np.float32) * (blend_factor * a_exp))
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+        # Draw keypoints:
+        print(f"reconstructed_keypoints_world: {reconstructed_keypoints_world}")
+        reconstructed_keypoints_world = reconstructed_keypoints_world.squeeze(0)
+        P_i = Ps[i].detach().cpu().numpy()  # (3,4)
+        for kp_idx, name in enumerate(keypoint_names):
+            coords3d = reconstructed_keypoints_world[kp_idx]
+            print(f"coords3d: {coords3d}")
+            print(f"reconstructed_keypoints_world: {reconstructed_keypoints_world}")
+            coords_np = coords3d.detach().cpu().numpy()
+            Xh = np.concatenate([coords_np, [1.0]])  # (4,)
+            ph = P_i @ Xh  # (3,)
+            z = ph[2]
+            if abs(z) < 1e-6:
+                continue
+            u = ph[0] / z
+            v = ph[1] / z
+
+            # u,v are pixel coords in the same coordinate system as the silhouette (W,H)
+            ui = int(round(u))
+            vi = int(round(v))
+            if 0 <= ui < W and 0 <= vi < H:
+                cv2.circle(blended, (ui, vi), radius=5, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+                cv2.putText(blended, name, (ui, vi + 15), cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale=0.35, color=(255, 0, 0), thickness=1, lineType=cv2.LINE_AA)
+
+        # Prepare output dirs & filename
+        view_output_dir = os.path.join(outdir, view_names[i] + "_reconstruction_images")
+        instance_dir = os.path.join(view_output_dir, f"instance_{instance_number}")
+        ensure_dir(instance_dir)
+        base_name = os.path.splitext(os.path.basename(orig_image_paths[i]))[0]
+        out_path = os.path.join(instance_dir, base_name + "_reconstructed.png")
+
+        # Save PNG (BGR)
+        cv2.imwrite(out_path, blended)
 
 
 def save_obj_model(
@@ -171,13 +279,11 @@ def reconstruct(
     cam_params = dataset.cams.get_camera_matrices()
     Ks = cam_params[1]
     principal_points = torch.stack((Ks[:, 0, 2], Ks[:, 1, 2]), dim=1)
-    image_sizes = torch.stack(
-        [torch.tensor(size) for size in dataset.index_json["image_sizes"].values()]
-    )
+    image_size = torch.tensor(dataset.uniform_img_size)
 
     ensure_dir(outdir)
     fish, optimizer, renderer = initialize_model(
-        mesh_path, device, image_sizes, *cam_params[1:]
+        mesh_path, device, image_size, *cam_params[1:5]
     )
 
     parameters = []
@@ -219,25 +325,41 @@ def reconstruct(
             renderer,
             device,
             *([] if init is None else init),
-            img_filenames=img_paths,
             index=idx,
             bboxs=bboxes,
         )
-        mesh_vertices_after_reconstruction, keypoints_after_reconstruction, t, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
+        mesh_vertices_after_reconstruction, keypoints_after_reconstruction, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
 
-        parameters += [global_ori_plus_pose_est, body_bone_est, scale_est, t]
+        parameters += [global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est]
         sample_data.append([views_indices, img_paths, keypoints_after_reconstruction, bboxes, idx])
 
-        save_rendered_views(
-            outdir,
-            instance_number,
-            idx,
-            img_paths,
-            mesh_vertices_after_reconstruction,
-            *cam_params,
-            principal_points,
-            keypoints_after_reconstruction,
-            bboxes,
+        # save_rendered_views(
+        #     outdir,
+        #     instance_number,
+        #     idx,
+        #     img_paths,
+        #     mesh_vertices_after_reconstruction,
+        #     *cam_params,
+        #     principal_points,
+        #     keypoints_after_reconstruction,
+        #     bboxes,
+        # )
+
+        print(f"keypoints_after_reconstruction: {keypoints_after_reconstruction}")
+
+
+        save_reconstruction_images(
+            orig_image_paths=img_paths,
+            outdir=outdir,
+            renderer=renderer,
+            instance_number=instance_number,
+            Ps=cam_params[0],
+            reconstructed_keypoints_world=keypoints_after_reconstruction,
+            reconstructed_vertices_world=mesh_vertices_after_reconstruction,
+            faces_from_vert_indices=fish.faces.unsqueeze(0),
+            global_t=global_t_est,
+            keypoint_names=dataset.index_json["keypoint_list"],
+            view_names=dataset.views
         )
 
         if save_models:

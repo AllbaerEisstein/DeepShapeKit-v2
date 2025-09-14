@@ -1,6 +1,7 @@
 from collections import defaultdict
 import csv
 import os
+from typing import Optional
 import cv2
 import numpy as np
 import torch
@@ -72,6 +73,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         print("DATASET ROOT: "+str(self.root))
         with open(self.root / 'index.json', 'r') as jf:
             self.index_json = json.load(jf)
+        # !! This specifies the video ordering
         self.views: list[str] = self.index_json["frame_folders"]
 
         self.view_2_kpts: dict[str, dict[str, KeypointsDict]] = {
@@ -129,6 +131,9 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             for v in self.views
         }
 
+        self.uniform_img_size = (max([value[0] for value in self.index_json['image_sizes'].values()]), 
+                                 max([value[1] for value in self.index_json['image_sizes'].values()]))
+
         self.cams = CameraSet(self.index_json, self.views)
 
         self.prev_data = None
@@ -139,10 +144,20 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         return len(self.index_json["image_count"])
 
 
-    def __getitem__(self, idx: int) -> dict:
-        frame_key = str(idx)
+    def __getitem__(self, frame_idx: int, instance_idx: Optional[int]) -> dict:
+        """
+        Returns:
+            samples (dict): a dict with the following fields:
+            sample['imgpaths'] (list[str]): list of paths to the original image for each view
+            sample['frames'] (list[int]): the list of the view indices
+            sample['instances'] (1): the number of instances in this sample (= max_n_instances)
+            sample['bboxes'] (n_instances, n_views, 4): bounding boxes of the segmentation masks in the format (x0, y0, x1, y1)
+            sample['masks_full'] (n_instances, n_views, uniform_img_width, uniform_img_height): tensor storing the binary segmentation mask
+            sample['keypoints'] (n_instances, n_views, n_keypoints, 3): tensor storing (x,y,conf) for each keypoint (keypoint missing -> conf=-1)
+        """
+        frame_key = str(frame_idx)
 
-        # raise an index error if we don't have at least two views with annotations
+        # raise an index error if we don't have at least two views with annotations for this instance
         views_with_annot = len(self.views)
         for view in self.views:
             if frame_key not in [str(frame_with_annot) for frame_with_annot in self.masks_meta[view]]:
@@ -159,17 +174,25 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             # image path
             file_loc = self.origin_frames_meta[view][origin_frame_number]['file_loc']
             origin_img_path = self.root / file_loc
+        
+
+            # extract keypoints for each instance
+            kpt_list: list[torch.Tensor] = self._extract_keypoints(view, 
+                                               self.view_2_kpts, 
+                                               frame_idx, 
+                                               flip=False
+            )
 
             # meta info for this frame
-            masks_rows      = self.masks_meta[view].get(origin_frame_number, [])
-            crops_rows      = self.cropped_meta[view].get(origin_frame_number, [])
-            full_masks_rows = self.masks_full_meta[view].get(origin_frame_number, [])
+            masks_row_per_instance      = self.masks_meta[view].get(origin_frame_number, [])
+            crops_row_per_instance      = self.cropped_meta[view].get(origin_frame_number, [])
+            full_masks_row_per_instance = self.masks_full_meta[view].get(origin_frame_number, [])
 
-            # sort by sub_index to keep instance order
+            # add placeholders for missing instances
             for inst in range(self.index_json['max_n_instances']):
-                if not any(r['sub_index'] == str(inst) for r in masks_rows):
+                if not any(r['sub_index'] == str(inst) for r in masks_row_per_instance):
                     # add empty entries for missing instances
-                    masks_rows.append({
+                    masks_row_per_instance.append({
                         'frame':        origin_frame_number,
                         'file_loc':     '', # no mask
                         'category':     'mask',
@@ -177,49 +200,58 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                         'folder':       view,
                         'bbox':         '[0,0,0,0]',
                     })
-                if not any(r['sub_index'] == str(inst) for r in crops_rows):
-                    crops_rows.append({
+                if not any(r['sub_index'] == str(inst) for r in crops_row_per_instance):
+                    crops_row_per_instance.append({
                         'frame':        origin_frame_number,
                         'file_loc':     '', # no crop
                         'category':     'cropped',
                         'sub_index':    str(inst),
                         'folder':       view,
                     })
-                if not any(r['sub_index'] == str(inst) for r in full_masks_rows):
-                    full_masks_rows.append({
+                if not any(r['sub_index'] == str(inst) for r in full_masks_row_per_instance):
+                    full_masks_row_per_instance.append({
                         'frame':        origin_frame_number,
                         'file_loc':     '', # no full mask
                         'category':     'mask_full',
                         'sub_index':    str(inst),
                         'folder':       view,
                     })
-            masks_rows      = sorted(masks_rows, key=lambda r: int(r['sub_index']))
-            crops_rows      = sorted(crops_rows, key=lambda r: int(r['sub_index']))
-            full_masks_rows = sorted(full_masks_rows, key=lambda r: int(r['sub_index']))
+            masks_row_per_instance      = sorted(masks_row_per_instance, key=lambda r: int(r['sub_index']))
+            crops_row_per_instance      = sorted(crops_row_per_instance, key=lambda r: int(r['sub_index']))
+            full_masks_row_per_instance = sorted(full_masks_row_per_instance, key=lambda r: int(r['sub_index']))
 
             # parse bboxes and load crops/full masks
-            # TODO: different image sizes - not stackable? -> pad all to max image size and edit camera matrices (Move logic from silhouette renderer to here)
             bboxes, crops, masks, full_masks = [], [], [], []
-            for (crops_rows, masks_rows, full_masks_rows) in zip(crops_rows, masks_rows, full_masks_rows):
-                if crops_rows['file_loc'] == '' or masks_rows['file_loc'] == '' or full_masks_rows['file_loc'] == '':
+            for (crops_row, masks_row, full_masks_row) in zip(crops_row_per_instance, masks_row_per_instance, full_masks_row_per_instance):
+                if crops_row['file_loc'] == '' or masks_row['file_loc'] == '' or full_masks_row['file_loc'] == '':
                     # missing instance -> add empty entries
                     bboxes.append([0,0,0,0])
-                    crops.append(np.zeros((1, 1), dtype=np.uint8).transpose())
-                    masks.append(np.zeros((1, 1), dtype=np.uint8).transpose())
-                    full_masks.append(np.zeros((self.index_json['image_sizes'][self.views[0]][1], self.index_json['image_sizes'][self.views[0]][0]), dtype=np.uint8).transpose())
+                    crops.append(np.zeros((1, 1), dtype=np.uint8))
+                    masks.append(np.zeros((1, 1), dtype=np.uint8))
+                    full_masks.append(np.zeros((self.uniform_img_size[0], self.uniform_img_size[1]), dtype=np.uint8))
                     continue
-                bbox = self._parse_bbox(masks_rows['bbox'])
-                bboxes.append(bbox)
-                crops.append(self._load_grayscale_image(view, crops_rows['file_loc']).transpose())
-                masks.append(self._load_grayscale_image(view, masks_rows['file_loc']).transpose())
-                full_masks.append(self._load_grayscale_image(view, full_masks_rows['file_loc']).transpose())
 
-            # extract keypoints for each instance
-            kpt_list: list[torch.Tensor] = self._extract_keypoints(view, 
-                                               self.view_2_kpts, 
-                                               idx, 
-                                               flip=False
-            )            
+                bbox = self._parse_bbox(masks_row['bbox'])
+                crop = self._load_grayscale_image(view, crops_row['file_loc'])
+                mask = self._load_grayscale_image(view, masks_row['file_loc'])
+                full_mask = self._load_grayscale_image(view, full_masks_row['file_loc'])
+
+                # pad the image to match the maximum image size and also adjust the bbox coordinates accordingly
+                orig_img_size = (self.index_json['image_sizes'][view][0],self.index_json['image_sizes'][view][1])
+                if orig_img_size != self.uniform_img_size:
+                    w, h = orig_img_size
+                    max_w, max_h = self.uniform_img_size
+                    pad_x = (max_w - w) / 2.0
+                    pad_y = (max_h - h) / 2.0
+                    # bbox is specified in x1, y1, x2, y2 format
+                    bbox = [bbox[0]+pad_x, bbox[1]+pad_y, bbox[2]+pad_x, bbox[3]+pad_y]
+                    full_mask = np.pad(full_mask, ((pad_x, pad_x), (pad_y, pad_y)))
+                    
+                bboxes.append(bbox)
+                crops.append(crop)
+                masks.append(mask)
+                full_masks.append(full_mask)
+        
 
             view_data[view] = {
                 'img_path':     str(origin_img_path),
@@ -242,8 +274,9 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         # -> sample["masks_full"][<view_index>][<instance_index>] gives the mask image loaded as matrix of that instance in that view
         # -> sample["keypoints"][<view_index>][<instance_index>][<keypoint_index>] gives the (x,y,conf) of that keypoint of that instance in that view
 
+        # change size: output should be indexable by instance number first, then by view number
         for attr in ['bboxes', 'masks_full', 'keypoints']:
-            sample[attr]     = sample[attr].transpose(0, 1)
+            sample[attr] = sample[attr].transpose(0, 1)
         # -> sample["masks_full"][<instance_index>][<view_index>] gives the mask image loaded as matrix of that instance in that view
         # -> sample["keypoints"][<instance_index>][<view_index>][<keypoint_index>] gives the (x,y,conf) of that keypoint of that instance in that view
 
@@ -285,6 +318,9 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         return [int(x) for x in nums]
 
     def _load_grayscale_image(self, view: str, rel_path: str) -> np.ndarray:
+        """
+        Use cv2.imread() to read an image to np.ndarray and transpose because cv2 read to row-major order but we require column-major order.
+        """
         # rel_path example: "video1/mask/image_0_0_mask.png"
         # try:
         #     img = Image.open(str(self.root / rel_path))
@@ -292,7 +328,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         #     print("PIL load OK")
         # except Exception as e:
         #     print("PIL failed:", e)
-        return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE))
+        return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE)).transpose()
     
     def _get_present_instances(self, f_idx: int) -> list[int]:
         """

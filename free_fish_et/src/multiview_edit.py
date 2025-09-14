@@ -92,7 +92,6 @@ def fit_mesh(
     init_s: Optional[torch.Tensor] = None,
     init_body_pose: Optional[torch.Tensor] = None,
     init_body_bone_length: Optional[torch.Tensor] = None,
-    img_filenames: Optional[torch.Tensor] = None,
     index: Optional[torch.Tensor] = None,
     bboxs: Optional[torch.Tensor] = None,
 ):
@@ -159,13 +158,16 @@ def fit_mesh(
         masks,
         renderer,
         has_prev,
-        img_filenames,
         index,
         bboxs,
     )
 
     ### Generating mesh output
     fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
+
+    print(f"fish_output: {fish_output}")
+    print(f"fish_output keypoints: {fish_output}['keypoints']")
+    print(f"t: {t}")
 
     # NOTE:
     # things to check: Correct row-major, column major order always?
