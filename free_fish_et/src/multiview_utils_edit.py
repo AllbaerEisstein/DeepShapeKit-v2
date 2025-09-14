@@ -86,8 +86,8 @@ def triangulation_LBFGS(
     Xs = []
     for i in range(vn):
         P = Ps[i]  # (3, 4)
-        # Least squares solution to PX ~ x
-        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1))  # (4, 1)
+        # Least squares solution to PX ~ x (find X so that || PX - x || is minimal)
+        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution  # (4, 1)
         X_cart = X_h[:3] / X_h[3]
         Xs.append(X_cart.squeeze())
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, 3)
@@ -140,7 +140,7 @@ def triangulation(
     for i in range(vn):
         P = Ps[i]  # (3, 4)
         # Least squares solution to PX ~ x
-        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1))  # (4, 1)
+        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution  # (4, 1)
         X_cart = X_h[:3] / X_h[3]
         Xs.append(X_cart.squeeze())
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, 3)

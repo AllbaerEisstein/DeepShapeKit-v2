@@ -51,22 +51,19 @@ def initialize_model(
     return fish, optimizer, renderer
 
 
-def process_frame(sample: dict, instance_number: int):
+def get_tensors_from_instance_sample(sample: dict):
     """
     Just read a dict and return relevant contents.
     """
-    if instance_number <= sample["instances"]:
-        keypoints = sample["keypoints"][instance_number]
-        masks = sample["masks_full"][instance_number]
-        bboxes = sample["bboxes"][instance_number]
-    else:
-        raise ValueError(f"Invalid fish_place: {instance_number}")
+    keypoints = sample["keypoints"]
+    masks = sample["masks_full"]
+    bboxes = sample["bboxes"]
 
     # Normalize mask to [0,1] on appropriate device
-    masks = masks.to(device) / 255.0
-    keypoints = keypoints.to(device)
-    bboxes = bboxes.to(device)
-    return sample["frames"], sample["imgpaths"], keypoints, masks, bboxes
+    masks = masks / 255.0
+    keypoints = keypoints
+    bboxes = bboxes
+    return keypoints, masks, bboxes
 
 
 def save_rendered_views(
@@ -116,8 +113,8 @@ def save_reconstruction_images(
     renderer: Silhouette_Renderer,  # Silhouette_Renderer instance
     instance_number: int,
     Ps: torch.Tensor,  # (N,3,4)
-    reconstructed_keypoints_world: torch.Tensor,  # (1, K, 3)
-    reconstructed_vertices_world: torch.Tensor,  # (1, V, 3)
+    reconstructed_keypoints_local: torch.Tensor,  # (1, K, 3)
+    reconstructed_vertices_local: torch.Tensor,  # (1, V, 3)
     faces_from_vert_indices: torch.Tensor,  # (1, N, 3)
     global_t: torch.Tensor, # (3)
     keypoint_names: List[str],
@@ -130,7 +127,7 @@ def save_reconstruction_images(
     overlay silhouette in red with given blend_factor, draw keypoints (blue), and save.
     """
 
-    silhouettes = renderer(reconstructed_vertices_world, faces_from_vert_indices, global_t)
+    silhouettes = renderer(reconstructed_vertices_local, faces_from_vert_indices, global_t)
 
     silhouettes_np = silhouettes.detach().cpu().numpy()
 
@@ -147,6 +144,7 @@ def save_reconstruction_images(
         if orig_bgr is None:
             raise FileNotFoundError(f"Could not read image {orig_image_paths[i]}")
 
+        # cv2 reads images in row-major order
         h0, w0 = orig_bgr.shape[:2]
         # Compute integer padding to center the resized image within (W,H)
         pad_left = (W - w0) // 2
@@ -181,13 +179,13 @@ def save_reconstruction_images(
         blended = np.clip(blended, 0, 255).astype(np.uint8)
 
         # Draw keypoints:
-        print(f"reconstructed_keypoints_world: {reconstructed_keypoints_world}")
-        reconstructed_keypoints_world = reconstructed_keypoints_world.squeeze(0)
+        print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
+        reconstructed_keypoints_local = (reconstructed_keypoints_local + global_t).squeeze(0)
         P_i = Ps[i].detach().cpu().numpy()  # (3,4)
         for kp_idx, name in enumerate(keypoint_names):
-            coords3d = reconstructed_keypoints_world[kp_idx]
+            coords3d = reconstructed_keypoints_local[kp_idx]
             print(f"coords3d: {coords3d}")
-            print(f"reconstructed_keypoints_world: {reconstructed_keypoints_world}")
+            print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
             coords_np = coords3d.detach().cpu().numpy()
             Xh = np.concatenate([coords_np, [1.0]])  # (4,)
             ph = P_i @ Xh  # (3,)
@@ -294,22 +292,42 @@ def reconstruct(
 
     for idx in frame_indices:
         try:
-            sample = dataset[idx]
+            instance_sample = dataset.__getitem__(idx, instance_number)
         except IndexError:
             print(f"Sample {idx} missing, skipping")
             continue
 
-        if not sample["full_kpts"]:
-            print(f"Frame {idx} missing keypoints, using last valid params")
-            # replicate last params
-            parameters.extend(parameters[-4:])
-            sample_data.append(sample_data[-1] if sample_data else [0])
-            pbar.update(1)
-            continue
 
-        views_indices, img_paths, keypoints, masks, bboxes = process_frame(
-            sample, instance_number
-        )
+        # if not sample["full_kpts"]:
+        #     print(f"Frame {idx} missing keypoints, using last valid params")
+        #     # replicate last params
+        #     parameters.extend(parameters[-4:])
+        #     sample_data.append(sample_data[-1] if sample_data else [0])
+        #     pbar.update(1)
+        #     continue
+
+
+        kpt_present_mask = instance_sample['kpt_present_mask']
+        seg_mask_present_mask = instance_sample['seg_mask_present_mask']
+
+        # QUESTION: how to deal with not enough keypoints/segmasks especially in first frame?
+        # TODO: fallback to previous segmasks, keypoints
+        if len([
+                view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
+                if view_with_seg_mask == True
+            ]) < 2:
+            print(f"Less than two views with segmentation masks in sample for frame {idx} -> skipping")
+            continue
+        if len([
+                view_with_kpts for view_with_kpts in kpt_present_mask 
+                if any(kpt_present == True for kpt_present in view_with_kpts)
+            ]) < 2:
+            print(f"Less than two views with keypoints in sample for frame {idx} -> skipping")
+            continue
+        views_indices, orig_img_paths = instance_sample['frames'], instance_sample['imgpaths']
+        keypoints, masks, bboxes = get_tensors_from_instance_sample(instance_sample)
+
+
         # initialize from previous solution if available
         init = (
             None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
@@ -328,10 +346,10 @@ def reconstruct(
             index=idx,
             bboxs=bboxes,
         )
-        mesh_vertices_after_reconstruction, keypoints_after_reconstruction, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
+        reconstructed_vertices_local, reconstructed_keypoints_local, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
 
         parameters += [global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est]
-        sample_data.append([views_indices, img_paths, keypoints_after_reconstruction, bboxes, idx])
+        sample_data.append([views_indices, orig_img_paths, reconstructed_keypoints_local, bboxes, idx])
 
         # save_rendered_views(
         #     outdir,
@@ -345,17 +363,17 @@ def reconstruct(
         #     bboxes,
         # )
 
-        print(f"keypoints_after_reconstruction: {keypoints_after_reconstruction}")
+        print(f"keypoints_after_reconstruction: {reconstructed_keypoints_local}")
 
 
         save_reconstruction_images(
-            orig_image_paths=img_paths,
+            orig_image_paths=orig_img_paths,
             outdir=outdir,
             renderer=renderer,
             instance_number=instance_number,
             Ps=cam_params[0],
-            reconstructed_keypoints_world=keypoints_after_reconstruction,
-            reconstructed_vertices_world=mesh_vertices_after_reconstruction,
+            reconstructed_keypoints_local=reconstructed_keypoints_local,
+            reconstructed_vertices_local=reconstructed_vertices_local,
             faces_from_vert_indices=fish.faces.unsqueeze(0),
             global_t=global_t_est,
             keypoint_names=dataset.index_json["keypoint_list"],
@@ -363,7 +381,7 @@ def reconstruct(
         )
 
         if save_models:
-            save_obj_model(outdir, idx, instance_number, mesh_vertices_after_reconstruction, fish)
+            save_obj_model(outdir, idx, instance_number, reconstructed_vertices_local, fish)
 
         pbar.update(1)
 

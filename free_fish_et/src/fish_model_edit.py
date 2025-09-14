@@ -82,8 +82,8 @@ class fish_model:
         self.V = self.V - self.J[0, 0]
         self.J = self.J - self.J[0, 0]
 
-        self.V = self.V * 0.01
-        self.J = self.J * 0.01
+        self.V = self.V #* 0.01
+        self.J = self.J #* 0.01
 
         self.LBS = LBS(self.J, self.parents, self.weights)
 

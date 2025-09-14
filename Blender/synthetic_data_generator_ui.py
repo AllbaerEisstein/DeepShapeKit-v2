@@ -283,11 +283,13 @@ def export_cam_matrices(context):
                 T_list = None
         P = mats.get('P')
         f = mats.get('f')
+        Rt = mats.get('Rt')
         entry = {
             'f': float(f) if f is not None else None,
             'K': mat_to_list(mats['K']),
             'R': mat_to_list(mats['R']),
             'T': T_list,
+            'Rt': mat_to_list(Rt),
             'P': mat_to_list(P),
             'camera_name': cam.name
         }

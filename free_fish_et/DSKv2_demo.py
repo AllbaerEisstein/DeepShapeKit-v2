@@ -31,7 +31,7 @@ if __name__ == '__main__':
     out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'
     dataset_folder_path     = (out_path / dataset_folder_name).absolute()
-    final_output_folder     = 'src/results/output/'
+    final_output_folder     = 'src/results/output_no_fish_scaling/with_kpt_transl'
 
     keypoint_list = [
         'mouth tip', 

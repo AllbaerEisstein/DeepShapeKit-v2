@@ -165,10 +165,6 @@ def fit_mesh(
     ### Generating mesh output
     fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
 
-    print(f"fish_output: {fish_output}")
-    print(f"fish_output keypoints: {fish_output}['keypoints']")
-    print(f"t: {t}")
-
     # NOTE:
     # things to check: Correct row-major, column major order always?
     # pixel/mm/m? E.g. in fish model there seems to be a conversion cm -> m

@@ -613,14 +613,14 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
         print(f"processing frames for video {view}...")
         files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / "files_crop.csv")))
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
-        frame2prediction: dict[str, KeypointsDict] = defaultdict(KeypointsDict)
+        frame2prediction: dict[str, InstancesKeypointsDict] = defaultdict(InstancesKeypointsDict)
         input_path = dataset_path / view / 'bbox-masked_image'
 
         for img in sorted(input_path.iterdir()):
             frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
             instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                frame2prediction[frame_number] = KeypointsDict()
+                frame2prediction[frame_number] = InstancesKeypointsDict()
                 _, instances = infer_keypoints.inference(model, img)
 
                 if len(instances) != 1:
