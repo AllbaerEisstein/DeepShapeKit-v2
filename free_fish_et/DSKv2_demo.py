@@ -2,7 +2,7 @@ import os
 import argparse
 from pathlib import Path
 from src.extract_frames_edit import *
-from src.multiview_reconstruction_edit import reconstruct
+from src.multiview_reconstruction_edit import reconstruct, render_pose_time_series
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -26,12 +26,16 @@ if __name__ == '__main__':
     # pose_model_path         = Path('src/DSKv2/bluegill_pose.pt')
     segmentation_model_path = Path('src/DSKv2/cygill_seg.pt')
     pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
-    mesh_path               = str(Path('src/DSKv2/Bluegill_Body.json'))
-    cam_matrices_path       = Path('src/DSKv2/cam_matrices.json')
+    # mesh_path               = str(Path('src/DSKv2/Bluegill_Body.json'))
+    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
+    mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
+    pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
+    # cam_matrices_path       = Path('src/DSKv2/cam_matrices_bl_2_cv.json')
+    cam_matrices_path       = Path('src/DSKv2/cam_matrices_bl.json')
     out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'
     dataset_folder_path     = (out_path / dataset_folder_name).absolute()
-    final_output_folder     = 'src/results/output_no_fish_scaling/with_kpt_transl'
+    final_output_folder     = 'src/results/output/'
 
     keypoint_list = [
         'mouth tip', 
@@ -80,6 +84,18 @@ if __name__ == '__main__':
     with open(os.path.join(dataset_folder_path, 'index.json')) as jf:
         video_meta = json.load(jf)
 
+
+    # ==============================
+
+    if 'render_time_series' in steps:
+        print('rendering silhouettes from global position and body pose time series...')
+        render_pose_time_series(
+            mesh_path=mesh_path,
+            dataset_dir=str(dataset_folder_path),
+            pose_time_series_file_path=pose_time_series_path,
+            outdir=final_output_folder
+        )
+
     # ==============================
 
     instance_number = 0
@@ -99,7 +115,7 @@ if __name__ == '__main__':
             mesh_path       = mesh_path,
             dataset_dir     = str(dataset_folder_path),
             outdir          = final_output_folder,
-            frame_indices           = index,
+            frame_indices   = index,
             instance_number = instance_number,
             seed            = seed,
             save_models     = save_models

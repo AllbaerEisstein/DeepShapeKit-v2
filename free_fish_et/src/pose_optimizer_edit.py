@@ -83,8 +83,8 @@ class OptimizeMV:
             )
             and self.fish.device_active == True
         ):
+            keypoints = keypoints.to(self.device)
             masks = masks.to(self.device) 
-            
             self.fish.to_device(self.device) 
             init_ori_plus_pose = init_ori_plus_pose.to(self.device) 
             init_body_bone_length = init_body_bone_length.to(self.device) 
@@ -101,10 +101,7 @@ class OptimizeMV:
         batch_size = proj_m.shape[0]
         kpts_2d = keypoints[..., :2]
         kpts_conf = keypoints[..., 2].clone()
-        # Disable unreliable keypoints
-        # TODO: what is this?
-        kpts_conf[0, -3] = 0
-        kpts_conf[1, -1] = 0
+
 
         # ===== Initialize parameters =====
         # global_orient: (1,3), body_pose: (1,P), bone_length: (1,B)
@@ -132,6 +129,7 @@ class OptimizeMV:
             # Reprojection loss
             model_kpts = out["keypoints"].to(self.device) + global_t
             model_kpts = model_kpts.expand(batch_size, -1, -1)
+            # TODO: filter missing keypoints before this step based on confidence
             loss = (
                 camera_fitting_loss(model_kpts, proj_m, kpts_2d, kpts_conf)
                 + self.prior_weight * (global_t - init_t).abs().sum()
@@ -155,6 +153,7 @@ class OptimizeMV:
         )
         # relax tail keypoints
         kpts_conf = kpts_conf.fill_(0.8)
+        # TODO: what happens here?
         kpts_conf[:, -3] = 0
         kpts_conf[:, -1] = 0
         kpts_conf[keypoints[..., 2] == 0] = 0
@@ -187,6 +186,7 @@ class OptimizeMV:
             opt_body.step()
 
         # Stage 3: tail + silhouette offset
+        # TODO: silhouette offset?
         sil_offset = torch.zeros((2, 3), device=self.device, requires_grad=True)
         for p in [body_pose, body_bone_length, global_orient, global_t, scale, sil_offset]:
             p.requires_grad_(True)
@@ -195,11 +195,13 @@ class OptimizeMV:
             lr=self.step_size,
         )
         # reweight tail points
+        # TODO: specify which keypoints belong to tail, body, etc. in fish fish model
         kpts_conf = kpts_conf.fill_(0.8)
         kpts_conf[0, -3] = 0.1
         kpts_conf[0, -1] = 1
         kpts_conf[1, 0] = 1
         kpts_conf[1, 2] = 1
+        # TODO: Why disable keypoints where y = 0?
         kpts_conf[keypoints[..., 2] == 0] = 0
         init_bp = body_pose.clone().detach()
         init_bl = body_bone_length.clone().detach()

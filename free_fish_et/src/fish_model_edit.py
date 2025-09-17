@@ -79,6 +79,7 @@ class fish_model:
         self.J = torch.tensor(dd["J"]).unsqueeze(0)
 
         self.V = torch.tensor(dd["V"]).unsqueeze(0)
+        # local coords, relative to head
         self.V = self.V - self.J[0, 0]
         self.J = self.J - self.J[0, 0]
 
@@ -87,7 +88,9 @@ class fish_model:
 
         self.LBS = LBS(self.J, self.parents, self.weights)
 
+        # TODO: let user choose which indices belong to which bodypart
         # Body_pose angle limit
+        # angle limits are specified in exponential map (axis-angle where angle is specified as the length of the axis vector)
         # we minus index by 1 because we exclude root pose as it is modeled as global orient
         self.bone_angle_min = [0.0] * (self.n_body_bones * 3)
         self.bone_angle_max = [0.0] * (self.n_body_bones * 3)
@@ -95,17 +98,17 @@ class fish_model:
         # repeat the pattern 0.0, -0.05, 0.0 for every bone (every three entries in bone_angle_min/max)
         for i in range(self.n_body_bones):
             self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.05, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.05, 0.0
 
         # the last 3 bones should have different limits
         for i in range(self.n_body_bones - 3, self.n_body_bones):
             self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.05, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.05, 0.0
 
         # the last bone should have a different limit
         for i in range(self.n_body_bones - 1, self.n_body_bones):
             self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.07, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, -0.07, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.07, 0.0
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
@@ -158,7 +161,7 @@ class fish_model:
         self.device_active = True
 
 
-    def __call__(self, global_ori, body_pose, body_bone_length, scale=1, pose2rot=True):
+    def __call__(self, global_ori, body_pose, body_bone_length, scale=1, pose2rot=True, deform=True):
         """
         Args:
             global_ori (BS, 3): BS (batch-size) different axis-angle representations of global rotation
@@ -197,7 +200,10 @@ class fish_model:
 
 
         # LBS
-        verts = self.LBS(V, global_ori_plus_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
+        if deform:
+            verts = self.LBS(V, global_ori_plus_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
+        else:
+            verts = V
 
         # Calculate 3d keypoint from new vertices resulted from pose
         keypoints = []

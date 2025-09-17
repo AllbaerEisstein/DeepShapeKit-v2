@@ -62,10 +62,6 @@ class LBS():
         # print(f"LBS: pose shape: {pose.size()}")
         kin_tree = (scale * self.kin_tree) * bone[:, :, None, None]
 
-        # disable rotation around x-axis for fish parts
-        for i in range(self.n_joints - 1):
-            pose[0,3 * (i + 1)] = 0.
-
         if to_rotmats:
             pose = batch_rodrigues(pose.view(-1, 3))
         pose = pose.view([batch_size, -1, 3, 3])

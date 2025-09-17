@@ -174,7 +174,7 @@ def _parse_distortion(d_obj: Any) -> Tuple[float,float,float,float,float]:
         return (rad_1, rad_2, tan_1, tan_2, rad_3)
     raise ValueError(f'Could not parse distortion from {d_obj}')
 
-def _adjust_intrinsics_for_padding(K, orig_size, max_size, pad_mode="center"):
+def _adjust_intrinsics_for_padding(K, orig_size, max_size):
     """
     Shift the principal point to a new location suitable for the new image size `max_size`.
     This assumes that the original image was padded where left and right padding was equal, and top and bottom padding was equal.
@@ -186,12 +186,8 @@ def _adjust_intrinsics_for_padding(K, orig_size, max_size, pad_mode="center"):
     w, h = orig_size
     max_w, max_h = max_size
 
-    if pad_mode == "center":
-        pad_x = (max_w - w) / 2.0
-        pad_y = (max_h - h) / 2.0
-    else:
-        # specify left/top padding explicitly if needed
-        raise NotImplementedError("other pad modes: specify pad_x, pad_y manually")
+    pad_x = (max_w - w) / 2.0
+    pad_y = (max_h - h) / 2.0
 
     Kp = K.copy().astype(float)
     Kp[0,2] += pad_x
@@ -213,6 +209,7 @@ class CameraSet:
         self.K_list: list[torch.Tensor] = []
         self.R_list: list[torch.Tensor] = []
         self.T_list: list[torch.Tensor] = []
+        self.Rt_list: list[torch.Tensor] = []
         self.distortions_list: list[Tuple[float,float,float,float,float]] = []
         self.uniform_img_size = uniform_img_size
 
@@ -275,6 +272,8 @@ class CameraSet:
             self.K_list.append(torch.tensor(K_np, dtype=torch.float32))
             self.R_list.append(torch.tensor(R_np, dtype=torch.float32))
             self.T_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
+            Rt_np = np.concatenate([R_np, T_np.reshape(3, 1)], axis=1)
+            self.Rt_list.append(torch.tensor(Rt_np, dtype=torch.float32))
             self.f_list.append((float(fx_fy[0]), float(fx_fy[1])))
             self.distortions_list.append(tuple(float(x) for x in dist5))
 

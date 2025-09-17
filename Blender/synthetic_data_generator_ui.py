@@ -10,6 +10,7 @@ bl_info = {
     "category": "Import-Export",
 }
 
+import csv
 import bpy
 import bmesh
 import os
@@ -176,11 +177,6 @@ class SYNTH_PropertyGroup(PropertyGroup):
     )
 
     # Misc
-    test_mode: BoolProperty(
-        name="Test Mode",
-        default=False
-    )
-
     draw_lattice_for_kpt_annot: BoolProperty(
         name="Draw Lattice On KPT Annot",
         default=False
@@ -384,8 +380,7 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
     return faces, vertices, normals, kpt_2_verts_worldco, kpt_2_faces_worldco
 
 
-def export_mesh_json(context):
-    out_dir = resolve(context.scene.synth_props.annot_out_dir)
+def get_mesh_json(context):
     collection_name = context.scene.synth_props.collection_name
     object_name = context.scene.synth_props.object_name
     kpt_list = [kp.strip() for kp in context.scene.synth_props.keypoint_list_csv.split(',') if kp.strip()]
@@ -426,7 +421,10 @@ def export_mesh_json(context):
         for g in v.groups:
             group_name = obj.vertex_groups[g.group].name
             if group_name in bone_index_map:
-                weights[v.index][bone_index_map[group_name]] = float(g.weight)
+                if arm.data.bones[group_name].use_deform:
+                    weights[v.index][bone_index_map[group_name]] = float(g.weight)
+                else:
+                    weights[v.index][bone_index_map[group_name]] = 0
 
     # -- v2k
     v2k = np.zeros((len(kpt_list), n_verts))
@@ -456,14 +454,11 @@ def export_mesh_json(context):
         'vert2kpt': v2k,
         'kintree_table': kintree,
         'weights': weights,
-        'n_bones': n_bone_groups
+        'n_bones': n_bone_groups,
+        'kpt_list': kpt_list
     }
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{collection_name}_{object_name}.json")
-    with open(out_path, 'wt') as f:
-        json.dump(out, f, indent=2)
-    return out_path
+    return out
 
 
 def get_avg_kpt_coords_3d(kpt2verts_co:dict):
@@ -559,6 +554,8 @@ def get_cam_matrix_for_cam(cam_obj, scene):
     # P: we want mapping from Blender world -> cv image (with y down and positive z forward)
     P = K @ BLENDER_CAM_2_CV_CAM @ Rt
     cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': BLENDER_CAM_2_CV_CAM.to_4x4() @ R, 'T': BLENDER_CAM_2_CV_CAM.to_4x4() @ T, 'P': P, 'Rt': BLENDER_CAM_2_CV_CAM @ Rt}
+    # P = K @ Rt
+    # cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': R, 'T': T, 'P': P, 'Rt': Rt}
     return cam_name_2_matrix[cam_name]
 
 
@@ -1178,16 +1175,6 @@ using opencv's contour detection can create a silhouette annotation from the bin
                         self.report({'INFO'}, f"Created YOLO mask segmentation training dataset at {resolve(context.scene.synth_props.render_out_dir)}")
                     except Exception as e:
                        self.report({'WARNING'}, f"YOLO mask dataset creation failed: {e}")
-                try:
-                    mesh_path = export_mesh_json(context)
-                    self.report({'INFO'}, f"Saved mesh JSON to {mesh_path}")
-                except Exception as e:
-                    self.report({'WARNING'}, f"Failed to export mesh: {e}")
-                try:
-                    cam_matrices_path = export_cam_matrices(context)
-                    self.report({'INFO'}, f"Saved cam matrices JSON to {cam_matrices_path}")
-                except Exception as e:
-                    self.report({'WARNING'}, f"Failed to export camera matrices: {e}")
                 self.report({'INFO'}, 'TimedRender finished')
                 return {'FINISHED'}
 
@@ -1330,7 +1317,6 @@ class SYNTH_OT_apply_settings(Operator):
             'draw_every_keypoint_vertex': p.draw_every_keypoint_vertex,
             'keep_occluded_keypoints': p.keep_occluded_keypoints,
             'draw_every_keypoint_face': p.draw_every_keypoint_face,
-            'test_mode': p.test_mode,
             'draw_lattice_for_kpt_annot': p.draw_lattice_for_kpt_annot,
             'create_yolo_datasets': p.create_yolo_datasets,
         }
@@ -1400,7 +1386,6 @@ class SYNTH_OT_load_config(Operator):
             'draw_every_keypoint_vertex': 'draw_every_keypoint_vertex',
             'keep_occluded_keypoints':'keep_occluded_keypoints',
             'draw_every_keypoint_face': 'draw_every_keypoint_face',
-            'test_mode': 'test_mode',
             'draw_lattice_for_kpt_annot': 'draw_lattice_for_kpt_annot',
             'create_yolo_datasets': 'create_yolo_datasets',
         }
@@ -1521,7 +1506,6 @@ class SYNTH_PT_main_panel(Panel):
         box.prop(p, 'draw_lattice_for_kpt_annot')
         box = layout.box()
         box.label(text="Misc")
-        box.prop(p, 'test_mode')
         box.prop(p, 'create_annotated_images')
         box.prop(p, 'create_yolo_datasets')
         box.prop(p, 'event_timer_interval')
@@ -1534,6 +1518,7 @@ class SYNTH_PT_main_panel(Panel):
         row.operator('synth.create_videos', icon='SEQUENCE')
         row.operator('synth.export_camera_matrices', icon='FILE_FOLDER')
         row.operator('synth.export_mesh', icon='FILE_FOLDER')
+        row.operator('synth.export_pose_time_series_json', icon='FILE_FOLDER')
 
 
 
@@ -1577,9 +1562,17 @@ class SYNTH_OT_export_mesh(Operator):
     bl_description = "Export mesh + armature weights & joints, and keypints to JSON"
 
     def execute(self, context):
+        synth_props = context.scene.synth_props
+        out_dir = synth_props.annot_out_dir
+        collection_name = synth_props.collection_name
+        object_name = synth_props.object_name
         try:
-            mesh_path = export_mesh_json(context)
-            self.report({'INFO'}, f"Saved mesh JSON to {mesh_path}")
+            out = get_mesh_json(context)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{collection_name}_{object_name}_mesh.json")
+            with open(out_path, 'wt') as f:
+                json.dump(out, f, indent=2)
+            self.report({'INFO'}, f"Saved mesh JSON to {out_path}")
             return {'FINISHED'}
         except Exception as e:
             self.report({'WARNING'}, f"Failed to export mesh: {e}")
@@ -1729,6 +1722,162 @@ class SYNTH_OT_create_videos(Operator):
         return {'FINISHED'}
 
 
+# --------------------------- Export Pose Time Series Operator --------------------------
+
+
+class SYNTH_OT_export_pose_time_series_json(Operator):
+    bl_idname = "synth.export_pose_time_series_json"
+    bl_label = "Export Pose Time Series (JSON)"
+    bl_description = "Export per-frame root position, bone relative rotations (radians) in exponential map representation and bone lengths to a JSON file in annotation dir"
+
+    def _find_armature_for_scene(self, context):
+        p = context.scene.synth_props
+        # 1) try armature modifier on target object if available
+        try:
+            col = bpy.data.collections.get(p.collection_name)
+            if col:
+                obj = col.objects.get(p.object_name)
+                if obj:
+                    for mod in obj.modifiers:
+                        if mod.type == 'ARMATURE' and mod.object:
+                            return mod.object
+        except Exception:
+            return None
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        arm_obj = self._find_armature_for_scene(context)
+        if arm_obj is None:
+            self.report({'ERROR'}, "No armature found (checked modifier on target object).")
+            return {'CANCELLED'}
+
+        bone_names = [b.name for b in arm_obj.data.bones]
+        if not bone_names:
+            self.report({'ERROR'}, "Armature has no bones.")
+            return {'CANCELLED'}
+
+        out_dir = resolve(p.annot_out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"pose_time_series_{p.collection_name}_{p.object_name}.json")
+
+        deps = bpy.context.evaluated_depsgraph_get()
+
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+
+        # determine FPS (float)
+        try:
+            fps = float(scene.render.fps) / float(scene.render.fps_base)
+        except Exception:
+            fps = float(scene.render.fps)
+
+        data = {
+            "meta": {
+                "armature": arm_obj.name,
+                "bone_order": bone_names,
+                "frame_start": int(frame_start),
+                "frame_end": int(frame_end),
+                "fps": float(fps),
+                "axis_order": "XYZ",
+                "units": "meters (world space)"
+            },
+            "frames": []
+        }
+
+        try:
+            for frame in range(frame_start, frame_end + 1):
+                scene.frame_set(frame)
+                # update depsgraph to ensure pose evaluation
+                deps.update()
+
+                arm_eval = arm_obj.evaluated_get(deps)
+                pose_bones = arm_eval.pose.bones
+
+                # root global position: head of first bone in armature data order
+                # global orientation: orientation of root bone in world space
+                first_bone_name = bone_names[0]
+                if first_bone_name not in pose_bones:
+                    self.report({'WARNING'}, f"Bone '{first_bone_name}' missing from pose bones at frame {frame}")
+                    root_bone_translation_world = Vector((0.0, 0.0, 0.0))
+                    root_ori_world = Vector((0.0, 0.0, 0.0))
+                else:
+                    pb_root = pose_bones[first_bone_name]
+                    root_bone_translation_world = arm_eval.matrix_world @ Vector(pb_root.head)
+                    root_bone_rot_matrix_world = (arm_eval.matrix_world @ pb_root.matrix).to_3x3()
+                    root_ori_world = root_bone_rot_matrix_world.to_quaternion().to_exponential_map()
+
+                global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
+                global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
+
+                body_pose = []         # list of [ex,ey,ez] euler radians per bone (skip first)
+                body_bone_length = []  # list of floats per bone (skip first)
+
+                # iterate bones in same order, skipping the root bone (index 0)
+                for bname in bone_names[1:]:
+                    if bname not in pose_bones:
+                        # placeholder if missing
+                        body_pose.append([0.0, 0.0, 0.0])
+                        body_bone_length.append(0.0)
+                        continue
+                    
+                    # pose_bones are from the evaluated armature
+                    pb = pose_bones[bname]
+                    parent_pb = pb.parent
+
+                    # relative rotation: parent.matrix.inverted() @ pb.matrix
+                    if parent_pb is None:
+                        # treat as identity (no relative rotation)
+                        rel_mat = Matrix.Identity(4)
+                    else:
+                        try:
+                            rel_mat = parent_pb.matrix.inverted() @ pb.matrix
+                        except Exception:
+                            rel_mat = Matrix.Identity(4)
+
+                    # extract rotation as exponential map (axis-angle where the norm of the vector is equal to the angle of the rotation)
+                    try:
+                        q = rel_mat.to_quaternion()
+                        exp_map = q.to_exponential_map()
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Failed to generate exponential map for bone {bname} for frame {frame}: {e}")
+                        # fallback
+                        exp_map = Vector((0.0, 0.0, 0.0))
+
+                    body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
+
+                    # bone length in world space (tail - head)
+                    try:
+                        world_head = arm_eval.matrix_world @ Vector(pb.head)
+                        world_tail = arm_eval.matrix_world @ Vector(pb.tail)
+                        length = float((world_tail - world_head).length)
+                    except Exception:
+                        length = 0.0
+                    body_bone_length.append(length)
+
+                frame_entry = {
+                    "frame": int(frame),
+                    "time": float((frame - frame_start) / fps),
+                    "global_t": global_t,
+                    "global_ori": global_ori,
+                    "body_pose": body_pose,
+                    "body_bone_length": body_bone_length
+                }
+                data["frames"].append(frame_entry)
+
+            # write json
+            with open(out_path, 'w') as jf:
+                json.dump(data, jf, indent=2)
+
+            self.report({'INFO'}, f"Wrote pose time series JSON to {out_path}")
+            return {'FINISHED'}
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export pose time series: {e}")
+            return {'CANCELLED'}
+
+
 
 # --------------------------- Registration ----------------------------------
 classes = (
@@ -1742,6 +1891,7 @@ classes = (
     SYNTH_OT_export_camera_matrices,
     SYNTH_OT_export_mesh,
     SYNTH_OT_create_videos,
+    SYNTH_OT_export_pose_time_series_json,
 )
 
 

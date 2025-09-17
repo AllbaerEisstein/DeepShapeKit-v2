@@ -1,3 +1,4 @@
+import json
 import pickle
 import os
 import argparse
@@ -8,6 +9,7 @@ import matplotlib.pyplot as plt
 import torch
 
 
+from src.constants_edit import BLENDERCAM_2_CV
 import src.multiview_edit as multiview
 import src.multiview_utils_edit as mutil
 
@@ -152,9 +154,9 @@ def save_reconstruction_images(
         pad_top = (H - h0) // 2
         pad_bottom = H - h0 - pad_top
         
-        print(f"alpha: {alpha.shape}")
-        print(f"left, right, top, bottom: {pad_left}, {pad_right}, {pad_top}, {pad_bottom}")
-        print(f"orig_bgr: {orig_bgr.shape}")
+        # print(f"alpha: {alpha.shape}")
+        # print(f"left, right, top, bottom: {pad_left}, {pad_right}, {pad_top}, {pad_bottom}")
+        # print(f"orig_bgr: {orig_bgr.shape}")
 
 
         # Pad with zeros (black). cv2.copyMakeBorder expects ints
@@ -162,7 +164,7 @@ def save_reconstruction_images(
             orig_bgr,
             top=pad_top, bottom=pad_bottom, left=pad_left, right=pad_right,
             borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0)
-        ).transpose(1,0,2)
+        )
 
         a = np.clip(alpha[i], 0.0, 1.0)  # (H,W), float
 
@@ -173,19 +175,20 @@ def save_reconstruction_images(
         red_img = np.zeros_like(padded)
         red_img[:, :, 2] = 255  # full red channel in BGR
 
-        a_exp = a[..., None]  # (H,W,1)
+
+        a_exp = a[..., None].transpose(1,0,2)  # (H,W,1)
         blended = (padded.astype(np.float32) * (1.0 - blend_factor * a_exp) +
                    red_img.astype(np.float32) * (blend_factor * a_exp))
         blended = np.clip(blended, 0, 255).astype(np.uint8)
 
         # Draw keypoints:
-        print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
+        # print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
         reconstructed_keypoints_local = (reconstructed_keypoints_local + global_t).squeeze(0)
         P_i = Ps[i].detach().cpu().numpy()  # (3,4)
         for kp_idx, name in enumerate(keypoint_names):
             coords3d = reconstructed_keypoints_local[kp_idx]
-            print(f"coords3d: {coords3d}")
-            print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
+            # print(f"coords3d: {coords3d}")
+            # print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
             coords_np = coords3d.detach().cpu().numpy()
             Xh = np.concatenate([coords_np, [1.0]])  # (4,)
             ph = P_i @ Xh  # (3,)
@@ -396,6 +399,77 @@ def reconstruct(
         mesh_file=mesh_path,
         index=frame_indices,
     )
+
+
+def render_pose_time_series(    
+    mesh_path: str,
+    dataset_dir: str,
+    pose_time_series_file_path: str,
+    outdir: str,
+    deform: bool = False
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    fish = fish_model(mesh_path)
+    fish.to_device(device)
+
+    dataset = load_multiview_dataset(dataset_dir)
+    cam_params = dataset.cams.get_camera_matrices()
+    Ps, Ks, Rs, ts, focals, distortions = cam_params
+    print(f"before: {Ps}")
+    Ks = Ks.to(device)
+    Rt = torch.cat([cam_params[2], cam_params[3].reshape(-1, 3, 1)], dim=2)
+    Rt = Rt.to(device)
+    Ps = Ks @ BLENDERCAM_2_CV.to(device=device, dtype=torch.float32).unsqueeze(0).expand(Rs.size(0),-1,-1) @ Rt
+    Ps = Ks @ Rt
+    print(f"after: {Ps}")
+    image_size = torch.tensor(dataset.uniform_img_size, device=device)
+
+    renderer = Silhouette_Renderer(device, image_size, *[param.to(device) for param in cam_params[1:-1]])
+
+    pose_time_series_outdir = os.path.join(outdir, "pose_time_series_rendered")
+    ensure_dir(pose_time_series_outdir)
+    with open(pose_time_series_file_path) as jf:
+        pose_time_series_json = json.load(jf)
+    frames = pose_time_series_json["frames"]
+
+    for index, frame in enumerate(frames):
+        sample = dataset.__getitem__(index)
+
+        global_t = torch.tensor(frame["global_t"], device=device)
+        global_ori = torch.tensor(frame["global_ori"], device=device)
+        body_pose = torch.tensor(frame["body_pose"], device=device)
+        bone_length = torch.tensor(frame["body_bone_length"], device=device)
+
+        articulated_verts_kpts = fish(global_ori.unsqueeze(0), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
+        keypoints = articulated_verts_kpts["keypoints"].to(device)
+        vertices = articulated_verts_kpts["vertices"].to(device)
+
+        silhouettes = renderer(vertices, fish.faces.unsqueeze(0), global_t)
+        silhouettes_np = silhouettes.detach().cpu().numpy()
+
+        for i in sample["frames"]:
+            base_name = os.path.splitext(os.path.basename(sample["imgpaths"][i]))[0]
+            out_path = os.path.join(pose_time_series_outdir, "just_silhouette_overlays")
+            ensure_dir(out_path)
+            a = np.clip(silhouettes_np[i], 0.0, 1.0)  # (H,W), float
+            a_exp = a[..., None]
+            cv2.imwrite(img=a_exp, filename=os.path.join(out_path, base_name+".png"))
+        
+        save_reconstruction_images(
+            orig_image_paths=sample["imgpaths"],
+            outdir=pose_time_series_outdir,
+            renderer=renderer,
+            instance_number=0,
+            Ps=Ps,
+            reconstructed_keypoints_local=keypoints,
+            reconstructed_vertices_local=vertices,
+            faces_from_vert_indices=fish.faces.unsqueeze(0),
+            global_t=global_t,
+            keypoint_names=dataset.index_json["keypoint_list"],
+            view_names=dataset.views
+        )
+        
 
 
 if __name__ == "__main__":
