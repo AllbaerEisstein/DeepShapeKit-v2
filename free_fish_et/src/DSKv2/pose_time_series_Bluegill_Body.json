@@ -13,7 +13,7 @@
     "frame_start": 0,
     "frame_end": 150,
     "fps": 30.0,
-    "axis_order": "XYZ",
+    "axis_order": "XYZ (Blender world coordinate convention)",
     "units": "meters (world space)"
   },
   "frames": [

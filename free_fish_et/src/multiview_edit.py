@@ -130,9 +130,9 @@ def fit_mesh(
 
     ### If not provided (as in multiview), initialize with canonical
     if init_body_pose is None:
-        init_body_pose = torch.zeros([1, (fish.n_body_bones) * 3], device=device)
+        init_body_pose = torch.zeros([1, fish.n_body_joints * 3], device=device)
     if init_body_bone_length is None:
-        init_body_bone_length = torch.ones([1, (fish.n_body_bones)], device=device)
+        init_body_bone_length = torch.ones([1, fish.n_body_bones], device=device)
 
     #### Change suitable format for optimizer
     ###### particularly, combine orient and body pose

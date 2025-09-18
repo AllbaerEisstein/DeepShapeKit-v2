@@ -21,7 +21,7 @@ from .LBS_edit import LBS
 class fish_model:
     """
     Parametric fish model.
-    !! The fish model is expected to use the same coordinate system conventions as the camera matrices used !!
+    !! The fish model is expected to use the same coordinate system conventions as the camera matrices !!
     !! Members will only be on the device after calling to_device(target_device) !!
     Args:
         faces (F, 3): faces of the fish mesh each consisting of the indices of three vertices spanning it
@@ -54,6 +54,11 @@ class fish_model:
         # the first bone is treated differently from all the other bones (first bone: global orientation fitting; body bones: pose fitting)
         # So n_body_bones excludes the first bone
         self.n_body_bones = dd["n_bones"] - 1
+        # we always have one more joint than bone (the head)
+        self.n_body_joints = len(dd["J"]) - 1
+
+        print(self.n_body_bones)
+        print(self.n_body_joints)
 
         # triangulate if input mesh has quad faces
         fish_faces = dd["F"]
@@ -76,19 +81,20 @@ class fish_model:
         self.weights = torch.tensor(dd["weights"])
         self.vert2kpt = torch.tensor(dd["vert2kpt"])
 
-        self.J = torch.tensor(dd["J"]).unsqueeze(0)
+        self.J = torch.tensor(dd["J"]).unsqueeze(0) # (1,J,3)
+        self.V = torch.tensor(dd["V"]).unsqueeze(0) # (1,V,3)
 
-        self.V = torch.tensor(dd["V"]).unsqueeze(0)
         # local coords, relative to head
         self.V = self.V - self.J[0, 0]
         self.J = self.J - self.J[0, 0]
 
+        # scaling, unit conversion
         self.V = self.V #* 0.01
         self.J = self.J #* 0.01
 
         self.LBS = LBS(self.J, self.parents, self.weights)
 
-        # TODO: let user choose which indices belong to which bodypart
+        # TODO: let user choose which indices belong to which bodypart (best to define in synthetic data generator)
         # Body_pose angle limit
         # angle limits are specified in exponential map (axis-angle where angle is specified as the length of the axis vector)
         # we minus index by 1 because we exclude root pose as it is modeled as global orient
@@ -164,14 +170,15 @@ class fish_model:
     def __call__(self, global_ori, body_pose, body_bone_length, scale=1, pose2rot=True, deform=True):
         """
         Args:
-            global_ori (BS, 3): BS (batch-size) different axis-angle representations of global rotation
-            body_pose (BS, bbn*3): axis-angle representation of body pose (exclude root joint orient) -> orientation of bbn body bones
+            global_ori (BS, 3): BS (batch-size) different exponential map representations of global rotation
+            body_pose (BS, bbn*3): exponential map representation of body pose (exclude root joint orient) -> orientation of bbn body bones
             body_bone_length (BS, bbn): bone lengths for bbn body bones
             scale (BS, 1): scale factor
-            pose2rot: if True, convert axis-angle to rotation matrix inside LBS
+            pose2rot: if True, convert exponential map to rotation matrix inside LBS
+            deform (bool): toggle if linear blend skinning should be applied. If not, just return rest-pose vertices and keypoints in local (model) space.
         Returns:
-            keypoints (1, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS
-            vertices (1, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS
+            keypoints (BS, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS in local (model) space
+            vertices (BS, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS in local (model) space
         """
         if not all(
             self.device == attr.device
@@ -184,8 +191,8 @@ class fish_model:
         batch_size = global_ori.shape[0]
         V = self.V.repeat([batch_size, 1, 1]) * scale
 
-        # print(f"body_bone_length: {body_bone_length.size()}")
-        # print(f"body_pose: {body_pose.size()}")
+        print(f"body_bone_length: {body_bone_length.size()}")
+        print(f"body_pose: {body_pose.size()}")
 
         # no need for global pose and body pose to be separate anymore
         # -> insert one length at the front (first bone) of the bone length tensor of each batch
@@ -193,15 +200,15 @@ class fish_model:
             [torch.ones([batch_size, 1], device=self.device), body_bone_length], dim=1
         )
         # concatenate global pose and body pose
-        global_ori_plus_pose = torch.cat([global_ori, body_pose], dim=1)
+        global_ori_plus_body_pose = torch.cat([global_ori, body_pose], dim=1)
 
-        # print(f"all_bone_lengths: {all_bone_lengths.size()}")
-        # print(f"global_ori_plus_pose: {global_ori_plus_pose.size()}")
+        print(f"all_bone_lengths: {all_bone_lengths.size()}")
+        print(f"global_ori_plus_body_pose: {global_ori_plus_body_pose.size()}")
 
 
         # LBS
         if deform:
-            verts = self.LBS(V, global_ori_plus_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
+            verts = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
         else:
             verts = V
 

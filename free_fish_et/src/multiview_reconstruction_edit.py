@@ -416,13 +416,13 @@ def render_pose_time_series(
     dataset = load_multiview_dataset(dataset_dir)
     cam_params = dataset.cams.get_camera_matrices()
     Ps, Ks, Rs, ts, focals, distortions = cam_params
-    print(f"before: {Ps}")
-    Ks = Ks.to(device)
-    Rt = torch.cat([cam_params[2], cam_params[3].reshape(-1, 3, 1)], dim=2)
-    Rt = Rt.to(device)
-    Ps = Ks @ BLENDERCAM_2_CV.to(device=device, dtype=torch.float32).unsqueeze(0).expand(Rs.size(0),-1,-1) @ Rt
-    Ps = Ks @ Rt
-    print(f"after: {Ps}")
+    # print(f"before: {Ps}")
+    # Ks = Ks.to(device)
+    # Rt = torch.cat([cam_params[2], cam_params[3].reshape(-1, 3, 1)], dim=2)
+    # Rt = Rt.to(device)
+    # Ps = Ks @ BLENDERCAM_2_CV.to(device=device, dtype=torch.float32).unsqueeze(0).expand(Rs.size(0),-1,-1) @ Rt
+    # Ps = Ks @ Rt
+    # print(f"after: {Ps}")
     image_size = torch.tensor(dataset.uniform_img_size, device=device)
 
     renderer = Silhouette_Renderer(device, image_size, *[param.to(device) for param in cam_params[1:-1]])
@@ -454,6 +454,7 @@ def render_pose_time_series(
             ensure_dir(out_path)
             a = np.clip(silhouettes_np[i], 0.0, 1.0)  # (H,W), float
             a_exp = a[..., None]
+            a_exp = np.clip(a_exp, 0, 255).astype(np.uint8)
             cv2.imwrite(img=a_exp, filename=os.path.join(out_path, base_name+".png"))
         
         save_reconstruction_images(

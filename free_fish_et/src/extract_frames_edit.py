@@ -587,6 +587,24 @@ def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
     return -1
 
 
+def draw_kpts_on_img(kpt2xyc: Dict[str, list], img_path: Path, out_path: Path, tenth_of_annot_radius: int = 1):
+    img = cv2.imread(str(img_path))
+    annot_radius = tenth_of_annot_radius * 10
+
+    for name, (x,y,c) in kpt2xyc.items():
+        if c <= 0:
+            continue
+        conf_scaled_annot_radius = int(
+            int(c*10)/10   # will cut off second decimal (e.g 0.72 -> 0.7)
+            *annot_radius  # if annot_radius is k*10 with k in N, this will yield an int
+        )
+        cv2.circle(img=img, center=(int(x),int(y)), radius=1, color=(255,0,0), lineType=-1) # center
+        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=(255,0,0), lineType=-1)
+        cv2.putText(img, f"{int(c*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=(255,0,0), thickness=1)
+
+    cv2.imwrite(filename=str(out_path), img=img)
+
+
 def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str]):
     """
     └── keypoint_results/
@@ -653,7 +671,13 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
                         print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
                         frame2prediction[frame_number][str(instance_number)][kpt_names_dict[index]] = [
                             x, y, (c if (x > 0 or y > 0) else 0.0) # undetected keypoints indicated by x=y=0 -> also conf=0.0
-                        ] 
+                        ]
+
+                    draw_kpts_on_img(
+                        frame2prediction[frame_number][str(instance_number)],
+                        img,
+                        dataset_path / view / 'keypoints_results' / f'keypoints_{frame_number}_{instance_number}.png'
+                    )
 
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
