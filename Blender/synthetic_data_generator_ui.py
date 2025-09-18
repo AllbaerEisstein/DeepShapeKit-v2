@@ -421,10 +421,7 @@ def get_mesh_json(context):
         for g in v.groups:
             group_name = obj.vertex_groups[g.group].name
             if group_name in bone_index_map:
-                if arm.data.bones[group_name].use_deform:
-                    weights[v.index][bone_index_map[group_name]] = float(g.weight)
-                else:
-                    weights[v.index][bone_index_map[group_name]] = 0
+                weights[v.index][bone_index_map[group_name]] = float(g.weight)
 
     # -- v2k
     v2k = np.zeros((len(kpt_list), n_verts))
@@ -444,8 +441,17 @@ def get_mesh_json(context):
     
     v2k = [list(keypoint) for keypoint in v2k]
 
-    # -- kintree (leave as you had it, but double-check indices)
-    kintree = [list(range(-1, len(joints)-1)), list(range(len(joints)))]
+    # -- kintree-table (list of list of parent indices and list of the children indices)
+    kintree = [
+        [
+            list(arm.data.bones).index(arm.data.bones[bone_name].parent)
+            for bone_name in bone_names
+        ], 
+        [
+            list(arm.data.bones).index(bone_name)
+            for bone_name in bone_names
+        ]
+    ]
 
     out = {
         'V': verts,
@@ -892,6 +898,7 @@ using opencv's contour detection can create a silhouette annotation from the bin
         self.render_queue = []
 
         cam_collection = bpy.data.collections.get('Cameras')
+        # TODO: add filtering based on checkboxes or dropdown in ui
         cam_objects = cam_collection.objects if cam_collection else bpy.data.objects
         cam_objects = sorted(cam_objects, key=lambda c: c.name)
 
@@ -907,7 +914,11 @@ using opencv's contour detection can create a silhouette annotation from the bin
                     render_path_os = os.path.join(resolve(p.render_out_dir), render_prefix + ".png")
                     mask_label_path_os = os.path.join(resolve(p.mask_label_dir), render_prefix + ".txt")
                     kpt_label_path_os = os.path.join(resolve(p.kpt_label_dir), render_prefix + ".txt")
-                    if not (os.path.exists(render_path_os) and os.path.exists(mask_label_path_os) and os.path.exists(kpt_label_path_os)):
+                    if not (
+                            os.path.exists(render_path_os)
+                            and os.path.exists(mask_label_path_os) if p.render_binary else True
+                            and os.path.exists(kpt_label_path_os)
+                        ):
                         self.render_queue.append({
                             'view':                     cam.name,
                             'frame':                    frame_index,
@@ -1518,7 +1529,7 @@ class SYNTH_PT_main_panel(Panel):
         row.operator('synth.create_videos', icon='SEQUENCE')
         row.operator('synth.export_camera_matrices', icon='FILE_FOLDER')
         row.operator('synth.export_mesh', icon='FILE_FOLDER')
-        row.operator('synth.export_pose_time_series_json', icon='FILE_FOLDER')
+        row.operator('synth.export_pose_time_series_json', icon='SEQUENCE')
 
 
 
@@ -1559,7 +1570,7 @@ class SYNTH_OT_export_camera_matrices(Operator):
 class SYNTH_OT_export_mesh(Operator):
     bl_idname = "synth.export_mesh"
     bl_label = "Export Mesh"
-    bl_description = "Export mesh + armature weights & joints, and keypints to JSON"
+    bl_description = "Export mesh + armature weights & joints, and keypoints (all in local/model coordinates) to JSON"
 
     def execute(self, context):
         synth_props = context.scene.synth_props
@@ -1780,7 +1791,7 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
                 "frame_start": int(frame_start),
                 "frame_end": int(frame_end),
                 "fps": float(fps),
-                "axis_order": "XYZ",
+                "axis_order": "XYZ (Blender world coordinate convention)",
                 "units": "meters (world space)"
             },
             "frames": []
@@ -1804,9 +1815,11 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
                     root_ori_world = Vector((0.0, 0.0, 0.0))
                 else:
                     pb_root = pose_bones[first_bone_name]
+                    if frame < 10:
+                        self.report({'INFO'}, f"frame {frame}: {Vector(pb_root.head)}")
                     root_bone_translation_world = arm_eval.matrix_world @ Vector(pb_root.head)
-                    root_bone_rot_matrix_world = (arm_eval.matrix_world @ pb_root.matrix).to_3x3()
-                    root_ori_world = root_bone_rot_matrix_world.to_quaternion().to_exponential_map()
+                    root_bone_rot_matrix_world = arm_eval.matrix_world @ pb_root.matrix
+                    root_ori_world = root_bone_rot_matrix_world.to_3x3().to_quaternion().to_exponential_map()
 
                 global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
                 global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
@@ -1832,13 +1845,16 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
                         rel_mat = Matrix.Identity(4)
                     else:
                         try:
-                            rel_mat = parent_pb.matrix.inverted() @ pb.matrix
+                            rel_mat = (arm_eval.matrix_world @ parent_pb.matrix).inverted() @ (arm_eval.matrix_world @ pb.matrix)
+                            if frame < 10:
+                                self.report({'INFO'}, f"frame {frame} bone {bname} t: {rel_mat.translation}")
+                                self.report({'INFO'}, f"frame {frame} bone {bname} t: {rel_mat.to_3x3().to_euler()}")
                         except Exception:
                             rel_mat = Matrix.Identity(4)
 
                     # extract rotation as exponential map (axis-angle where the norm of the vector is equal to the angle of the rotation)
                     try:
-                        q = rel_mat.to_quaternion()
+                        q = rel_mat.to_3x3().to_quaternion()
                         exp_map = q.to_exponential_map()
                     except Exception as e:
                         self.report({'WARNING'}, f"Failed to generate exponential map for bone {bname} for frame {frame}: {e}")
