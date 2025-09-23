@@ -122,7 +122,7 @@ def save_reconstruction_images(
     keypoint_names: List[str],
     view_names: List[str],
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
-    blend_factor: float = 0.4,           # overlay opacity (40%)
+    blend_factor: float = 0.6,           # overlay opacity (60%)
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
@@ -190,7 +190,7 @@ def save_reconstruction_images(
             # print(f"coords3d: {coords3d}")
             # print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
             coords_np = coords3d.detach().cpu().numpy()
-            Xh = np.concatenate([coords_np, [1.0]])  # (4,)
+            Xh = np.concatenate([coords_np, [1.0]])  # (4,) -> homogeneous
             ph = P_i @ Xh  # (3,)
             z = ph[2]
             if abs(z) < 1e-6:
@@ -445,17 +445,17 @@ def render_pose_time_series(
         keypoints = articulated_verts_kpts["keypoints"].to(device)
         vertices = articulated_verts_kpts["vertices"].to(device)
 
-        silhouettes = renderer(vertices, fish.faces.unsqueeze(0), global_t)
-        silhouettes_np = silhouettes.detach().cpu().numpy()
+        # silhouettes = renderer(vertices, fish.faces.unsqueeze(0), global_t)
+        # silhouettes_np = silhouettes.detach().cpu().numpy()
 
-        for i in sample["frames"]:
-            base_name = os.path.splitext(os.path.basename(sample["imgpaths"][i]))[0]
-            out_path = os.path.join(pose_time_series_outdir, "just_silhouette_overlays")
-            ensure_dir(out_path)
-            a = np.clip(silhouettes_np[i], 0.0, 1.0)  # (H,W), float
-            a_exp = a[..., None]
-            a_exp = np.clip(a_exp, 0, 255).astype(np.uint8)
-            cv2.imwrite(img=a_exp, filename=os.path.join(out_path, base_name+".png"))
+        # for i in sample["frames"]:
+        #     base_name = os.path.splitext(os.path.basename(sample["imgpaths"][i]))[0]
+        #     out_path = os.path.join(pose_time_series_outdir, "just_silhouette_overlays")
+        #     ensure_dir(out_path)
+        #     a = np.clip(silhouettes_np[i], 0.0, 1.0)  # (H,W), float
+        #     a_exp = a[..., None]
+        #     a_exp = np.clip(a_exp, 0, 255).astype(np.uint8)
+        #     cv2.imwrite(img=a_exp, filename=os.path.join(out_path, base_name+".png"))
         
         save_reconstruction_images(
             orig_image_paths=sample["imgpaths"],

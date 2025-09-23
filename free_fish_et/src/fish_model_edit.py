@@ -51,14 +51,13 @@ class fish_model:
 
         self.dd = dd
 
+        self.n_bones = dd["n_bones"]
         # the first bone is treated differently from all the other bones (first bone: global orientation fitting; body bones: pose fitting)
         # So n_body_bones excludes the first bone
         self.n_body_bones = dd["n_bones"] - 1
-        # we always have one more joint than bone (the head)
-        self.n_body_joints = len(dd["J"]) - 1
 
-        print(self.n_body_bones)
-        print(self.n_body_joints)
+        # we always have one more joint than bone (the head)
+        self.n_joints = len(dd["J"])
 
         # triangulate if input mesh has quad faces
         fish_faces = dd["F"]
@@ -172,7 +171,7 @@ class fish_model:
         Args:
             global_ori (BS, 3): BS (batch-size) different exponential map representations of global rotation
             body_pose (BS, bbn*3): exponential map representation of body pose (exclude root joint orient) -> orientation of bbn body bones
-            body_bone_length (BS, bbn): bone lengths for bbn body bones
+            body_bone_length (BS, bn): bone lengths for bbn body bones
             scale (BS, 1): scale factor
             pose2rot: if True, convert exponential map to rotation matrix inside LBS
             deform (bool): toggle if linear blend skinning should be applied. If not, just return rest-pose vertices and keypoints in local (model) space.
@@ -180,6 +179,10 @@ class fish_model:
             keypoints (BS, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS in local (model) space
             vertices (BS, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS in local (model) space
         """
+        assert body_bone_length.size(1) == self.n_body_bones, f"body_bone_length must have size (batch_size, n_bones_total-1) but has size {body_bone_length.size()} instead of ({global_ori.size(0), self.n_body_bones})"
+        assert global_ori.size(1) == 3, f"global_ori must have size (batch_size, 3) but has size {global_ori.size()} instead of ({global_ori.size(0), 3}) and must supply world space orientation in exponential map representation"
+        assert body_pose.size(1) == self.n_body_bones*3, f"body_pose must have size (batch_size, (n_bones_total-1)*3) but has size {body_pose.size()} instead of ({global_ori.size(0), self.n_body_bones*3})"
+        
         if not all(
             self.device == attr.device
             for attr in [self.faces, global_ori, body_pose, body_bone_length]
@@ -188,11 +191,12 @@ class fish_model:
             body_pose = body_pose.to(self.device)
             body_bone_length = body_bone_length.to(self.device)
 
+
         batch_size = global_ori.shape[0]
         V = self.V.repeat([batch_size, 1, 1]) * scale
 
-        print(f"body_bone_length: {body_bone_length.size()}")
-        print(f"body_pose: {body_pose.size()}")
+        # print(f"body_bone_length: {body_bone_length.size()}")
+        # print(f"body_pose: {body_pose.size()}")
 
         # no need for global pose and body pose to be separate anymore
         # -> insert one length at the front (first bone) of the bone length tensor of each batch
@@ -202,8 +206,8 @@ class fish_model:
         # concatenate global pose and body pose
         global_ori_plus_body_pose = torch.cat([global_ori, body_pose], dim=1)
 
-        print(f"all_bone_lengths: {all_bone_lengths.size()}")
-        print(f"global_ori_plus_body_pose: {global_ori_plus_body_pose.size()}")
+        # print(f"all_bone_lengths: {all_bone_lengths.size()}")
+        # print(f"global_ori_plus_body_pose: {global_ori_plus_body_pose.size()}")
 
 
         # LBS

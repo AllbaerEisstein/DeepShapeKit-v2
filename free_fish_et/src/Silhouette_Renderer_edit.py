@@ -11,7 +11,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.renderer.fisheyecameras import FishEyeCameras
 
-from src.constants_edit import CV_2_PYTORCH3D
+from src.constants_edit import CV_2_PYTORCH3D, BLENDERCAM_2_PYTORCH3D
 
 
 class Silhouette_Renderer:
@@ -51,9 +51,9 @@ class Silhouette_Renderer:
         # --- that means, a transformation from CV to PyTorch3D has to be appended.
         # --- input K is expected to transform from CV camera (x right, y down, z forward) to CV image (x right, y down, z forward).
         # --- that means, a transformation from CV to PyTorch3D has to be prepended.
-        Rs = CV_2_PYTORCH3D.to(device=self.device, dtype=Rs.dtype).unsqueeze(0).expand(self.n_batches,-1,-1) @ Rs
-        ts = CV_2_PYTORCH3D.to(device=self.device, dtype=ts.dtype) @ ts
-        Ks = Ks @ torch.linalg.inv(CV_2_PYTORCH3D.to(device=self.device, dtype=Ks.dtype)).unsqueeze(0).expand(self.n_batches,-1,-1)
+        Rs = BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=Rs.dtype).unsqueeze(0).expand(self.n_batches,-1,-1) @ Rs
+        ts = BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=ts.dtype) @ ts
+        Ks = Ks @ torch.linalg.inv(BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=Ks.dtype)).unsqueeze(0).expand(self.n_batches,-1,-1)
         # adjust principle points since the axes were flipped
         Ks[:,0,2] = self.image_size[0].unsqueeze(0).expand(self.n_batches) - Ks[:,0,2]
         Ks[:,1,2] = self.image_size[1].unsqueeze(0).expand(self.n_batches) - Ks[:,1,2]

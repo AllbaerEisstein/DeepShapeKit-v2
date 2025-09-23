@@ -400,28 +400,129 @@ def get_mesh_json(context):
             break
     if arm is None:
         raise ValueError("Saving mesh to json failed. Specified object has no armature modifier.")
-    bone_names = [b.name for b in arm.data.bones]
-    joints = [list(arm.data.bones[n].head_local) for n in bone_names]
-    # append tail of last bone - this is needed because bones are represented as vectors.
-    # so we need start and end position of each bone! (e.g., for seven bones, we need eight joints)
-    if bone_names:
-        joints.append(list(arm.data.bones[bone_names[-1]].tail_local))
 
-    # -- rest-pose geometry
+    # --- JOINTS & KINTREE (ensure joint indices align with joints list)
+    bone_list = list(arm.data.bones)
+    roots = [b for b in bone_list if b.parent is None]
+    if not roots:
+        raise ValueError("No root bones found in armature")
+
+    # BFS traversal to preserve topology order
+    bone_names_tree = {b.name: {'p': str, 'c': []} for b in bone_list} # very inefficient way to store a tree
+    ordered_bones = []
+    queue = roots[:]
+    while queue:
+        b = queue.pop(0)
+        ordered_bones.append(b)
+        bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
+        for ch in b.children:
+            queue.append(ch)
+            bone_names_tree[b.name]['c'].append(ch.name)
+
+
+    # head/tail helpers (armature-space local coordinates)
+    def head_pos(b): return b.head_local.copy()
+    def tail_pos(b): return b.tail_local.copy()
+
+    def key_from_vec(v, prec=6):
+        return (round(v.x, prec), round(v.y, prec), round(v.z, prec))
+
+    pos_to_joint_idx = {}
+    joint_positions = []
+    joint_names = []
+    parent_indices = []
+
+    def ensure_joint_at_position(pos, name=None):
+        k = key_from_vec(pos)
+        if k in pos_to_joint_idx:
+            return pos_to_joint_idx[k]
+        idx = len(joint_positions)
+        pos_to_joint_idx[k] = idx
+        joint_positions.append(pos)
+        joint_names.append(name or f"joint_{idx}")
+        parent_indices.append(-1)
+        return idx
+
+    # Create joints (heads & tails), set parent relationships for joints
+    for b in ordered_bones:
+        hi = ensure_joint_at_position(head_pos(b), name=f"{b.name}_head")
+        ti = ensure_joint_at_position(tail_pos(b), name=f"{b.name}_tail")
+
+        # the tail joint's parent is the head joint of the same bone
+        parent_indices[ti] = hi
+
+        # the head joint's parent is the tail joint of the parent bone (if parent exists)
+        if b.parent is not None:
+            p_tail_idx = ensure_joint_at_position(tail_pos(b.parent), name=f"{b.parent.name}_tail")
+            if p_tail_idx != hi and parent_indices[hi] == -1:
+                parent_indices[hi] = p_tail_idx
+        else:
+            parent_indices[hi] = -1
+
+    # Now detect missing physical bone connections and add virtual bones
+    virtual_bone_2_joint_idx = {}   # vname -> (parent_joint_idx, child_joint_idx)
+    virtual_bone_names = []
+    for b in ordered_bones:
+        if b.parent is None:
+            continue
+        p_tail_key = key_from_vec(tail_pos(b.parent))
+        child_head_key = key_from_vec(head_pos(b))
+        if p_tail_key != child_head_key:
+            vname = f"virtual_{b.parent.name}_to_{b.name}"
+            # in bone-tree, replace entry for original child bone with entry for virtual bone (insert node and edge into tree)
+            bone_names_tree[vname] = {'p': b.parent.name, 'c': [b.name]}
+            bone_names_tree[b.name]['p'] = vname
+            bone_names_tree[b.parent.name]['c'] = [vname if c == b.name else c for c in bone_names_tree[b.parent.name]['c']]
+
+            virtual_bone_names.append(vname)
+            p_idx = pos_to_joint_idx.get(p_tail_key)
+            c_idx = pos_to_joint_idx.get(child_head_key)
+            if p_idx is None:
+                p_idx = ensure_joint_at_position(tail_pos(b.parent), name=f"{b.parent.name}_tail")
+            if c_idx is None:
+                c_idx = ensure_joint_at_position(head_pos(b), name=f"{b.name}_head")
+            virtual_bone_2_joint_idx[vname] = (p_idx, c_idx)
+    
+    # topo-sort the tree
+    bone_names_ordered = []
+    queue = [node for node, p_c_dict in bone_names_tree.items() if not p_c_dict['p']]
+    while queue:
+        n = queue.pop(0)
+        bone_names_ordered.append(n)
+        for ch in bone_names_tree[n]['c']:
+            queue.append(ch)
+
+    # Build bone_to_joint mapping: for each exported bone name (real or virtual),
+    # assign the joint index that the bone 'controls' (the tail/end joint).
+    bone_to_joint = {}
+    # real bones => tail joint index
+    for b in ordered_bones:
+        tail_k = key_from_vec(tail_pos(b))
+        bone_to_joint[b.name] = pos_to_joint_idx[tail_k]
+    # virtual bones => child-head joint index (stored as c_idx in virtual_bone_map)
+    for vname, (p_idx, c_idx) in virtual_bone_2_joint_idx.items():
+        bone_to_joint[vname] = c_idx
+
+    # Convert joint positions to lists (object-space coordinates)
+    joints = [[float(c) for c in v] for v in joint_positions]
+    joint_indices = list(range(len(joints)))
+    kintree_unique_joints = [parent_indices, joint_indices]
+
+    # geometry
     verts = [[float(c) for c in v.co] for v in obj.data.vertices]
     faces = [list(p.vertices) for p in obj.data.polygons]
 
-    # -- weights: efficient per-vertex iteration
+    # weights: include columns for virtual bones (zeros)
     n_verts = len(obj.data.vertices)
-    n_bone_groups = len(bone_names)
+    n_bone_groups = len(bone_names_ordered)
     weights = [[0.0]*n_bone_groups for _ in range(n_verts)]
-    # Create a mapping from vertex group name → index in bone_names
-    bone_index_map = {name: i for i, name in enumerate(bone_names)}
+    bone_name_2_index = {name:i for i,name in enumerate(bone_names_ordered)}
     for v in obj.data.vertices:
         for g in v.groups:
             group_name = obj.vertex_groups[g.group].name
-            if group_name in bone_index_map:
-                weights[v.index][bone_index_map[group_name]] = float(g.weight)
+            if group_name in bone_name_2_index:
+                weights[v.index][bone_name_2_index[group_name]] = float(g.weight)
+    # note: virtual bones don't have a vertex group so their weights will remain 0, which is intended
 
     # -- v2k
     v2k = np.zeros((len(kpt_list), n_verts))
@@ -434,37 +535,29 @@ def get_mesh_json(context):
             if kpt_name in [obj.vertex_groups[g.group].name for g in v.groups]:
                 # if it does, record the index of this vertex
                 vertices_for_this_kpt.append(v_index)
-        # and then normalize the weight of each of these verteces and insert their weight at the correct index of the kespoint's vertex list
-        normalized_weight = 1/len(vertices_for_this_kpt)
+        normalized_weight = 1/len(vertices_for_this_kpt) if vertices_for_this_kpt else 0.0
         for vertex_index in vertices_for_this_kpt:
             v2k[kpt_index][vertex_index] = normalized_weight
     
     v2k = [list(keypoint) for keypoint in v2k]
-
-    # -- kintree-table (list of list of parent indices and list of the children indices)
-    kintree = [
-        [
-            list(arm.data.bones).index(arm.data.bones[bone_name].parent)
-            for bone_name in bone_names
-        ], 
-        [
-            list(arm.data.bones).index(bone_name)
-            for bone_name in bone_names
-        ]
-    ]
 
     out = {
         'V': verts,
         'F': faces,
         'J': joints,
         'vert2kpt': v2k,
-        'kintree_table': kintree,
+        'kintree_table': kintree_unique_joints,
         'weights': weights,
         'n_bones': n_bone_groups,
-        'kpt_list': kpt_list
+        'kpt_list': kpt_list,
+        'bone_order': bone_names_ordered,            # bone order used for export
+        'bone_names_tree': bone_names_tree, # a tree-dict of parent-child-relationships of bones
+        'bone_to_joint': bone_to_joint,       # maps bone_name -> joint_index it controls (tail joint)
+        'virtual_bone_names': virtual_bone_names # for identifying virtual bones
     }
 
     return out
+
 
 
 def get_avg_kpt_coords_3d(kpt2verts_co:dict):
@@ -914,10 +1007,10 @@ using opencv's contour detection can create a silhouette annotation from the bin
                     render_path_os = os.path.join(resolve(p.render_out_dir), render_prefix + ".png")
                     mask_label_path_os = os.path.join(resolve(p.mask_label_dir), render_prefix + ".txt")
                     kpt_label_path_os = os.path.join(resolve(p.kpt_label_dir), render_prefix + ".txt")
-                    if not (
-                            os.path.exists(render_path_os)
-                            and os.path.exists(mask_label_path_os) if p.render_binary else True
-                            and os.path.exists(kpt_label_path_os)
+                    if (
+                            (not os.path.exists(render_path_os))
+                            or ((not os.path.exists(mask_label_path_os)) if p.render_binary else True)
+                            or (not os.path.exists(kpt_label_path_os))
                         ):
                         self.render_queue.append({
                             'view':                     cam.name,
@@ -1739,11 +1832,10 @@ class SYNTH_OT_create_videos(Operator):
 class SYNTH_OT_export_pose_time_series_json(Operator):
     bl_idname = "synth.export_pose_time_series_json"
     bl_label = "Export Pose Time Series (JSON)"
-    bl_description = "Export per-frame root position, bone relative rotations (radians) in exponential map representation and bone lengths to a JSON file in annotation dir"
+    bl_description = "Export per-frame root position, bone relative rotations in exponential map and bone length scalings to a JSON file"
 
     def _find_armature_for_scene(self, context):
         p = context.scene.synth_props
-        # 1) try armature modifier on target object if available
         try:
             col = bpy.data.collections.get(p.collection_name)
             if col:
@@ -1764,21 +1856,39 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
             self.report({'ERROR'}, "No armature found (checked modifier on target object).")
             return {'CANCELLED'}
 
-        bone_names = [b.name for b in arm_obj.data.bones]
-        if not bone_names:
-            self.report({'ERROR'}, "Armature has no bones.")
-            return {'CANCELLED'}
+        # Use get_mesh_json to derive bone order, joint list and maps
+        mesh_info = get_mesh_json(context)
+        bone_names_ordered = mesh_info['bone_order']            # includes virtual bones appended
+        bone_names_tree = mesh_info['bone_names_tree']
+        virtual_bone_names = mesh_info['virtual_bone_names']
+        bone_to_joint = mesh_info['bone_to_joint']     # bone_name -> joint_index
+        joints = mesh_info['J']                        # list of joint positions (object-space)
+        # compute rest lengths from joint positions: for bone -> (head_joint, tail_joint)
+        # For real bones, tail_joint is bone_to_joint[b], head_joint = parent of that tail (kintree parent)
+        parent_indices = mesh_info['kintree_table'][0]
 
+        # Build a quick map joint_index -> parent_joint_index (from kintree)
+        joint_to_parent = {i: parent_indices[i] for i in range(len(parent_indices))}
+
+        # rest lengths per bone (real + virtual)
+        bone_name_2_rest_length = {}
+        # we need head joint index for each bone:
+        for bname in bone_names_ordered:
+            tail_j = bone_to_joint.get(bname)
+            head_j = joint_to_parent.get(tail_j, -1)
+            head_pos = Vector(joints[head_j])
+            tail_pos = Vector(joints[tail_j])
+            dist = float((tail_pos - head_pos).length)
+            bone_name_2_rest_length[bname] = dist if dist > 0.0 else 1.0
+
+        # Prepare path and timing
         out_dir = resolve(p.annot_out_dir)
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"pose_time_series_{p.collection_name}_{p.object_name}.json")
 
         deps = bpy.context.evaluated_depsgraph_get()
-
         frame_start = scene.frame_start
         frame_end = scene.frame_end
-
-        # determine FPS (float)
         try:
             fps = float(scene.render.fps) / float(scene.render.fps_base)
         except Exception:
@@ -1787,7 +1897,7 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
         data = {
             "meta": {
                 "armature": arm_obj.name,
-                "bone_order": bone_names,
+                "bone_order": bone_names_ordered,
                 "frame_start": int(frame_start),
                 "frame_end": int(frame_end),
                 "fps": float(fps),
@@ -1797,101 +1907,109 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
             "frames": []
         }
 
-        try:
-            for frame in range(frame_start, frame_end + 1):
-                scene.frame_set(frame)
-                # update depsgraph to ensure pose evaluation
-                deps.update()
+        # iterate frames
+        for frame in range(frame_start, frame_end + 1):
+            scene.frame_set(frame)
+            deps.update()
+            arm_eval = arm_obj.evaluated_get(deps)
+            pose_bones = arm_eval.pose.bones
 
-                arm_eval = arm_obj.evaluated_get(deps)
-                pose_bones = arm_eval.pose.bones
+            # root: first bone in bone_names must be a real bone (it was originally from ordered bones)
+            first_bone = bone_names_ordered[0]
+            if first_bone not in pose_bones:
+                self.report({'ERROR'}, f"Root bone '{first_bone}' missing in pose at frame {frame}")
+                return {'CANCELLED'}
 
-                # root global position: head of first bone in armature data order
-                # global orientation: orientation of root bone in world space
-                first_bone_name = bone_names[0]
-                if first_bone_name not in pose_bones:
-                    self.report({'WARNING'}, f"Bone '{first_bone_name}' missing from pose bones at frame {frame}")
-                    root_bone_translation_world = Vector((0.0, 0.0, 0.0))
-                    root_ori_world = Vector((0.0, 0.0, 0.0))
-                else:
-                    pb_root = pose_bones[first_bone_name]
-                    if frame < 10:
-                        self.report({'INFO'}, f"frame {frame}: {Vector(pb_root.head)}")
-                    root_bone_translation_world = arm_eval.matrix_world @ Vector(pb_root.head)
-                    root_bone_rot_matrix_world = arm_eval.matrix_world @ pb_root.matrix
-                    root_ori_world = root_bone_rot_matrix_world.to_3x3().to_quaternion().to_exponential_map()
+            pb_root = pose_bones[first_bone]
+            # root global translation: use root bone head in world space
+            root_bone_translation_world = arm_eval.matrix_world @ Vector(pb_root.head)
+            root_bone_rot_matrix_world = arm_eval.matrix_world @ pb_root.matrix
+            root_ori_world = root_bone_rot_matrix_world.to_3x3().to_quaternion().to_exponential_map()
 
-                global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
-                global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
+            global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
+            global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
 
-                body_pose = []         # list of [ex,ey,ez] euler radians per bone (skip first)
-                body_bone_length = []  # list of floats per bone (skip first)
+            body_pose = []
+            body_bone_length = []
 
-                # iterate bones in same order, skipping the root bone (index 0)
-                for bname in bone_names[1:]:
-                    if bname not in pose_bones:
-                        # placeholder if missing
-                        body_pose.append([0.0, 0.0, 0.0])
-                        body_bone_length.append(0.0)
-                        continue
-                    
-                    # pose_bones are from the evaluated armature
+            # iterate bone_names in order, skipping the first (root)
+            for bname in bone_names_ordered[1:]:
+                # Real bone: present in pose_bones
+                if bname in pose_bones:
                     pb = pose_bones[bname]
                     parent_pb = pb.parent
-
-                    # relative rotation: parent.matrix.inverted() @ pb.matrix
                     if parent_pb is None:
-                        # treat as identity (no relative rotation)
-                        rel_mat = Matrix.Identity(4)
-                    else:
-                        try:
-                            rel_mat = (arm_eval.matrix_world @ parent_pb.matrix).inverted() @ (arm_eval.matrix_world @ pb.matrix)
-                            if frame < 10:
-                                self.report({'INFO'}, f"frame {frame} bone {bname} t: {rel_mat.translation}")
-                                self.report({'INFO'}, f"frame {frame} bone {bname} t: {rel_mat.to_3x3().to_euler()}")
-                        except Exception:
-                            rel_mat = Matrix.Identity(4)
-
-                    # extract rotation as exponential map (axis-angle where the norm of the vector is equal to the angle of the rotation)
-                    try:
-                        q = rel_mat.to_3x3().to_quaternion()
-                        exp_map = q.to_exponential_map()
-                    except Exception as e:
-                        self.report({'WARNING'}, f"Failed to generate exponential map for bone {bname} for frame {frame}: {e}")
-                        # fallback
-                        exp_map = Vector((0.0, 0.0, 0.0))
-
+                        self.report({'ERROR'}, f"Pose bone {bname} unexpectedly has no parent at frame {frame}")
+                        return {'CANCELLED'}
+                    rel_mat = parent_pb.matrix.inverted() @ pb.matrix
+                    q = rel_mat.to_3x3().to_quaternion()
+                    exp_map = q.to_exponential_map()
                     body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
 
-                    # bone length in world space (tail - head)
-                    try:
-                        world_head = arm_eval.matrix_world @ Vector(pb.head)
-                        world_tail = arm_eval.matrix_world @ Vector(pb.tail)
-                        length = float((world_tail - world_head).length)
-                    except Exception:
-                        length = 0.0
-                    body_bone_length.append(length)
+                    # length scaling using world head/tail
+                    world_head = arm_eval.matrix_world @ Vector(pb.head)
+                    world_tail = arm_eval.matrix_world @ Vector(pb.tail)
+                    cur_len = float((world_tail - world_head).length)
+                    rest_len = bone_name_2_rest_length.get(bname, 1.0)
+                    length_factor = cur_len / rest_len if rest_len != 0 else 1.0
+                    body_bone_length.append(length_factor)
+                    continue
 
-                frame_entry = {
-                    "frame": int(frame),
-                    "time": float((frame - frame_start) / fps),
-                    "global_t": global_t,
-                    "global_ori": global_ori,
-                    "body_pose": body_pose,
-                    "body_bone_length": body_bone_length
-                }
-                data["frames"].append(frame_entry)
+                # Virtual bone
+                if bname in virtual_bone_names:
+                    p_name = bone_names_tree[bname]['p']
+                    c_name = bone_names_tree[bname]['c'][0]
+                    # ensure parent & child pose bones exist
+                    if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
+                        self.report({'ERROR'}, f"Virtual bone {bname} refers to missing pose bones at frame {frame}")
+                        return {'CANCELLED'}
 
-            # write json
-            with open(out_path, 'w') as jf:
-                json.dump(data, jf, indent=2)
+                    parent_pb = pose_bones[p_name]
+                    child_pb = pose_bones[c_name]
 
-            self.report({'INFO'}, f"Wrote pose time series JSON to {out_path}")
-            return {'FINISHED'}
+                    # build frames at parent tail and child head (armature space -> world)
+                    parent_tail = Vector(parent_pb.tail)
+                    child_head = Vector(child_pb.head)
+                    parent_rot_world = (arm_eval.matrix_world @ parent_pb.matrix).to_3x3().to_4x4()
+                    child_rot_world = (arm_eval.matrix_world @ child_pb.matrix).to_3x3().to_4x4()
+                    world_parent_tail = arm_eval.matrix_world @ parent_tail
+                    world_child_head = arm_eval.matrix_world @ child_head
 
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to export pose time series: {e}")
-            return {'CANCELLED'}
+                    parent_tail_frame_world = Matrix.Translation(world_parent_tail) @ parent_rot_world
+                    child_head_frame_world = Matrix.Translation(world_child_head) @ child_rot_world
+
+                    rel_mat = parent_tail_frame_world.inverted() @ child_head_frame_world
+                    q = rel_mat.to_3x3().to_quaternion()
+                    exp_map = q.to_exponential_map()
+                    body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
+
+                    cur_dist = float((world_child_head - world_parent_tail).length)
+                    rest_len = bone_name_2_rest_length.get(bname, 1.0)
+                    length_factor = cur_dist / rest_len if rest_len != 0 else 1.0
+                    body_bone_length.append(length_factor)
+                    continue
+
+                # neither real nor virtual (shouldn't happen)
+                body_pose.append([0.0, 0.0, 0.0])
+                body_bone_length.append(1.0)
+
+            frame_entry = {
+                "frame": int(frame),
+                "time": float((frame - frame_start) / fps),
+                "global_t": global_t,
+                "global_ori": global_ori,
+                "body_pose": body_pose,
+                "body_bone_length": body_bone_length
+            }
+            data["frames"].append(frame_entry)
+
+        # write json
+        with open(out_path, 'w') as jf:
+            json.dump(data, jf, indent=2)
+
+        self.report({'INFO'}, f"Wrote pose time series JSON to {out_path}")
+        return {'FINISHED'}
+
 
 
 

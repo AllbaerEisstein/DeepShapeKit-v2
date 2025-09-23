@@ -18,24 +18,22 @@ from src.geometry import batch_rodrigues
 class LBS():
     '''
     Implementation of linear blend skinning, with additional bone and scale
-    Args:
-        J (BN, JN, 3): joint positions in local space for BN batches
-        parents (JN): list of indices of the parent of every joint (e.g. [-1,0,1,2,3,4]) for 6 joints
     '''
 
     def __init__(self, J, parent_indices, weights):
         """
         Args:
-            J (BN, JN, 3): joint positions in local space for BN batches
+            J (BN, JN, 3): joint positions in local space for BN batches. JN should be the total joint number, so n_bones+1 (there is one more joint (head) than bones)
             parents (JN): list of indices of the parent of every joint (e.g. [-1,0,1,2,3,4]) for 6 joints
+            weights (n_vertices, n_bones): 
         """
+        # the head joint is just the origin of the mesh. it is excluded
         self.n_body_joints = J.shape[1] - 1
 
         self.joints_homog = F.pad((J[:, parent_indices[1:]]).unsqueeze(-1), [0, 0, 0, 1], value=0)
         # kin_tree: positions of the body joints (first joint excluded!) relative to their parents
-        self.locs_rel_to_parents = (J[:, 1:] - J[:, parent_indices[1:]]).unsqueeze(-1)
-        # "list" of parent joint coordinates
-        self.joint_parent = F.pad((J[:, parent_indices[1:]]).unsqueeze(-1), [0,0,0,1], value=1)
+        # ---> len(locs_rel_to_parents) = n_joints-1 = n_bones
+        self.body_joint_locs_rel_to_parents = (J[:, 1:] - J[:, parent_indices[1:]]).unsqueeze(-1)
 
         self.parent_indices = parent_indices
         self.weights = weights[None].float()
@@ -52,24 +50,31 @@ class LBS():
         device = global_ori_plus_body_pose.device
         V_homog = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
         # TODO: used to cut the first bone: bone[:, 1:, None, None]
-        print(f"LBS: locs_rel_to_parents shape: {self.locs_rel_to_parents.size()}")
-        print(f"LBS: all_bone_length shape: {all_bone_length.size()}")
-        print(f"LBS: global_ori_plus_body_pose shape: {global_ori_plus_body_pose.size()}")
+        # print(f"LBS: locs_rel_to_parents shape: {self.body_joint_locs_rel_to_parents.size()}")
+        # print(f"LBS: all_bone_length shape: {all_bone_length.size()}")
+        # print(f"LBS: global_ori_plus_body_pose shape: {global_ori_plus_body_pose.size()}")
         
         # scale the joint positions by the bone lengths -> init kin-tree excluded head joint, this step should exclude it, too
         # however, the head bone length is important since the first *body joint* has a location relative to its 
         # parent (head joint) that needs to be scaled.
-        locs_rel_to_parents = (scale * self.locs_rel_to_parents) * all_bone_length[:, :, None, None]
+        body_joint_locs_rel_to_parents = (scale * self.body_joint_locs_rel_to_parents) * all_bone_length[:, :, None, None]
 
         if to_rotmats:
             global_ori_plus_body_pose = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3)) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to tuple format ([[[a,b,c],[a1,b1,c1],...]])
         global_ori_plus_body_pose = global_ori_plus_body_pose.view([batch_size, -1, 3, 3])
+
         T_for_joints_rel_to_parent = torch.zeros([batch_size, self.n_body_joints, 4, 4]).float().to(device) # 4x4 all-0 matrices for every joint (excluding head joint)
         T_for_joints_rel_to_parent[:, :, -1, -1] = 1 # last-row last-column entry (bottom right) is 1 (homogeneous transform)
-        # TODO: used to cut the first pose: pose[:,1:,:,:]
-        print(f"global_or_plus_pose as matrix size: {global_ori_plus_body_pose.size()}")
-        T_for_joints_rel_to_parent[:, :, :3, :] = torch.cat([global_ori_plus_body_pose[:,1:,:,:], locs_rel_to_parents], dim=-1)
-        # now, T looks like this for every joint (excluding head joint):
+        # print(f"global_ori_plus_pose as matrix size: {global_ori_plus_body_pose.size()}")
+        # first joint just gets translated via bone_length-scaling; no rotation
+        T_for_joints_rel_to_parent[:, 0, :3, :]  = torch.cat([torch.eye(3, device=device).unsqueeze(0), body_joint_locs_rel_to_parents[:,0,:]], dim=-1)
+        # now, T looks like this for the first body joint:
+        #       1           0           0       loc_rel_to_parent[0]
+        #       0           1           0       loc_rel_to_parent[1]
+        #       0           0           1       loc_rel_to_parent[2]
+        #       0           0           0           1
+        T_for_joints_rel_to_parent[:, 1:, :3, :] = torch.cat([global_ori_plus_body_pose[:,1:,:,:], body_joint_locs_rel_to_parents[:,1:,:]], dim=-1)
+        # now, T looks like this for every joint (excluding first two joints, i.e. excluding head joint and first body joint):
         #
         #   rotmat(0,0) rotmat(0,1) rotmat(0,2) loc_rel_to_parent[0]
         #   rotmat(1,0) rotmat(1,1) rotmat(1,2) loc_rel_to_parent[1]

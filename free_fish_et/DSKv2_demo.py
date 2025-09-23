@@ -33,15 +33,14 @@ if __name__ == '__main__':
     segmentation_model_path = Path('src/DSKv2/cygill_seg.pt')
     pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
 
-    mesh_path               = str(Path('src/DSKv2/Bluegill_Body_mesh.json'))
-    pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
+    # mesh_path               = str(Path('src/DSKv2/Bluegill_Body_mesh.json'))
+    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
 
-    # mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
-    # # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
-    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube_rotating.json'))
+    mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
+    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
+    pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube_rotating.json'))
 
     cam_matrices_path       = Path('src/DSKv2/cam_matrices_bl_2_cv.json')
-    # cam_matrices_path       = Path('src/DSKv2/cam_matrices_bl.json')
     
     out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'
@@ -105,7 +104,7 @@ if __name__ == '__main__':
             dataset_dir=str(dataset_folder_path),
             pose_time_series_file_path=pose_time_series_path,
             outdir=final_output_folder,
-            deform=True
+            deform=False
         )
 
     # ==============================
