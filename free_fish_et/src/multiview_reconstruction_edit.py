@@ -441,7 +441,9 @@ def render_pose_time_series(
         body_pose = torch.tensor(frame["body_pose"], device=device)
         bone_length = torch.tensor(frame["body_bone_length"], device=device)
 
-        articulated_verts_kpts = fish(global_ori.unsqueeze(0), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
+        # articulated_verts_kpts = fish(global_ori.unsqueeze(0), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
+        # articulated_verts_kpts = fish(torch.zeros_like(global_ori.unsqueeze(0), device=device), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
+        articulated_verts_kpts = fish(global_ori.unsqueeze(0), torch.zeros_like(body_pose.unsqueeze(0).flatten(1), device=device), bone_length.unsqueeze(0), deform=deform)
         keypoints = articulated_verts_kpts["keypoints"].to(device)
         vertices = articulated_verts_kpts["vertices"].to(device)
 

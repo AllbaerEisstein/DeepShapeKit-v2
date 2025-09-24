@@ -72,10 +72,8 @@ class fish_model:
                 raise Exception("face data incorrect: got vertices number not in [3,4]")
         self.faces = torch.tensor(triangle_faces)
 
-        # self.faces = torch.tensor(dd['F'])
-
         self.kintree_table = torch.tensor(dd["kintree_table"])[:, :]
-        self.parents = self.kintree_table[0][:]
+        self.parent_indices = self.kintree_table[0][:]
 
         self.weights = torch.tensor(dd["weights"])
         self.vert2kpt = torch.tensor(dd["vert2kpt"])
@@ -83,15 +81,15 @@ class fish_model:
         self.J = torch.tensor(dd["J"]).unsqueeze(0) # (1,J,3)
         self.V = torch.tensor(dd["V"]).unsqueeze(0) # (1,V,3)
 
-        # local coords, relative to head
-        self.V = self.V - self.J[0, 0]
-        self.J = self.J - self.J[0, 0]
+        # # local coords, relative to head
+        # self.V = self.V - self.J[0, 0]
+        # self.J = self.J - self.J[0, 0]
 
         # scaling, unit conversion
         self.V = self.V #* 0.01
         self.J = self.J #* 0.01
 
-        self.LBS = LBS(self.J, self.parents, self.weights)
+        self.LBS = LBS(self.J, self.parent_indices, self.weights)
 
         # TODO: let user choose which indices belong to which bodypart (best to define in synthetic data generator)
         # Body_pose angle limit
@@ -133,7 +131,7 @@ class fish_model:
         """
         self.device = torch.device(device)
         self.kintree_table = self.kintree_table.to(device)
-        self.parents = self.parents.to(device)
+        self.parent_indices = self.parent_indices.to(device)
         self.faces = self.faces.to(self.device)
         self.weights = self.weights.to(self.device)
         self.vert2kpt = self.vert2kpt.to(self.device)
@@ -147,7 +145,7 @@ class fish_model:
             self.faces.device == attr.device
             for attr in [
                 self.kintree_table,
-                self.parents,
+                self.parent_indices,
                 self.weights,
                 self.vert2kpt,
                 self.J,
@@ -161,7 +159,7 @@ class fish_model:
             raise ValueError(
                 "failed to move all fish object attributes to the same device"
             )
-        self.LBS = LBS(self.J, self.parents, self.weights)
+        self.LBS = LBS(self.J, self.parent_indices, self.weights)
         self.device = self.faces.device
         self.device_active = True
 

@@ -1,0 +1,31 @@
+            # helpers to get joint positions from pose bone matrices (PoseBone.head and PoseBone.tail are relative to parent)
+            def get_location_along_bone_arm_space(pose_bone, offset):
+                # this is in local space of the parent of pose_bone (origin at head of parent)
+                T = Matrix.Translation(
+                        offset * (pose_bone.tail - pose_bone.head)
+                    )
+                # matrix of a pose bone gives matrix of head in armature space
+                return Matrix.Translation((T @ pose_bone.matrix).to_translation())
+
+            def get_location_along_bone_parent_space(pose_bone, offset):
+                # this is in local space of the parent of pose_bone (origin at head of parent)
+                T = Matrix.Translation(
+                        offset * (pose_bone.tail - pose_bone.head)
+                    )
+                # head of a pose bone gives location of head in armature space
+                return T @ Matrix.Translation(Vector(pose_bone.head))
+
+            def get_head_arm_space_from_pose_bone(pose_bone):
+                return pose_bone.matrix # matrix of a pose bone gives matrix of head in armature space
+            
+            def get_tail_arm_space_from_pose_bone(pose_bone):
+                return get_location_along_bone_arm_space(pose_bone, 1)
+            
+            def get_head_parent_space_from_pose_bone(pose_bone):
+                return Matrix.Translation(Vector(pose_bone.head)) # head of a pose bone gives translation vector of head in parent space
+            
+            def get_tail_parent_space_from_pose_bone(pose_bone):
+                return get_location_along_bone_parent_space(pose_bone, 1)
+            
+            # def get_rot_arm_space_from_pose_bone(pose_bone):
+            #     return pose_bone.

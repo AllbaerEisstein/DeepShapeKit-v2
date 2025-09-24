@@ -24,6 +24,7 @@ from bpy.props import (
     StringProperty, BoolProperty, FloatProperty, IntProperty,
     PointerProperty
 )
+from bpy_extras.io_utils import ImportHelper
 from bpy.types import Panel, Operator, PropertyGroup
 import cv2
 import numpy as np
@@ -380,6 +381,9 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
     return faces, vertices, normals, kpt_2_verts_worldco, kpt_2_faces_worldco
 
 
+
+# --------------------------- Mesh extraction --------------------
+
 def get_mesh_json(context):
     collection_name = context.scene.synth_props.collection_name
     object_name = context.scene.synth_props.object_name
@@ -406,33 +410,42 @@ def get_mesh_json(context):
     roots = [b for b in bone_list if b.parent is None]
     if not roots:
         raise ValueError("No root bones found in armature")
+    
+    # head/tail helpers (armature-space local coordinates)
+    def head_pos(b): return b.head_local.copy()
+    def tail_pos(b): return b.tail_local.copy()
 
     # BFS traversal to preserve topology order
-    bone_names_tree = {b.name: {'p': str, 'c': []} for b in bone_list} # very inefficient way to store a tree
+    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'bone_rest_rot': []} for b in bone_list} # very inefficient way to store a tree
     ordered_bones = []
     queue = roots[:]
     while queue:
         b = queue.pop(0)
         ordered_bones.append(b)
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
+        bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
+        rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
+        bone_names_tree[b.name]['bone_rest_rot'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
         for ch in b.children:
             queue.append(ch)
             bone_names_tree[b.name]['c'].append(ch.name)
-
-
-    # head/tail helpers (armature-space local coordinates)
-    def head_pos(b): return b.head_local.copy()
-    def tail_pos(b): return b.tail_local.copy()
-
-    def key_from_vec(v, prec=6):
-        return (round(v.x, prec), round(v.y, prec), round(v.z, prec))
 
     pos_to_joint_idx = {}
     joint_positions = []
     joint_names = []
     parent_indices = []
 
+
+    def key_from_vec(v, prec=6):
+        return (round(v.x, prec), round(v.y, prec), round(v.z, prec))
+
     def ensure_joint_at_position(pos, name=None):
+        """
+        If a joint was already ensured at this position, return the index of that joint.
+        Else, create a new index for this position. Indices auto-increment.
+        This function also appends to the list `joint_positions` every time it is called. 
+        So, if it is called in hierarchical order, `joint_positions` is ordered according to this hierarchy.
+        """
         k = key_from_vec(pos)
         if k in pos_to_joint_idx:
             return pos_to_joint_idx[k]
@@ -440,27 +453,11 @@ def get_mesh_json(context):
         pos_to_joint_idx[k] = idx
         joint_positions.append(pos)
         joint_names.append(name or f"joint_{idx}")
+        # fill up with default -1 parent for each new pos
         parent_indices.append(-1)
         return idx
-
-    # Create joints (heads & tails), set parent relationships for joints
-    for b in ordered_bones:
-        hi = ensure_joint_at_position(head_pos(b), name=f"{b.name}_head")
-        ti = ensure_joint_at_position(tail_pos(b), name=f"{b.name}_tail")
-
-        # the tail joint's parent is the head joint of the same bone
-        parent_indices[ti] = hi
-
-        # the head joint's parent is the tail joint of the parent bone (if parent exists)
-        if b.parent is not None:
-            p_tail_idx = ensure_joint_at_position(tail_pos(b.parent), name=f"{b.parent.name}_tail")
-            if p_tail_idx != hi and parent_indices[hi] == -1:
-                parent_indices[hi] = p_tail_idx
-        else:
-            parent_indices[hi] = -1
-
-    # Now detect missing physical bone connections and add virtual bones
-    virtual_bone_2_joint_idx = {}   # vname -> (parent_joint_idx, child_joint_idx)
+    
+    # Detect missing physical bone connections and add virtual bones
     virtual_bone_names = []
     for b in ordered_bones:
         if b.parent is None:
@@ -470,40 +467,49 @@ def get_mesh_json(context):
         if p_tail_key != child_head_key:
             vname = f"virtual_{b.parent.name}_to_{b.name}"
             # in bone-tree, replace entry for original child bone with entry for virtual bone (insert node and edge into tree)
-            bone_names_tree[vname] = {'p': b.parent.name, 'c': [b.name]}
+            bone_names_tree[vname] = {
+                    'p': b.parent.name, 'c': [b.name], 
+                    'joints': [tail_pos(b.parent), head_pos(b)], 
+                    'joints_idx': [-1,-1],
+                }
             bone_names_tree[b.name]['p'] = vname
             bone_names_tree[b.parent.name]['c'] = [vname if c == b.name else c for c in bone_names_tree[b.parent.name]['c']]
-
             virtual_bone_names.append(vname)
-            p_idx = pos_to_joint_idx.get(p_tail_key)
-            c_idx = pos_to_joint_idx.get(child_head_key)
-            if p_idx is None:
-                p_idx = ensure_joint_at_position(tail_pos(b.parent), name=f"{b.parent.name}_tail")
-            if c_idx is None:
-                c_idx = ensure_joint_at_position(head_pos(b), name=f"{b.name}_head")
-            virtual_bone_2_joint_idx[vname] = (p_idx, c_idx)
+
+            # parent_rest_R_world and child_rest_R_world obtained as above for their real bones:
+            parent_rest_R_world = (arm.matrix_world @ b.parent.matrix_local).to_3x3()
+            child_rest_R_world  = (arm.matrix_world @ b.matrix_local).to_3x3()
+            # relative rotation (parent_tail_frame -> child_head_frame) in world coordinates:
+            virtual_rest_R_world = parent_rest_R_world.inverted() @ child_rest_R_world
+            bone_names_tree[vname]['bone_rest_rot'] = virtual_rest_R_world
     
-    # topo-sort the tree
+    # topo-sort the tree and add joint information, in the same go create joint indexing and joint parent information
+    # this ensures indexing of joints that corresponds to the bone hierarchy
     bone_names_ordered = []
     queue = [node for node, p_c_dict in bone_names_tree.items() if not p_c_dict['p']]
     while queue:
         n = queue.pop(0)
         bone_names_ordered.append(n)
+
+        hi = ensure_joint_at_position(bone_names_tree[n]['joints'][0], name=f"{n}_head")
+        ti = ensure_joint_at_position(bone_names_tree[n]['joints'][1], name=f"{n}_tail")
+        bone_names_tree[n]['joints_idx'][0] = hi
+        bone_names_tree[n]['joints_idx'][1] = ti
+
+        # the parent of the tail joint is the head joint of the same bone
+        parent_indices[ti] = hi
+
+        # the parent of the head joint has been set already since every head joint (except for root joint) is a also a tail joint.
+        # just the parent index of the head joint has to be set manually.
+        if bone_names_tree[n]['p'] == '':
+            parent_indices[hi] = -1
+
         for ch in bone_names_tree[n]['c']:
             queue.append(ch)
 
-    # Build bone_to_joint mapping: for each exported bone name (real or virtual),
-    # assign the joint index that the bone 'controls' (the tail/end joint).
-    bone_to_joint = {}
-    # real bones => tail joint index
-    for b in ordered_bones:
-        tail_k = key_from_vec(tail_pos(b))
-        bone_to_joint[b.name] = pos_to_joint_idx[tail_k]
-    # virtual bones => child-head joint index (stored as c_idx in virtual_bone_map)
-    for vname, (p_idx, c_idx) in virtual_bone_2_joint_idx.items():
-        bone_to_joint[vname] = c_idx
 
     # Convert joint positions to lists (object-space coordinates)
+    # joint positions was built i
     joints = [[float(c) for c in v] for v in joint_positions]
     joint_indices = list(range(len(joints)))
     kintree_unique_joints = [parent_indices, joint_indices]
@@ -546,13 +552,20 @@ def get_mesh_json(context):
         'F': faces,
         'J': joints,
         'vert2kpt': v2k,
-        'kintree_table': kintree_unique_joints,
         'weights': weights,
-        'n_bones': n_bone_groups,
         'kpt_list': kpt_list,
-        'bone_order': bone_names_ordered,            # bone order used for export
-        'bone_names_tree': bone_names_tree, # a tree-dict of parent-child-relationships of bones
-        'bone_to_joint': bone_to_joint,       # maps bone_name -> joint_index it controls (tail joint)
+        'n_bones': n_bone_groups,
+        'bone_order': bone_names_ordered,        # bone order used for export
+        'kintree_table': kintree_unique_joints,
+        'bone_names_tree': {
+            bone_name: {
+                'p': data['p'],
+                'c': data['c'],
+                'joints': data['joints_idx'],
+                'rest_rot_world': [[float(c) for c in row] for row in data['bone_rest_rot']]
+            }
+            for bone_name, data in bone_names_tree.items()
+        },                                       # a tree-dict of parents, children and joint indices of bones
         'virtual_bone_names': virtual_bone_names # for identifying virtual bones
     }
 
@@ -1568,78 +1581,6 @@ class SYNTH_OT_export_keypoint_list(Operator):
         return {'FINISHED'}
 
 
-class SYNTH_PT_main_panel(Panel):
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Synthetic Data'
-    bl_label = 'Synthetic Data Generator'
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-        p = scene.synth_props
-        box = layout.box()
-        box.label(text="Output Paths")
-        box.prop(p, 'render_out_dir')
-        box.prop(p, 'annot_out_dir')
-        box.prop(p, 'kpt_label_dir')
-        box.prop(p, 'mask_label_dir')
-        box = layout.box()
-        box.label(text="Render / Image")
-        box.prop(p, 'render_scale')
-        row = box.row(align=True)
-        row.prop(p, 'image_width_px')
-        row.prop(p, 'image_height_px')
-        box = layout.box()
-        box.label(text="Target Object & Keypoints")
-        box.prop(p, 'collection_name')
-        box.prop(p, 'object_name')
-        box.prop(p, 'keypoint_list_csv')
-        box.operator('synth.export_keypoint_list', icon='EXPORT')
-        box = layout.box()
-        box.label(text="Behaviour")
-        box.prop(p, 'render_binary')
-        box.prop(p, 'use_compositor')
-        box = layout.box()
-        box.label(text="Keypoint Options")
-        box.prop(p, 'check_keypoint_visibility')
-        box.prop(p, 'keypoint_visible_threshold')
-        box.prop(p, 'keep_occluded_keypoints')
-        box.prop(p, 'draw_every_keypoint_vertex')
-        box.prop(p, 'draw_every_keypoint_face')
-        box.prop(p, 'draw_lattice_for_kpt_annot')
-        box = layout.box()
-        box.label(text="Misc")
-        box.prop(p, 'create_annotated_images')
-        box.prop(p, 'create_yolo_datasets')
-        box.prop(p, 'event_timer_interval')
-        row = layout.row()
-        row.operator('synth.apply_settings', icon='CHECKMARK')
-        row.operator('synth.load_config', icon='IMPORT')
-        row = layout.row()
-        row.operator('render.timed_render', icon='RENDER_STILL')
-        row.operator('synth.unregister_timed_render', icon='CANCEL')
-        row.operator('synth.create_videos', icon='SEQUENCE')
-        row.operator('synth.export_camera_matrices', icon='FILE_FOLDER')
-        row.operator('synth.export_mesh', icon='FILE_FOLDER')
-        row.operator('synth.export_pose_time_series_json', icon='SEQUENCE')
-
-
-
-class SYNTH_OT_unregister_timed_render(Operator):
-    bl_idname = "synth.unregister_timed_render"
-    bl_label = "Unregister TimedRender"
-
-    def execute(self, context):
-        try:
-            bpy.utils.unregister_class(TimedRender)
-            self.report({'INFO'}, 'Unregistered TimedRender')
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({'WARNING'}, f'Failed to unregister TimedRender: {e}')
-            return {'CANCELLED'}
-
-
 
 # --------------------------- Camera matrices export operator ----------------
 
@@ -1826,6 +1767,7 @@ class SYNTH_OT_create_videos(Operator):
         return {'FINISHED'}
 
 
+
 # --------------------------- Export Pose Time Series Operator --------------------------
 
 
@@ -1861,7 +1803,6 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
         bone_names_ordered = mesh_info['bone_order']            # includes virtual bones appended
         bone_names_tree = mesh_info['bone_names_tree']
         virtual_bone_names = mesh_info['virtual_bone_names']
-        bone_to_joint = mesh_info['bone_to_joint']     # bone_name -> joint_index
         joints = mesh_info['J']                        # list of joint positions (object-space)
         # compute rest lengths from joint positions: for bone -> (head_joint, tail_joint)
         # For real bones, tail_joint is bone_to_joint[b], head_joint = parent of that tail (kintree parent)
@@ -1874,7 +1815,7 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
         bone_name_2_rest_length = {}
         # we need head joint index for each bone:
         for bname in bone_names_ordered:
-            tail_j = bone_to_joint.get(bname)
+            tail_j = bone_names_tree[bname]['joints'][1] # index of tail joint controlled by this bone
             head_j = joint_to_parent.get(tail_j, -1)
             head_pos = Vector(joints[head_j])
             tail_pos = Vector(joints[tail_j])
@@ -1928,6 +1869,11 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
 
             global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
             global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
+
+            exporter_root_head_world = arm_eval.matrix_world @ pb_root.head
+            exporter_root_mat_trans = arm_eval.matrix_world @ pb_root.matrix.to_translation()
+            self.report({'INFO'}, f"exporter_root_head_world {exporter_root_head_world}")
+            self.report({'INFO'}, f"exporter_root_mat_trans {exporter_root_mat_trans}")
 
             body_pose = []
             body_bone_length = []
@@ -2012,8 +1958,324 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
 
 
 
+# --------------------------- Pose Time Series to Animation OPerator --------------------------
 
-# --------------------------- Registration ----------------------------------
+
+def _expmap_to_rotation_matrix_4x4(exp_map_vec):
+    """Convert an exponential-map 3-vector into a 4x4 rotation matrix (no translation)."""
+    v = Vector(exp_map_vec)
+    angle = v.length
+    if angle == 0.0:
+        return Matrix.Identity(4)
+    axis = v / angle
+    return Matrix.Rotation(angle, 4, axis)
+
+def _matrix3_from_rows(rows):
+    """Build a 3x3 Matrix from nested list-of-rows as stored in get_mesh_json."""
+    return Matrix(((rows[0][0], rows[0][1], rows[0][2]),
+                   (rows[1][0], rows[1][1], rows[1][2]),
+                   (rows[2][0], rows[2][1], rows[2][2])))
+
+def _ensure_collection(name):
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        coll = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(coll)
+    return coll
+
+def create_animation_from_pose_time_series(context, timeseries_path):
+    """
+    Reads a timeseries JSON and creates a reconstruction in 'Reconstructions' using
+    per-bone rest-rotation matrices (rest_rot) to conjugate/export rotations exactly.
+    Returns (new_arm_obj, new_mesh_obj).
+    """
+    scene = context.scene
+    p = scene.synth_props
+
+    # 1) load timeseries JSON
+    with open(timeseries_path, 'r') as f:
+        ts = json.load(f)
+
+    meta = ts.get('meta', {})
+    bone_order_ts = meta.get('bone_order')
+
+    mesh_info = get_mesh_json(context)
+
+    bone_order_mesh = mesh_info['bone_order']
+    bone_names_tree = mesh_info['bone_names_tree']   # each node has p,c,joints,rest_rot_world (3x3 lists)
+    virtual_bone_names = set(mesh_info.get('virtual_bone_names', []))
+    bone_to_joint = {bname: data['joints'][1] for bname, data in bone_names_tree.items()}
+    joints = mesh_info['J']
+    kintree_parent = mesh_info['kintree_table'][0]
+
+    # we'll use meta bone order (the exporter order). We warn if it differs from current mesh
+    exported_bone_order = bone_order_ts
+    if exported_bone_order != bone_order_mesh:
+        print("Warning: timeseries bone order differs from mesh bone order; proceeding with timeseries order.")
+
+    # 3) locate source object + its armature
+    col = bpy.data.collections.get(p.collection_name)
+    if col is None:
+        raise ValueError(f"Collection '{p.collection_name}' not found")
+    src_obj = col.objects.get(p.object_name)
+    if src_obj is None:
+        raise ValueError(f"Object '{p.object_name}' not found in collection '{p.collection_name}'")
+
+    src_arm = None
+    for mod in src_obj.modifiers:
+        if mod.type == 'ARMATURE' and mod.object:
+            src_arm = mod.object
+            break
+    if src_arm is None:
+        raise ValueError("Source object has no armature modifier.")
+
+    # 4) duplicate object and armature into Reconstructions collection
+    recon_coll = _ensure_collection("Reconstructions")
+
+    new_obj = src_obj.copy()
+    new_obj.data = src_obj.data.copy()
+    recon_coll.objects.link(new_obj)
+
+    new_arm = src_arm.copy()
+    new_arm.data = src_arm.data.copy()
+    recon_coll.objects.link(new_arm)
+
+    # make mesh point to duplicated armature
+    for mod in new_obj.modifiers:
+        if mod.type == 'ARMATURE':
+            mod.object = new_arm
+
+    # 5) create action on duplicated armature
+    action = bpy.data.actions.new(name=f"recon_action_{new_arm.name}")
+    new_arm.animation_data_create()
+    new_arm.animation_data.action = action
+
+    pose_bones = new_arm.pose.bones
+    pose_bone_names = {pb.name for pb in pose_bones}
+
+    # helper: get rest head->tail vector (object-space) using J & kintree
+    def rest_head_tail_vector_for_bonename(bname):
+        tail_idx = bone_to_joint.get(bname, None)
+        parent_idx = kintree_parent[tail_idx]
+        if parent_idx is None or parent_idx < 0:
+            return Vector((0.0, 0.1, 0.0))
+        head_pos = Vector(joints[parent_idx])
+        tail_pos = Vector(joints[tail_idx])
+        return (tail_pos - head_pos)
+
+    # precompute rest vectors and rest rotations (as 3x3 Matrices) for all exported bones
+    bone_rest_vec = {}
+    bone_rest_R_world = {}   # 3x3 Matrix for each exported bone
+    for bname in exported_bone_order:
+        bone_rest_vec[bname] = rest_head_tail_vector_for_bonename(bname)
+        rows = bone_names_tree[bname]['rest_rot_world']
+        bone_rest_R_world[bname] = _matrix3_from_rows(rows)
+
+    arm_world = new_arm.matrix_world
+
+    # iterate frames and set pose
+    for frame_entry in ts['frames']:
+        frame_idx = int(frame_entry['frame'])
+        frame_num = frame_idx
+
+        # root global transform from timeseries
+        global_t = Vector(frame_entry['global_t'])
+        global_ori_exp = Vector(frame_entry['global_ori'])
+        root_rot_4 = _expmap_to_rotation_matrix_4x4(global_ori_exp)
+        root_world_frame = Matrix.Translation(global_t) @ root_rot_4
+
+        # start chain with root_world_frame as parent_world
+        parent_world = root_world_frame
+
+        body_pose_list = frame_entry.get('body_pose', [])
+        body_len_list = frame_entry.get('body_bone_length', [])
+
+        # iterate exported bones in order
+        for i, bname in enumerate(exported_bone_order):
+            if i == 0:
+                # root: set its pose bone transform if present
+                if bname in pose_bone_names:
+                    pb = pose_bones[bname]
+                    pb.matrix = arm_world.inverted() @ parent_world
+                    pb.rotation_mode = 'QUATERNION'
+                    pb.keyframe_insert(data_path="location", frame=frame_num)
+                    pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+                # continue, parent_world remains as is
+                continue
+
+            entry_idx = i - 1
+            rel_exp = Vector((0.0, 0.0, 0.0))
+            length_scale = 1.0
+            if entry_idx < len(body_pose_list):
+                rel_exp = Vector(body_pose_list[entry_idx])
+                if entry_idx < len(body_len_list):
+                    length_scale = float(body_len_list[entry_idx])
+
+            # convert rel exponential map to rotation (4x4)
+            R_rel_local_4 = _expmap_to_rotation_matrix_4x4(rel_exp)   # rotation expressed in parent's local pose axes (as exported)
+
+            # Now *conjugate* rel rotation into world frame using parent's rest_rot:
+            # R_parent_rest_world (3x3) is the parent's rest rotation in world coordinates.
+            # Convert it to 4x4 for conjugation
+            R_parent_rest_3 = bone_rest_R_world.get(exported_bone_order[i-1], Matrix.Identity(3))
+            R_parent_rest_4 = R_parent_rest_3.to_4x4()
+            try:
+                R_parent_rest_inv_4 = R_parent_rest_4.inverted()
+            except Exception:
+                R_parent_rest_inv_4 = R_parent_rest_4.copy()  # fallback (shouldn't happen)
+
+            # conjugate: R_rel_world = R_parent_rest * R_rel_local * R_parent_rest^-1
+            R_rel_world_4 = R_parent_rest_4 @ R_rel_local_4 @ R_parent_rest_inv_4
+
+            # Build translation: rotate rest vector and scale it
+            rest_vec = bone_rest_vec.get(bname, Vector((0.0, 0.1, 0.0)))
+            # rotate using rotation part of R_rel_world_4
+            translated = (R_rel_world_4.to_3x3() @ (rest_vec * length_scale))
+
+            rel_mat = Matrix.Translation(translated) @ R_rel_world_4
+
+            # compute child_world by chaining
+            child_world = parent_world @ rel_mat
+
+            # if virtual bone, advance chain but do not set pose
+            if bname in virtual_bone_names:
+                parent_world = child_world
+                continue
+
+            # else real bone: set pose_bone such that arm_world @ pb.matrix == child_world
+            if bname not in pose_bone_names:
+                # missing on duplicated armature: advance chain
+                parent_world = child_world
+                continue
+
+            pb = pose_bones[bname]
+            pb.matrix = arm_world.inverted() @ child_world
+            pb.rotation_mode = 'QUATERNION'
+            pb.keyframe_insert(data_path="location", frame=frame_num)
+            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+
+            # advance chain
+            parent_world = child_world
+
+    # finalize
+    new_arm.animation_data.action = action
+    bpy.context.view_layer.update()
+
+    return new_arm, new_obj
+
+# ----------------------
+# Operator: file selector wrapper
+# ----------------------
+class SYNTH_OT_create_animation_from_pose_time_series(Operator, ImportHelper):
+    """Create animation on duplicated object from pose_time_series.json"""
+    bl_idname = "synth.create_animation_from_pose_time_series"
+    bl_label = "Create Animation from Pose Time Series"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # ImportHelper provides a filepath property
+    filename_ext = ".json"
+    filter_glob: StringProperty(
+        default="pose_time_series_*.json;*.json",
+        options={'HIDDEN'}
+    )
+
+    def execute(self, context):
+        try:
+            new_arm, new_obj = create_animation_from_pose_time_series(context, self.filepath)
+            self.report({'INFO'}, f"Created reconstruction '{new_obj.name}' with animated armature '{new_arm.name}' in collection 'Reconstructions'")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create animation: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        # show the file selector
+        wm = context.window_manager
+        wm.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+    
+
+
+
+
+# --------------------------- UI & Registration ----------------------------------
+
+class SYNTH_PT_main_panel(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Synthetic Data'
+    bl_label = 'Synthetic Data Generator'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        p = scene.synth_props
+        box = layout.box()
+        box.label(text="Output Paths")
+        box.prop(p, 'render_out_dir')
+        box.prop(p, 'annot_out_dir')
+        box.prop(p, 'kpt_label_dir')
+        box.prop(p, 'mask_label_dir')
+        box = layout.box()
+        box.label(text="Render / Image")
+        box.prop(p, 'render_scale')
+        row = box.row(align=True)
+        row.prop(p, 'image_width_px')
+        row.prop(p, 'image_height_px')
+        box = layout.box()
+        box.label(text="Target Object & Keypoints")
+        box.prop(p, 'collection_name')
+        box.prop(p, 'object_name')
+        box.prop(p, 'keypoint_list_csv')
+        box.operator('synth.export_keypoint_list', icon='EXPORT')
+        box = layout.box()
+        box.label(text="Behaviour")
+        box.prop(p, 'render_binary')
+        box.prop(p, 'use_compositor')
+        box = layout.box()
+        box.label(text="Keypoint Options")
+        box.prop(p, 'check_keypoint_visibility')
+        box.prop(p, 'keypoint_visible_threshold')
+        box.prop(p, 'keep_occluded_keypoints')
+        box.prop(p, 'draw_every_keypoint_vertex')
+        box.prop(p, 'draw_every_keypoint_face')
+        box.prop(p, 'draw_lattice_for_kpt_annot')
+        box = layout.box()
+        box.label(text="Misc")
+        box.prop(p, 'create_annotated_images')
+        box.prop(p, 'create_yolo_datasets')
+        box.prop(p, 'event_timer_interval')
+        row = layout.row()
+        row.operator('synth.apply_settings', icon='CHECKMARK')
+        row.operator('synth.load_config', icon='IMPORT')
+        row = layout.row()
+        row.operator('render.timed_render', icon='RENDER_STILL')
+        row.operator('synth.unregister_timed_render', icon='CANCEL')
+        row.operator('synth.create_videos', icon='SEQUENCE')
+        row = layout.row()
+        row.operator('synth.export_camera_matrices', icon='FILE_FOLDER')
+        row.operator('synth.export_mesh', icon='FILE_FOLDER')
+        row = layout.row()
+        row.operator('synth.export_pose_time_series_json', icon='SEQUENCE')
+        row.operator('synth.create_animation_from_pose_time_series', icon='IMPORT')
+
+
+class SYNTH_OT_unregister_timed_render(Operator):
+    bl_idname = "synth.unregister_timed_render"
+    bl_label = "Unregister TimedRender"
+
+    def execute(self, context):
+        try:
+            bpy.utils.unregister_class(TimedRender)
+            self.report({'INFO'}, 'Unregistered TimedRender')
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'WARNING'}, f'Failed to unregister TimedRender: {e}')
+            return {'CANCELLED'}
+
+
 classes = (
     SYNTH_PropertyGroup,
     SYNTH_OT_apply_settings,
@@ -2026,6 +2288,7 @@ classes = (
     SYNTH_OT_export_mesh,
     SYNTH_OT_create_videos,
     SYNTH_OT_export_pose_time_series_json,
+    SYNTH_OT_create_animation_from_pose_time_series,
 )
 
 

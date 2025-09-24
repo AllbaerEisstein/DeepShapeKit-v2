@@ -31,7 +31,7 @@ class LBS():
         self.n_body_joints = J.shape[1] - 1
 
         self.joints_homog = F.pad((J[:, parent_indices[1:]]).unsqueeze(-1), [0, 0, 0, 1], value=0)
-        # kin_tree: positions of the body joints (first joint excluded!) relative to their parents
+        # body_joint_locs_rel_to_parents: positions of the body joints (first joint excluded!) relative to their parents
         # ---> len(locs_rel_to_parents) = n_joints-1 = n_bones
         self.body_joint_locs_rel_to_parents = (J[:, 1:] - J[:, parent_indices[1:]]).unsqueeze(-1)
 
@@ -49,7 +49,6 @@ class LBS():
         batch_size = len(V)
         device = global_ori_plus_body_pose.device
         V_homog = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
-        # TODO: used to cut the first bone: bone[:, 1:, None, None]
         # print(f"LBS: locs_rel_to_parents shape: {self.body_joint_locs_rel_to_parents.size()}")
         # print(f"LBS: all_bone_length shape: {all_bone_length.size()}")
         # print(f"LBS: global_ori_plus_body_pose shape: {global_ori_plus_body_pose.size()}")
