@@ -416,7 +416,7 @@ def get_mesh_json(context):
     def tail_pos(b): return b.tail_local.copy()
 
     # BFS traversal to preserve topology order
-    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'bone_rest_rot': []} for b in bone_list} # very inefficient way to store a tree
+    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot_world': []} for b in bone_list} # very inefficient way to store a tree
     ordered_bones = []
     queue = roots[:]
     while queue:
@@ -425,7 +425,7 @@ def get_mesh_json(context):
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
         bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
         rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
-        bone_names_tree[b.name]['bone_rest_rot'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
+        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
         for ch in b.children:
             queue.append(ch)
             bone_names_tree[b.name]['c'].append(ch.name)
@@ -434,6 +434,35 @@ def get_mesh_json(context):
     joint_positions = []
     joint_names = []
     parent_indices = []
+
+    def get_virtual_bone_world_space_matrix_from_bones(parentb, childb):
+        parent_world_tail = arm.matrix_world @ tail_pos(parentb)   # world-space parent tail
+        child_world_head  = arm.matrix_world @ head_pos(childb)          # world-space child head
+        dir_world = child_world_head - parent_world_tail
+        y = dir_world.normalized()   # virtual bone +Y in world
+        # choose a stable roll reference in world space using parent's REST axes:
+        parent_rest_R_world = bone_names_tree[parentb.name]['rest_rot_world']  # 3x3
+        # try parent's rest Z (local +Z) first:
+        parent_z = parent_rest_R_world @ Vector((0.0, 0.0, 1.0))
+        # if nearly parallel to y, try parent local X
+        if abs(parent_z.normalized().dot(y)) > 0.999:
+            parent_x = parent_rest_R_world @ Vector((1.0, 0.0, 0.0))
+            # compute Z = parent_x × Y (ensure orthogonality). error out if Z is degenerate
+            z = parent_x.cross(y)
+            if z.length < 1e-8:
+                raise Exception(f"z-axis is degenerate while constructing rest_rot_world for bone {childb.name}")
+            z.normalize()
+            x = y.cross(z)
+            virtual_rest_R_world = Matrix((x, y, z)).transposed()
+        else:
+            # compute X = parent_z × Y (ensure orthogonality). error out if X is degenerate
+            x = parent_z.cross(y)
+            if x.length < 1e-8:
+                raise Exception(f"x-axis is degenerate while constructing rest_rot_world for bone {childb.name}")
+            x.normalize()
+            z = y.cross(x)
+            virtual_rest_R_world = Matrix((x, y, z)).transposed()
+        return virtual_rest_R_world
 
 
     def key_from_vec(v, prec=6):
@@ -466,6 +495,7 @@ def get_mesh_json(context):
         child_head_key = key_from_vec(head_pos(b))
         if p_tail_key != child_head_key:
             vname = f"virtual_{b.parent.name}_to_{b.name}"
+            virtual_bone_names.append(vname)
             # in bone-tree, replace entry for original child bone with entry for virtual bone (insert node and edge into tree)
             bone_names_tree[vname] = {
                     'p': b.parent.name, 'c': [b.name], 
@@ -474,14 +504,9 @@ def get_mesh_json(context):
                 }
             bone_names_tree[b.name]['p'] = vname
             bone_names_tree[b.parent.name]['c'] = [vname if c == b.name else c for c in bone_names_tree[b.parent.name]['c']]
-            virtual_bone_names.append(vname)
 
-            # parent_rest_R_world and child_rest_R_world obtained as above for their real bones:
-            parent_rest_R_world = (arm.matrix_world @ b.parent.matrix_local).to_3x3()
-            child_rest_R_world  = (arm.matrix_world @ b.matrix_local).to_3x3()
-            # relative rotation (parent_tail_frame -> child_head_frame) in world coordinates:
-            virtual_rest_R_world = parent_rest_R_world.inverted() @ child_rest_R_world
-            bone_names_tree[vname]['bone_rest_rot'] = virtual_rest_R_world
+            virtual_rest_R_world = get_virtual_bone_world_space_matrix_from_bones(b.parent, b)
+            bone_names_tree[vname]['rest_rot_world'] = virtual_rest_R_world
     
     # topo-sort the tree and add joint information, in the same go create joint indexing and joint parent information
     # this ensures indexing of joints that corresponds to the bone hierarchy
@@ -562,7 +587,7 @@ def get_mesh_json(context):
                 'p': data['p'],
                 'c': data['c'],
                 'joints': data['joints_idx'],
-                'rest_rot_world': [[float(c) for c in row] for row in data['bone_rest_rot']]
+                'rest_rot_world': [[float(c) for c in row] for row in data['rest_rot_world']]
             }
             for bone_name, data in bone_names_tree.items()
         },                                       # a tree-dict of parents, children and joint indices of bones
@@ -1855,6 +1880,73 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
             arm_eval = arm_obj.evaluated_get(deps)
             pose_bones = arm_eval.pose.bones
 
+            def get_virtual_bone_arm_space_matrix(virtual_bname):
+                if virtual_bname not in virtual_bone_names:
+                    self.report({'ERROR'}, f"Tried to construct virtual arm space matrix for {virtual_bname} which is not a virtual bone")
+                    raise Exception
+                p_name = bone_names_tree[virtual_bname]['p']
+                c_name = bone_names_tree[virtual_bname]['c'][0]
+                # ensure parent & child pose bones exist
+                if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
+                    self.report({'ERROR'}, f"Virtual bone {virtual_bname} refers to missing pose bones at frame {frame}")
+                    raise Exception
+                parent_pb = pose_bones[p_name]
+                child_pb = pose_bones[c_name]
+                # parent tail and child head in armature space
+                parent_tail_arm = Vector(parent_pb.tail)
+                child_head_arm = Vector(child_pb.head)
+                # direction vector in armature space (virtual bone's +Y)
+                dir_vec = child_head_arm - parent_tail_arm
+                dir_len = dir_vec.length
+                # Prepare parent rest rotation in armature space (3x3)
+                # bone_names_tree[p_name]['rest_rot'] is stored as 3x3 row lists (world-space)
+                rest_rot_rows = bone_names_tree.get(p_name, {}).get('rest_rot', None)
+                if rest_rot_rows is not None:
+                    # convert rows -> 3x3 Matrix (world)
+                    parent_rest_R_world = Matrix((
+                        (rest_rot_rows[0][0], rest_rot_rows[0][1], rest_rot_rows[0][2]),
+                        (rest_rot_rows[1][0], rest_rot_rows[1][1], rest_rot_rows[1][2]),
+                        (rest_rot_rows[2][0], rest_rot_rows[2][1], rest_rot_rows[2][2]),
+                    ))
+                    # convert to armature-space by pre-multiplying with arm_world_inv
+                    arm_world_inv_3 = arm_obj.matrix_world.inverted().to_3x3()
+                    parent_rest_R_arm = arm_world_inv_3 @ parent_rest_R_world
+                else:
+                    parent_rest_R_arm = Matrix.Identity(3)
+                if dir_len < 1e-8:
+                    # degenerate: child head coincident with parent tail -> use parent's rotation
+                    artificial_rot_3 = parent_pb.matrix.to_3x3()
+                else:
+                    y_axis = dir_vec.normalized()
+                    # pick stable reference from parent's REST axes in armature space
+                    # try parent's rest Z (bone local +Z) in armature space
+                    ref_candidate = parent_rest_R_arm @ Vector((0.0, 0.0, 1.0))
+                    # if parallel to y_axis, try local X
+                    if abs(ref_candidate.normalized().dot(y_axis)) > 0.999:
+                        ref_candidate = parent_rest_R_arm @ Vector((1.0, 0.0, 0.0))
+                        # compute z = ref × y, normalize. If degenerate, error out
+                        z_axis = ref_candidate.cross(y_axis)
+                        if z_axis.length < 1e-8:
+                            self.report({'ERROR'}, f"Failed to construct coordinate frame for virtual bone {virtual_bname}: failed to construct z axis")
+                            raise Exception
+                        else:
+                            z_axis.normalize()
+                        x_axis = y_axis.cross(z_axis)
+                    else:
+                        x_axis = ref_candidate.cross(y_axis)
+                        if x_axis.length < 1e-8:
+                            self.report({'ERROR'}, f"Failed to construct coordinate frame for virtual bone {virtual_bname}: failed to construct x axis")
+                            raise Exception
+                        else:
+                            x_axis.normalize()
+                        z_axis = y_axis.cross(x_axis)
+                    # assemble rotation matrix with columns [x, y, z] (local->armature)
+                    # Matrix expects rows; building from column vectors and transposing
+                    artificial_rot_3 = Matrix((x_axis, y_axis, z_axis)).transposed()
+                # build artificial 4x4 matrix in armature space: translation = parent_tail_arm, rotation = artificial_rot_3
+                artificial_virtual_mat = Matrix.Translation(parent_tail_arm) @ artificial_rot_3.to_4x4()
+                return artificial_virtual_mat
+
             # root: first bone in bone_names must be a real bone (it was originally from ordered bones)
             first_bone = bone_names_ordered[0]
             if first_bone not in pose_bones:
@@ -1870,74 +1962,81 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
             global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
             global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
 
-            exporter_root_head_world = arm_eval.matrix_world @ pb_root.head
-            exporter_root_mat_trans = arm_eval.matrix_world @ pb_root.matrix.to_translation()
-            self.report({'INFO'}, f"exporter_root_head_world {exporter_root_head_world}")
-            self.report({'INFO'}, f"exporter_root_mat_trans {exporter_root_mat_trans}")
-
             body_pose = []
             body_bone_length = []
 
             # iterate bone_names in order, skipping the first (root)
-            for bname in bone_names_ordered[1:]:
-                # Real bone: present in pose_bones
-                if bname in pose_bones:
-                    pb = pose_bones[bname]
-                    parent_pb = pb.parent
-                    if parent_pb is None:
-                        self.report({'ERROR'}, f"Pose bone {bname} unexpectedly has no parent at frame {frame}")
+            queue = [node for node, p_c_dict in bone_names_tree.items() if not p_c_dict['p']]
+            while queue:
+                bname = queue.pop(0)
+                if bone_names_tree[bname]['p'] != '': # skip root bone (root bone was captured through global_ori, global_t)
+
+                    # Real bone: present in pose_bones
+                    if bname in pose_bones:
+                        pb = pose_bones[bname]
+                        parent_bname = bone_names_tree[bname]['p']
+                        if parent_bname in pose_bones:
+                            parent_pb_matrix = pose_bones[parent_bname].matrix
+                        elif parent_bname in virtual_bone_names:
+                            # construct matrix of virtual bone parent
+                            try:
+                                parent_pb_matrix = get_virtual_bone_arm_space_matrix(parent_bname)
+                            except Exception:
+                                return {'CANCELLED'}
+                        else:
+                            self.report({'ERROR'}, f"Pose bone {bname} unexpectedly has no parent at frame {frame}")
+                            return {'CANCELLED'}
+                        rel_mat = parent_pb_matrix.inverted() @ pb.matrix
+                        q = rel_mat.to_3x3().to_quaternion()
+                        exp_map = q.to_exponential_map()
+                        body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
+
+                        # length scaling using world head/tail
+                        world_head = arm_eval.matrix_world @ Vector(pb.head)
+                        world_tail = arm_eval.matrix_world @ Vector(pb.tail)
+                        cur_len = float((world_tail - world_head).length)
+                        rest_len = bone_name_2_rest_length.get(bname, 1.0)
+                        length_factor = cur_len / rest_len if rest_len != 0 else 1.0
+                        body_bone_length.append(length_factor)
+
+                    # Virtual bone
+                    elif bname in virtual_bone_names:
+                        p_name = bone_names_tree[bname]['p']
+                        c_name = bone_names_tree[bname]['c'][0]
+                        # ensure parent & child pose bones exist
+                        if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
+                            self.report({'ERROR'}, f"Virtual bone {bname} refers to missing pose bones at frame {frame}")
+                            raise Exception
+                        parent_pb = pose_bones[p_name]
+                        child_pb = pose_bones[c_name]
+                        # parent tail and child head in armature space
+                        parent_tail_arm = Vector(parent_pb.tail)
+                        child_head_arm = Vector(child_pb.head)
+                        # Now compute rel_mat exactly like for real bones
+                        try:
+                            rel_mat = parent_pb.matrix.inverted() @ get_virtual_bone_arm_space_matrix(bname)
+                        except Exception:
+                            return {'CANCELLED'}
+
+                        # extract rotation as exponential map
+                        q = rel_mat.to_3x3().to_quaternion()
+                        exp_map = q.to_exponential_map()
+                        body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
+
+                        # length scaling in world space
+                        world_parent_tail = arm_eval.matrix_world @ parent_tail_arm
+                        world_child_head = arm_eval.matrix_world @ child_head_arm
+                        cur_dist = float((world_child_head - world_parent_tail).length)
+                        rest_len = bone_name_2_rest_length.get(bname, 1.0)
+                        length_factor = cur_dist / rest_len if rest_len != 0 else 1.0
+                        body_bone_length.append(length_factor)
+                    
+                    else:
+                        self.report({'ERROR'}, f"Bone {bname} appears in neither pose_bones nor virtual_bone_names")
                         return {'CANCELLED'}
-                    rel_mat = parent_pb.matrix.inverted() @ pb.matrix
-                    q = rel_mat.to_3x3().to_quaternion()
-                    exp_map = q.to_exponential_map()
-                    body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
-
-                    # length scaling using world head/tail
-                    world_head = arm_eval.matrix_world @ Vector(pb.head)
-                    world_tail = arm_eval.matrix_world @ Vector(pb.tail)
-                    cur_len = float((world_tail - world_head).length)
-                    rest_len = bone_name_2_rest_length.get(bname, 1.0)
-                    length_factor = cur_len / rest_len if rest_len != 0 else 1.0
-                    body_bone_length.append(length_factor)
-                    continue
-
-                # Virtual bone
-                if bname in virtual_bone_names:
-                    p_name = bone_names_tree[bname]['p']
-                    c_name = bone_names_tree[bname]['c'][0]
-                    # ensure parent & child pose bones exist
-                    if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
-                        self.report({'ERROR'}, f"Virtual bone {bname} refers to missing pose bones at frame {frame}")
-                        return {'CANCELLED'}
-
-                    parent_pb = pose_bones[p_name]
-                    child_pb = pose_bones[c_name]
-
-                    # build frames at parent tail and child head (armature space -> world)
-                    parent_tail = Vector(parent_pb.tail)
-                    child_head = Vector(child_pb.head)
-                    parent_rot_world = (arm_eval.matrix_world @ parent_pb.matrix).to_3x3().to_4x4()
-                    child_rot_world = (arm_eval.matrix_world @ child_pb.matrix).to_3x3().to_4x4()
-                    world_parent_tail = arm_eval.matrix_world @ parent_tail
-                    world_child_head = arm_eval.matrix_world @ child_head
-
-                    parent_tail_frame_world = Matrix.Translation(world_parent_tail) @ parent_rot_world
-                    child_head_frame_world = Matrix.Translation(world_child_head) @ child_rot_world
-
-                    rel_mat = parent_tail_frame_world.inverted() @ child_head_frame_world
-                    q = rel_mat.to_3x3().to_quaternion()
-                    exp_map = q.to_exponential_map()
-                    body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
-
-                    cur_dist = float((world_child_head - world_parent_tail).length)
-                    rest_len = bone_name_2_rest_length.get(bname, 1.0)
-                    length_factor = cur_dist / rest_len if rest_len != 0 else 1.0
-                    body_bone_length.append(length_factor)
-                    continue
-
-                # neither real nor virtual (shouldn't happen)
-                body_pose.append([0.0, 0.0, 0.0])
-                body_bone_length.append(1.0)
+                    
+                for ch in bone_names_tree[bname]['c']:
+                    queue.append(ch)
 
             frame_entry = {
                 "frame": int(frame),
@@ -2103,7 +2202,7 @@ def create_animation_from_pose_time_series(context, timeseries_path):
                 # continue, parent_world remains as is
                 continue
 
-            entry_idx = i - 1
+            entry_idx = i - 1 # root bone is excluded from body pose, thus decrement index
             rel_exp = Vector((0.0, 0.0, 0.0))
             length_scale = 1.0
             if entry_idx < len(body_pose_list):
