@@ -18,21 +18,15 @@ from src.fish_model_edit import fish_model
 from src.losses import camera_fitting_loss
 from src.geometry import perspective_projection
 import src.multiview_utils_edit as mutils
-import src.constants as c
 from src.pose_optimizer_edit import OptimizeMV
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
+from src.CameraGroups import CameraGroup, _camera_group_from_args
 
 
 def fit_geometry(
     fish: fish_model,
     keypoints: torch.Tensor,
-    Ps: torch.Tensor, 
-    Ks: torch.Tensor, 
-    Rs: torch.Tensor, 
-    Ts: torch.Tensor, 
-    focals: torch.Tensor, 
-    distortions: torch.Tensor,
-    principal_points: torch.Tensor, 
+    cameras: CameraGroup,
     init_pose: Optional[torch.Tensor] = None,
     init_body_bone_l: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -41,7 +35,7 @@ def fit_geometry(
     Input:
         fish: fish model
         keypoints (vn, kn, 3): 2d keypoints from each view with hard confidence
-        Ps (vn, 3, 4): camera projection matrices for each view
+        cameras: camera parameters for each view
     """
 
     # 3D kpts on bird
@@ -55,7 +49,8 @@ def fit_geometry(
         fish_mesh_kpts_local = fish_articulated["keypoints"][0]
 
     # Triangulation with LBFGS
-    observed_kpts_3d = mutils.get_gt_3d(keypoints, Ps, Ks, Rs, Ts, focals, principal_points, distortions, LBFGS=True)
+    camera_group = _camera_group_from_args(cameras).to(keypoints.device)
+    observed_kpts_3d = mutils.get_gt_3d(keypoints, camera_group, LBFGS=True)
 
     valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0
     valid_kpts_3d = observed_kpts_3d[valid_kpts_3d_boolmask, :3]
@@ -76,13 +71,7 @@ def fit_geometry(
 def fit_mesh(
     fish: fish_model,
     optimizer: OptimizeMV,
-    Ps: torch.Tensor, 
-    Ks: torch.Tensor, 
-    Rs: torch.Tensor, 
-    Ts: torch.Tensor, 
-    focals: torch.Tensor, 
-    distortions: torch.Tensor,
-    principal_points: torch.Tensor,
+    cameras: CameraGroup,
     keypoints: torch.Tensor,
     masks: torch.Tensor,
     renderer: Silhouette_Renderer,
@@ -98,17 +87,18 @@ def fit_mesh(
     """
     Only used in multiview and crossview fitting:
     Input:
+        cameras: camera parameters for each view
         init_pose (vn, 4*3): body pose in axis-angle (exclude root joint orient)
         init_bone (vn, 4): bone length
     """
     # move to device
-    keypoints, masks, Ps, Ks, Rs, Ts, focals, principal_points, distortions = keypoints.to(device), masks.to(device), Ps.to(device), Ks.to(device), Rs.to(device), Ts.to(device), focals.to(device), principal_points.to(device), distortions.to(device)
+    camera_group = _camera_group_from_args(cameras).to(device)
+    Ps = camera_group.P
+    keypoints = keypoints.to(device)
+    masks = masks.to(device)
     fish.to_device(device)
-    cam_params = [Ps, Ks, Rs, Ts, focals, distortions, principal_points]
-    assert (
-        all(keypoints.device == param.device for param in cam_params+[masks, fish])
-        and fish.device_active == True
-    ), "keypoints, Ps, Ks, Rs, Ts, focals, centers, distortions, masks, fish must be on the same device as specified"
+    assert keypoints.shape[0] == Ps.shape[0], "camera batch size must match keypoints"
+    assert fish.device_active, "fish model must be on target device"
 
     if (
         init_global_ori != None
@@ -125,7 +115,7 @@ def fit_mesh(
     ### Triangulation + Procrustes as initialization
     if init_global_ori == None and init_t == None and init_s == None:
         init_global_ori, init_t, init_s = fit_geometry(
-            fish, keypoints, *cam_params, init_pose=init_body_pose, init_body_bone_l=init_body_bone_length
+            fish, keypoints, camera_group, init_pose=init_body_pose, init_body_bone_l=init_body_bone_length
         )
 
     ### If not provided (as in multiview), initialize with canonical
@@ -142,10 +132,10 @@ def fit_mesh(
     init_s = init_s.float().to(device)
     init_t = init_t.float().to(device)
 
-    assert (
-        all(keypoints.device == param.device for param in cam_params+[masks, fish, init_ori_plus_pose, init_body_bone_length, init_s, init_t])
-        and fish.device_active == True
-    ), "All inputs must be on the same device as specified"
+    assert all(
+        tensor.device == keypoints.device
+        for tensor in (masks, Ps, init_ori_plus_pose, init_body_bone_length, init_s, init_t)
+    ), "All inputs must reside on the target device"
 
     ### Mesh fitting
     vertices, global_ori_plus_pose_est, body_bone_est, scale_est, t, losses = optimizer(

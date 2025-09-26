@@ -81,9 +81,9 @@ class fish_model:
         self.J = torch.tensor(dd["J"]).unsqueeze(0) # (1,J,3)
         self.V = torch.tensor(dd["V"]).unsqueeze(0) # (1,V,3)
 
-        # # local coords, relative to head
-        # self.V = self.V - self.J[0, 0]
-        # self.J = self.J - self.J[0, 0]
+        # local coords, relative to head
+        self.V = self.V - self.J[0, 0]
+        self.J = self.J - self.J[0, 0]
 
         # scaling, unit conversion
         self.V = self.V #* 0.01

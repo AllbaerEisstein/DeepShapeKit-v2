@@ -9,9 +9,8 @@ from pytorch3d.renderer import (
     MeshRasterizer,
     BlendParams,
 )
-from pytorch3d.renderer.fisheyecameras import FishEyeCameras
-
-from src.constants_edit import CV_2_PYTORCH3D, BLENDERCAM_2_PYTORCH3D
+from src.constants_edit import *
+from src.CameraGroups import CameraGroup, _camera_group_from_args
 
 
 class Silhouette_Renderer:
@@ -22,92 +21,46 @@ class Silhouette_Renderer:
     def __init__(
         self,
         device: str,
-        image_size: torch.Tensor,
-        Ks: torch.Tensor,
-        Rs: torch.Tensor,
-        ts: torch.Tensor,
-        focals: torch.Tensor,
+        camera_group: CameraGroup,
     ):
-        """
-        Args:
-            image_size (2): rendered image pixel width and pixel height (expected to be uniform for all views)
-            Ks (cn, 3, 3): intrinsic camera matrices for cn different cameras
-            Rs (cn, 3, 3): rotation matrices in world coordinates for cn different cameras in the same reference frame
-            ts (cn, 3): translation from world reference frame to the camera position of cn different cameras
-            focals (cn): focal lengths (mm) of cn different cameras
-        """
-        assert all(Ks.shape[0] == param.shape[0] for param in [Rs, ts, focals]), "each camera needs one each of the parameters K, R, T, focal"
-        self.n_batches = Rs.size(0)
-        # move to device
+        """Initialise a differentiable silhouette renderer for a batch of cameras."""
         self.device = torch.device(device)
-        Ks = Ks.to(self.device)
-        Rs = Rs.to(self.device)
-        ts = ts.to(self.device)
-        focals = focals.to(self.device)
-        self.image_size = image_size.to(device=self.device)
+        camera_group = _camera_group_from_args(camera_group).to(self.device)
 
-        # Transform to PyTorch3D-conventions (x left, y up, z forward)
-        # --- input R and t are expected to transform from Blender world (x right, y forward, z up) to CV (x right, y down, z forward).
-        # --- that means, a transformation from CV to PyTorch3D has to be appended.
-        # --- input K is expected to transform from CV camera (x right, y down, z forward) to CV image (x right, y down, z forward).
-        # --- that means, a transformation from CV to PyTorch3D has to be prepended.
-        Rs = BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=Rs.dtype).unsqueeze(0).expand(self.n_batches,-1,-1) @ Rs
-        ts = BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=ts.dtype) @ ts
-        Ks = Ks @ torch.linalg.inv(BLENDERCAM_2_PYTORCH3D.to(device=self.device, dtype=Ks.dtype)).unsqueeze(0).expand(self.n_batches,-1,-1)
-        # adjust principle points since the axes were flipped
-        Ks[:,0,2] = self.image_size[0].unsqueeze(0).expand(self.n_batches) - Ks[:,0,2]
-        Ks[:,1,2] = self.image_size[1].unsqueeze(0).expand(self.n_batches) - Ks[:,1,2]
+        self.n_batches = camera_group.batch_size
+        self.image_size = camera_group.image_size
 
-        # NOTE: every camera projection will be be rasterized to the same image size because this is a requirement for batch-rendering
-        principal_points = torch.stack((Ks[:,0,2],Ks[:,1,2]),dim=1)
+        Rs = BLENDERWORLD_2_PYTORCH3D.to(device=self.device, dtype=camera_group.R.dtype) @ camera_group.R
+        Rs = camera_group.R
+        ts = camera_group.T @ BLENDERWORLD_2_PYTORCH3D.to(device=self.device, dtype=camera_group.R.dtype).transpose(0,1)
+        principal_points = camera_group.principal_points
+        focal_lengths = camera_group.focal_lengths_px
+
+        focal_lengths = focal_lengths.to(self.device)
+        principal_points = principal_points.to(self.device)
+
+
         blend_params = BlendParams(sigma=1e-2, gamma=1e-4)
         raster_settings = RasterizationSettings(
-            image_size = (int(image_size[0]), int(image_size[1])),
-            blur_radius = 0.0,  # np.log(1./1e-4 - 1.) * blend_params.sigma,
-            faces_per_pixel = 1,
+            image_size=(int(self.image_size[0]), int(self.image_size[1])),
+            blur_radius=0.0,
+            faces_per_pixel=1,
         )
-        
-        # NOTE: Images are expected to be undistorted already
-        ## Legacy-code:
-        # if any([coeff > 0.0 for coeffs in distortions for coeff in coeffs]):
-        #     cameras = FishEyeCameras(
-        #         image_size = image_size,
-        #         focal_length = focals,
-        #         principal_point = principal_points,
-        #         radial_params = torch.cat((distortions[:,:2], distortions[:,4])),
-        #         tangential_params = distortions[:,2:4],
-        #         use_radial = True,
-        #         use_tangential = True,
-        #         R=Rs,
-        #         T=Ts,
-        #         world_coordinates = True,
-        #         use_thin_prism = False,
-        #         device = device,
-        #     )
-        #     print("Silhouette_Renderer: using fish-eye cameras")
-        # else:
 
-        # NOTE: Somehow, when the renderer is called, it expects K in the following shape:
-        # K = [
-        #     [fx,   0,   px,   0],
-        #     [0,   fy,   py,   0],
-        #     [0,    0,    0,   1],
-        #     [0,    0,    1,   0],
-        # ]
+        image_size_batch = self.image_size.unsqueeze(0).expand(self.n_batches, -1)
         cameras = PerspectiveCameras(
-            image_size=image_size.unsqueeze(0),
-            focal_length=focals,
+            image_size=image_size_batch,
+            focal_length=focal_lengths,
             principal_point=principal_points,
             R=Rs,
             T=ts,
             in_ndc=False,
-            device=self.device
+            device=self.device,
         )
-        # print("Silhouette_renderer: using perspective cameras")
         self.cameras = cameras
 
         self.silhouette_renderers = MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
+            rasterizer=MeshRasterizer(cameras=self.cameras, raster_settings=raster_settings),
             shader=SoftSilhouetteShader(blend_params=blend_params),
         )
 
@@ -129,9 +82,9 @@ class Silhouette_Renderer:
         if T.device != self.device:
             T = T.to(self.device)
 
-        vertices = vertices + T
+        vertices_translated = (vertices + T) #@ BLENDERWORLD_2_PYTORCH3D.to(device=self.device, dtype=vertices.dtype).transpose(0,1)
 
-        fish_mesh = Meshes(verts=vertices.repeat(self.n_batches, 1, 1), faces=faces.repeat(self.n_batches, 1, 1))
+        fish_mesh = Meshes(verts=vertices_translated.repeat(self.n_batches, 1, 1), faces=faces.repeat(self.n_batches, 1, 1))
 
         # TODO: What does silhouettes look like?
         silhouettes = self.silhouette_renderers(

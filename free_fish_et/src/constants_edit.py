@@ -61,8 +61,20 @@ BLENDERCAM_2_PYTORCH3D = torch.tensor([
     ( 0,  0, -1 )
 ])
 
+BLENDERWORLD_2_PYTORCH3D = torch.tensor([    
+    (-1,  0,  0 ),
+    ( 0,  0,  1 ),
+    ( 0,  1,  0 )
+])
+
 CV_2_PYTORCH3D = torch.tensor([
     (-1,  0,  0 ),
     ( 0, -1,  0 ),
+    ( 0,  0,  1 )
+])
+
+TO_PYTORCH3D = torch.tensor([
+    ( 0, -1,  0 ),
+    (-1,  0,  0 ),
     ( 0,  0,  1 )
 ])

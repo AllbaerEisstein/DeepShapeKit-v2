@@ -104,7 +104,7 @@ if __name__ == '__main__':
             dataset_dir=str(dataset_folder_path),
             pose_time_series_file_path=pose_time_series_path,
             outdir=final_output_folder,
-            deform=True
+            deform=False
         )
 
     # ==============================
