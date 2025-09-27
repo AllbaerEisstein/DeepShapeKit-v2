@@ -40,7 +40,7 @@ if __name__ == '__main__':
     # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
     pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube_rotating.json'))
 
-    cam_matrices_path       = Path('src/DSKv2/cam_matrices_bl_2_cv.json')
+    cam_matrices_path       = Path('src/DSKv2/cam_matrices.json')
     
     out_path                = Path('src/results/cygill')
     dataset_folder_name     = 'dataset'

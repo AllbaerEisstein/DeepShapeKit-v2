@@ -270,14 +270,7 @@ def export_cam_matrices(context):
             continue
         def mat_to_list(m):
             return [[float(v) for v in row] for row in m]
-        T = mats.get('T')
-        if T is None:
-            T_list = None
-        else:
-            try:
-                T_list = mat_to_list(T)
-            except Exception:
-                T_list = None
+        t = mats.get('t')
         P = mats.get('P')
         f = mats.get('f')
         Rt = mats.get('Rt')
@@ -285,7 +278,7 @@ def export_cam_matrices(context):
             'f': float(f) if f is not None else None,
             'K': mat_to_list(mats['K']),
             'R': mat_to_list(mats['R']),
-            'T': T_list,
+            't': [float(t.x), float(t.y), float(t.z)],
             'Rt': mat_to_list(Rt),
             'P': mat_to_list(P),
             'camera_name': cam.name
@@ -679,20 +672,51 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
 
 # --------------------------- Projection helpers ----------------------------
 
+
 def get_cam_matrix_for_cam(cam_obj, scene):
     """Compute and cache camera matrices for a camera object.
-    Returns dict with keys 'f','K','R','T','P' in CV convention (y is down, z is positive camera look-at) where P maps Blender world -> CV image homogeneous coords.
+    Returns dict with keys 'f','K','R','t','Rt','P' in CV convention (x right, y down, z forward).
     """
     cam_name = cam_obj.name
-    if cam_name in cam_name_2_matrix and cam_name_2_matrix[cam_name].get('P') is not None:
-        return cam_name_2_matrix[cam_name]
+    cached = cam_name_2_matrix.get(cam_name)
+    if cached and cached.get('P') is not None:
+        return cached
 
-    f, KRT, K, R, T, Rt = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
-    # P: we want mapping from Blender world -> cv image (with y down and positive z forward)
-    P = K @ BLENDER_CAM_2_CV_CAM @ Rt
-    cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': BLENDER_CAM_2_CV_CAM.to_4x4() @ R, 'T': BLENDER_CAM_2_CV_CAM.to_4x4() @ T, 'P': P, 'Rt': BLENDER_CAM_2_CV_CAM @ Rt}
-    # P = K @ Rt
-    # cam_name_2_matrix[cam_name] = {'f': f, 'K': K, 'R': R, 'T': T, 'P': P, 'Rt': Rt}
+    f, _, K_mat, _, _, _ = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
+    K_np = np.array(K_mat, dtype=float)
+
+    cam_world = cam_obj.matrix_world
+    R_cam2world = cam_world.to_3x3()
+    R_c2w_np = np.array(R_cam2world, dtype=float)
+
+    right = R_c2w_np[:, 0]
+    up = R_c2w_np[:, 1]
+    forward = -R_c2w_np[:, 2]  # Blender camera looks along -Z
+
+    def _norm(v):
+        n = np.linalg.norm(v)
+        return v if n == 0 else v / n
+
+    right = _norm(right)
+    up = _norm(up)
+    forward = _norm(forward)
+    down = -up
+
+    R_cv = np.stack([right, down, forward], axis=0)
+
+    cam_center_world = np.array(cam_world.translation, dtype=float)
+    t_cv = -R_cv @ cam_center_world
+    Rt_cv = np.concatenate([R_cv, t_cv[:, None]], axis=1)
+    P = K_np @ Rt_cv
+
+    cam_name_2_matrix[cam_name] = {
+        'f': float(f) if f is not None else None,
+        'K': Matrix(K_np),
+        'R': Matrix(R_cv),
+        't': Vector(t_cv),
+        'Rt': Matrix(Rt_cv),
+        'P': Matrix(P),
+    }
     return cam_name_2_matrix[cam_name]
 
 
@@ -1322,10 +1346,10 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
             if not self.rendering:
                 qitem = self.render_queue.pop(0)
-                try:
-                    self.handle_render_item(context, qitem)
-                except Exception as e:
-                    self.report({'WARNING'}, f"Render failed for item: {e}")
+                # try:
+                self.handle_render_item(context, qitem)
+                # except Exception as e:
+                #     self.report({'WARNING'}, f"Render failed for item: {e}")
 
         return {'PASS_THROUGH'}
 
