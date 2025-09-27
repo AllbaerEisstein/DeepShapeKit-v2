@@ -18,7 +18,7 @@ import cv2
 
 # from .renderer import Renderer
 from .geometry import perspective_projection, perspective_projection_homo
-from .CameraGroups import CameraGroup, _camera_group_from_args
+from .CameraGroups import CameraGroup
 
 
 
@@ -43,9 +43,9 @@ def triangulation_LBFGS(
     points: torch.Tensor,
     cameras: CameraGroup,
 ) -> tuple[torch.Tensor, list[float]]:
-    camera_group = _camera_group_from_args(cameras).to(points.device)
-    vn = points.shape[0]
+    camera_group = cameras.to(points.device)
 
+    vn = points.shape[0]
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
     Xs = []
     for i in range(vn):
@@ -56,6 +56,7 @@ def triangulation_LBFGS(
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
 
     X = X_init.clone().detach().requires_grad_()
+    
     losses: list[float] = []
     optimizer = torch.optim.LBFGS([X], lr=1, max_iter=100, line_search_fn='strong_wolfe')
 
@@ -84,7 +85,7 @@ def triangulation(
     points: torch.Tensor,
     cameras: CameraGroup,
 ) -> tuple[torch.Tensor, list[float]]:
-    camera_group = _camera_group_from_args(cameras).to(points.device)
+    camera_group = cameras.to(points.device)
 
     vn = points.shape[0]
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
@@ -121,7 +122,7 @@ def get_gt_3d(
     LBFGS: bool = True,
 ) -> torch.Tensor:
     """Triangulate 3D keypoints from multi-view 2D keypoints."""
-    camera_group = _camera_group_from_args(cameras).to(keypoints.device)
+    camera_group = cameras.to(keypoints.device)
 
     vn, kn, _ = keypoints.shape
     kpts_3d = keypoints.new_zeros((kn, 4))
@@ -132,8 +133,8 @@ def get_gt_3d(
             continue
         obs = keypoints[valid_views, k, :2]
         image_size = None
-        if camera_group.image_size is not None:
-            img_size = camera_group.image_size
+        if camera_group.image_size_wh is not None:
+            img_size = camera_group.image_size_wh
             if img_size.dim() >= 2 and img_size.shape[0] == camera_group.batch_size:
                 image_size = img_size[valid_views]
             else:
@@ -142,8 +143,8 @@ def get_gt_3d(
             P=camera_group.P[valid_views],
             K=camera_group.K[valid_views],
             R=camera_group.R[valid_views],
-            T=camera_group.T[valid_views],
-            image_size=image_size,
+            t=camera_group.t[valid_views],
+            image_size_wh=image_size,
         ).to(keypoints.device)
 
         if LBFGS:
@@ -213,7 +214,7 @@ def batch_render_reconstructions(
 ) -> np.ndarray:
     """Overlay projected mesh vertices, keypoints, and bounding boxes onto images."""
     device = vertex_world_coors_reconstructed.device
-    camera_group = _camera_group_from_args(cameras).to(device)
+    camera_group = cameras.to(device)
 
     vn, h, w, _ = imgs.shape
     imgs_out = imgs.clone() if torch.is_tensor(imgs) else torch.tensor(imgs).clone()

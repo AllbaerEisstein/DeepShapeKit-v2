@@ -50,31 +50,39 @@ Coordinate system conventions:
 
 """
 BLENDERCAM_2_CV = torch.tensor([    
-    ( 1,  0,  0 ),
-    ( 0, -1,  0 ),
-    ( 0,  0, -1 )
+    [ 1,  0,  0 ],
+    [ 0, -1,  0 ],
+    [ 0,  0, -1 ]
 ])
 
 BLENDERCAM_2_PYTORCH3D = torch.tensor([    
-    (-1,  0,  0 ),
-    ( 0,  1,  0 ),
-    ( 0,  0, -1 )
+    [-1,  0,  0 ],
+    [ 0,  1,  0 ],
+    [ 0,  0, -1 ]
 ])
 
 BLENDERWORLD_2_PYTORCH3D = torch.tensor([    
-    (-1,  0,  0 ),
-    ( 0,  0,  1 ),
-    ( 0,  1,  0 )
+    [-1,  0,  0 ],
+    [ 0,  0,  1 ],
+    [ 0,  1,  0 ]
 ])
 
+PYTORCH3D_2_BLENDERWORLD = BLENDERWORLD_2_PYTORCH3D.transpose(0, 1)
+
 CV_2_PYTORCH3D = torch.tensor([
-    (-1,  0,  0 ),
-    ( 0, -1,  0 ),
-    ( 0,  0,  1 )
+    [-1,  0,  0 ],
+    [ 0, -1,  0 ],
+    [ 0,  0,  1 ]
 ])
 
 TO_PYTORCH3D = torch.tensor([
-    ( 0, -1,  0 ),
-    (-1,  0,  0 ),
-    ( 0,  0,  1 )
+    [ 0, -1,  0 ],
+    [-1,  0,  0 ],
+    [ 0,  0,  1 ]
+])
+
+TO_PYTORCH3D2 = torch.tensor([
+    [ 0, -1,  0 ],
+    [ 0,  0,  1 ],
+    [-1,  0,  0 ]
 ])

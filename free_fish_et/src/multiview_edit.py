@@ -20,7 +20,7 @@ from src.geometry import perspective_projection
 import src.multiview_utils_edit as mutils
 from src.pose_optimizer_edit import OptimizeMV
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
-from src.CameraGroups import CameraGroup, _camera_group_from_args
+from src.CameraGroups import CameraGroup
 
 
 def fit_geometry(
@@ -49,7 +49,7 @@ def fit_geometry(
         fish_mesh_kpts_local = fish_articulated["keypoints"][0]
 
     # Triangulation with LBFGS
-    camera_group = _camera_group_from_args(cameras).to(keypoints.device)
+    camera_group = cameras.to(keypoints.device)
     observed_kpts_3d = mutils.get_gt_3d(keypoints, camera_group, LBFGS=True)
 
     valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0
@@ -92,7 +92,7 @@ def fit_mesh(
         init_bone (vn, 4): bone length
     """
     # move to device
-    camera_group = _camera_group_from_args(cameras).to(device)
+    camera_group = cameras.to(device)
     Ps = camera_group.P
     keypoints = keypoints.to(device)
     masks = masks.to(device)

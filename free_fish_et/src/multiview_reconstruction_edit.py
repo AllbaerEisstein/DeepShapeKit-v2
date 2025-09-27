@@ -11,7 +11,7 @@ import torch
 
 import src.multiview_edit as multiview
 import src.multiview_utils_edit as mutil
-from src.CameraGroups import CameraGroup, _camera_group_from_args
+from src.CameraGroups import CameraGroup
 
 from tqdm import tqdm
 from src.fish_model_edit import fish_model
@@ -36,7 +36,7 @@ def load_multiview_dataset(root: str) -> Multiview_Dataset:
 
 
 def initialize_model(
-    mesh_file: str, device: str, image_size: torch.Tensor, cameras: CameraGroup
+    mesh_file: str, device: str, cameras: CameraGroup
 ) -> tuple:
     fish = fish_model(mesh_json_path=mesh_file)
     optimizer = OptimizeMV(
@@ -82,12 +82,11 @@ def save_rendered_views(
     print(f"vertices size: {mesh_vertices_after_reconstruction.size()}")
     print(f"keypoints size: {keypoints.size()}")
     ensure_dir(instance_dir)
-    camera_group = _camera_group_from_args(cameras)
     imgs = torch.stack([torch.tensor(plt.imread(img_path) * 255) for img_path in img_filenames])
     imgs_with_projection = mutil.batch_render_reconstructions(
         imgs,
         mesh_vertices_after_reconstruction,
-        camera_group,
+        cameras,
         kpts=keypoints,
         bboxs=bboxes,
     )
@@ -122,16 +121,15 @@ def save_reconstruction_images(
 
     silhouettes_np = silhouettes.detach().cpu().numpy()
 
-    alpha = silhouettes_np  # (N, W, H)
-    n_views, W, H = alpha.shape
+    alpha = silhouettes_np  # (N, H, W)
+    n_views, H, W = alpha.shape
 
-    camera_group = _camera_group_from_args(cameras)
     assert len(orig_image_paths) == n_views, "orig_image_paths length must match rendered views"
-    assert camera_group.batch_size == n_views, "Camera batch size must match number of views"
+    assert cameras.batch_size == n_views, "Camera batch size must match number of views"
     assert len(view_names) == n_views, "Number of view names must match number of views"
 
     keypoints_world = (reconstructed_keypoints_local + global_t).squeeze(0)
-    projection_matrices = camera_group.P.detach().cpu()
+    projection_matrices = cameras.P.detach().cpu()
 
     for i in range(n_views):
         # Read original image (BGR)
@@ -169,7 +167,7 @@ def save_reconstruction_images(
         red_img[:, :, 2] = 255  # full red channel in BGR
 
 
-        a_exp = a[..., None].transpose(1,0,2)  # (H,W,1)
+        a_exp = a[..., None]
         blended = (padded.astype(np.float32) * (1.0 - blend_factor * a_exp) +
                    red_img.astype(np.float32) * (blend_factor * a_exp))
         blended = np.clip(blended, 0, 255).astype(np.uint8)
@@ -272,12 +270,12 @@ def reconstruct(
     Ps, Ks, Rs, Ts, *_ = cam_params
     image_size = torch.tensor(dataset.uniform_img_size, dtype=Ks.dtype)
 
-    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, T=Ts, image_size=image_size)
+    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, t=Ts, image_size_wh=image_size)
     camera_group_device = camera_group_cpu.to(device)
 
     ensure_dir(outdir)
     fish, optimizer, renderer = initialize_model(
-        mesh_path, device, image_size, camera_group_device
+        mesh_path, device, camera_group_device
     )
 
     parameters = []
@@ -410,7 +408,7 @@ def render_pose_time_series(
     Ps, Ks, Rs, ts, *_ = cam_params
     image_size = torch.tensor(dataset.uniform_img_size, dtype=Ks.dtype)
 
-    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, T=ts, image_size=image_size)
+    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, t=ts, image_size_wh=image_size)
     camera_group_device = camera_group_cpu.to(device)
 
     renderer = Silhouette_Renderer(device, camera_group_device)
