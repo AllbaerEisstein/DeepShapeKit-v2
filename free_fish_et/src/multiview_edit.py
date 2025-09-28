@@ -93,7 +93,7 @@ def fit_mesh(
     """
     # move to device
     camera_group = cameras.to(device)
-    Ps = camera_group.P
+    Ps = camera_group.projection_matrices(blender=True)
     keypoints = keypoints.to(device)
     masks = masks.to(device)
     fish.to_device(device)

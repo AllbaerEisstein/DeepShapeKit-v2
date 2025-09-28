@@ -28,25 +28,11 @@ class Silhouette_Renderer:
         dtype = cg.R.dtype
         self.n_batches = cg.batch_size
 
-        blworld_to_p3d = BLENDERWORLD_2_PYTORCH3D.to(self.device, dtype=dtype)
-        blworld_to_p3d_inv = blworld_to_p3d.transpose(0, 1)
-        cv_to_p3d = CV_2_PYTORCH3D.to(self.device, dtype=dtype)
-
-        blworld_to_p3d_batch = blworld_to_p3d.unsqueeze(0).expand(self.n_batches, -1, -1)
-        blworld_to_p3d_inv_batch = blworld_to_p3d_inv.unsqueeze(0).expand(self.n_batches, -1, -1)
-        cv_to_p3d_batch = cv_to_p3d.unsqueeze(0).expand(self.n_batches, -1, -1)
-
-        R_cv = cg.R
-        t_cv = cg.t
-
-        # Rotate into PyTorch3D camera coordinates and Blender -> PyTorch3D world basis.
-        R_p3d = torch.matmul(cv_to_p3d_batch, torch.matmul(R_cv, blworld_to_p3d_inv_batch))
-
-        # Recover camera centres in Blender world, convert to PyTorch3D world, then back to T.
-        t_cv_col = t_cv.unsqueeze(-1)
-        centres_bl = -torch.matmul(R_cv.transpose(1, 2), t_cv_col)
-        centres_p3d = torch.matmul(blworld_to_p3d_batch, centres_bl)
-        T_p3d = -torch.matmul(R_p3d, centres_p3d).squeeze(-1)
+        R_custom_conv = cg.R
+        t_custom_conv = cg.t
+        CUSTOMCONV_2_P3D = cg.from_pytorch3d.transpose(1,2)
+        R_p3d = torch.matmul(CUSTOMCONV_2_P3D, R_custom_conv)
+        T_p3d = torch.matmul(CUSTOMCONV_2_P3D, t_custom_conv.unsqueeze(-1)).squeeze(-1)
 
         principal_points = cg.principal_points.to(self.device, dtype=dtype)
         focal_lengths = cg.focal_lengths_px.to(self.device, dtype=dtype)
@@ -83,8 +69,9 @@ class Silhouette_Renderer:
             device=self.device,
         )
 
-        self.blworld_to_p3d = blworld_to_p3d
-        self.blworld_to_p3d_T = blworld_to_p3d.transpose(0, 1)
+        BLWORLD_2_P3D = BLENDERWORLD_2_PYTORCH3D.to(self.device, dtype=dtype)
+        self.blworld_to_p3d = BLWORLD_2_P3D
+        self.blworld_to_p3d_T = BLWORLD_2_P3D.transpose(0, 1)
         self.cameras = cameras
         self.silhouette_renderers = MeshRenderer(
             rasterizer=MeshRasterizer(cameras=self.cameras, raster_settings=raster_settings),

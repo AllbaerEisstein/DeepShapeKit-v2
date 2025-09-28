@@ -109,10 +109,23 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                 new_focal_mm = newK[0][0] * (f / K[0][0])
                 new_dist = (0.0,)*5
                 video_name = video_name + "_undistorted"
-                cam_matrices[video_name] = {}
-                cam_matrices[video_name]["K"] = [list(row) for row in newK]
-                cam_matrices[video_name]["f"] = new_focal_mm
-                cam_matrices[video_name]["d"] = new_dist
+                original_entry = cam_matrices.get(video_name.replace("_undistorted", ""), {})
+                updated_entry = {
+                    "K": [list(row) for row in newK],
+                    "f": new_focal_mm,
+                    "distortion": {
+                        "rad_1": new_dist[0],
+                        "rad_2": new_dist[1],
+                        "tan_1": new_dist[2],
+                        "tan_2": new_dist[3],
+                        "rad_3": new_dist[4],
+                    },
+                }
+                for key in ["R", "t", "Rt", "P", "FROM_BLENDERWORLD"]:
+                    if key in original_entry:
+                        updated_entry[key] = original_entry[key]
+                cam_matrices[video_name] = updated_entry
+                distortions = new_dist
                 needs_undistortion = True
 
 

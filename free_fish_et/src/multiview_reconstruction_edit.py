@@ -111,6 +111,7 @@ def save_reconstruction_images(
     view_names: List[str],
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
+    draw_verts: bool = False
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
@@ -129,13 +130,18 @@ def save_reconstruction_images(
     assert len(view_names) == n_views, "Number of view names must match number of views"
 
     keypoints_world = (reconstructed_keypoints_local + global_t).squeeze(0)
-    projection_matrices = cameras.P.detach().cpu()
+    keypoints_proj = cameras.perspective_projection_from_blworld(keypoints_world.unsqueeze(0)).detach().cpu()
+    keypoints_proj = keypoints_proj.squeeze(0)
 
-    for i in range(n_views):
+    verts_world = (reconstructed_vertices_local + global_t).squeeze(0)
+    verts_proj = cameras.perspective_projection_from_blworld(verts_world.unsqueeze(0)).detach().cpu()
+    verts_proj = verts_proj.squeeze(0)
+
+    for view_idx in range(n_views):
         # Read original image (BGR)
-        orig_bgr = cv2.imread(str(orig_image_paths[i]), cv2.IMREAD_COLOR)
+        orig_bgr = cv2.imread(str(orig_image_paths[view_idx]), cv2.IMREAD_COLOR)
         if orig_bgr is None:
-            raise FileNotFoundError(f"Could not read image {orig_image_paths[i]}")
+            raise FileNotFoundError(f"Could not read image {orig_image_paths[view_idx]}")
 
         # cv2 reads images in row-major order
         h0, w0 = orig_bgr.shape[:2]
@@ -144,11 +150,6 @@ def save_reconstruction_images(
         pad_right = W - w0 - pad_left
         pad_top = (H - h0) // 2
         pad_bottom = H - h0 - pad_top
-        
-        # print(f"alpha: {alpha.shape}")
-        # print(f"left, right, top, bottom: {pad_left}, {pad_right}, {pad_top}, {pad_bottom}")
-        # print(f"orig_bgr: {orig_bgr.shape}")
-
 
         # Pad with zeros (black). cv2.copyMakeBorder expects ints
         padded = cv2.copyMakeBorder(
@@ -157,7 +158,7 @@ def save_reconstruction_images(
             borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0)
         )
 
-        a = np.clip(alpha[i], 0.0, 1.0)  # (H,W), float
+        a = np.clip(alpha[view_idx], 0.0, 1.0)  # (H,W), float
 
         # threshold tiny values
         a[a < silhouette_threshold] = 0.0
@@ -173,33 +174,27 @@ def save_reconstruction_images(
         blended = np.clip(blended, 0, 255).astype(np.uint8)
 
         # Draw keypoints:
-        P_i = projection_matrices[i].numpy()  # (3,4)
         for kp_idx, name in enumerate(keypoint_names):
-            coords3d = keypoints_world[kp_idx]
-            # print(f"coords3d: {coords3d}")
-            # print(f"reconstructed_keypoints_world: {reconstructed_keypoints_local}")
-            coords_np = coords3d.detach().cpu().numpy()
-            Xh = np.concatenate([coords_np, [1.0]])  # (4,) -> homogeneous
-            ph = P_i @ Xh  # (3,)
-            z = ph[2]
-            if abs(z) < 1e-6:
-                continue
-            u = ph[0] / z
-            v = ph[1] / z
-
             # u,v are pixel coords in the same coordinate system as the silhouette (W,H)
-            ui = int(round(u))
-            vi = int(round(v))
+            ui = int(round(keypoints_proj[view_idx, kp_idx, 0].item()))
+            vi = int(round(keypoints_proj[view_idx, kp_idx, 1].item()))
             if 0 <= ui < W and 0 <= vi < H:
                 cv2.circle(blended, (ui, vi), radius=5, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
                 cv2.putText(blended, name, (ui, vi + 15), cv2.FONT_HERSHEY_SIMPLEX,
                             fontScale=0.35, color=(255, 0, 0), thickness=1, lineType=cv2.LINE_AA)
 
+        if draw_verts:
+            for vert_idx in range(verts_proj.size(1)):
+                ui = int(round(verts_proj[view_idx, vert_idx, 0].item()))
+                vi = int(round(verts_proj[view_idx, vert_idx, 1].item()))
+                if 0 <= ui < W and 0 <= vi < H:
+                    cv2.circle(blended, (ui, vi), radius=2, color=(0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+
         # Prepare output dirs & filename
-        view_output_dir = os.path.join(outdir, view_names[i] + "_reconstruction_images")
+        view_output_dir = os.path.join(outdir, view_names[view_idx] + "_reconstruction_images")
         instance_dir = os.path.join(view_output_dir, f"instance_{instance_number}")
         ensure_dir(instance_dir)
-        base_name = os.path.splitext(os.path.basename(orig_image_paths[i]))[0]
+        base_name = os.path.splitext(os.path.basename(orig_image_paths[view_idx]))[0]
         out_path = os.path.join(instance_dir, base_name + "_reconstructed.png")
 
         # Save PNG (BGR)
@@ -266,11 +261,7 @@ def reconstruct(
 
     dataset = load_multiview_dataset(dataset_dir)
 
-    cam_params = dataset.cams.get_camera_matrices()
-    Ps, Ks, Rs, Ts, *_ = cam_params
-    image_size = torch.tensor(dataset.uniform_img_size, dtype=Ks.dtype)
-
-    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, t=Ts, image_size_wh=image_size)
+    camera_group_cpu = dataset.cams.get_camera_group()
     camera_group_device = camera_group_cpu.to(device)
 
     ensure_dir(outdir)
@@ -404,11 +395,7 @@ def render_pose_time_series(
     fish.to_device(device)
 
     dataset = load_multiview_dataset(dataset_dir)
-    cam_params = dataset.cams.get_camera_matrices()
-    Ps, Ks, Rs, ts, *_ = cam_params
-    image_size = torch.tensor(dataset.uniform_img_size, dtype=Ks.dtype)
-
-    camera_group_cpu = CameraGroup(P=Ps, K=Ks, R=Rs, t=ts, image_size_wh=image_size)
+    camera_group_cpu = dataset.cams.get_camera_group()
     camera_group_device = camera_group_cpu.to(device)
 
     renderer = Silhouette_Renderer(device, camera_group_device)
@@ -450,13 +437,14 @@ def render_pose_time_series(
             outdir=pose_time_series_outdir,
             renderer=renderer,
             instance_number=0,
-            cameras=camera_group_cpu,
+            cameras=camera_group_device,
             reconstructed_keypoints_local=keypoints,
             reconstructed_vertices_local=vertices,
             faces_from_vert_indices=fish.faces.unsqueeze(0),
             global_t=global_t,
             keypoint_names=dataset.index_json["keypoint_list"],
-            view_names=dataset.views
+            view_names=dataset.views,
+            draw_verts=True
         )
         
 

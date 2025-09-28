@@ -35,12 +35,18 @@ import numpy as np
 # cache for camera matrices (per-camera)
 cam_name_2_matrix = {}
 
-# conversion matrix from Blender camera coordinates to usual CV camera coordinates
+# conversion matrices between conventions
 BLENDER_CAM_2_CV_CAM = Matrix((
     (1, 0, 0),
     (0, -1, 0),
     (0, 0, -1)
 ))
+
+BLENDERWORLD_2_CVWORLD = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [0.0, 1.0, 0.0],
+], dtype=float)
 
 
 # --------------------------- Property Group ---------------------------------
@@ -251,48 +257,6 @@ def get_3x4_P_matrix_Blendercam2Blenderimage(cam, scene):
     f, K = get_calibration_matrix_K_Blendercam2Blenderimage(cam.data, scene)
     Rt, R, T = get_3x4_RT_matrix_Blender2Blendercam(cam)
     return f, K @ Rt, K, R, T, Rt
-
-
-def export_cam_matrices(context):
-    scene = context.scene
-    p = scene.synth_props
-    out = {}
-    cam_collection = bpy.data.collections.get('Cameras')
-    cam_objs = cam_collection.objects if cam_collection else [o for o in bpy.data.objects if o.type == 'CAMERA']
-    cam_name_2_matrix.clear()
-    for cam in cam_objs:
-        if cam.type != 'CAMERA':
-            continue
-        try:
-            mats = get_cam_matrix_for_cam(cam, scene)
-        except Exception as e:
-            raise ValueError(f"Failed to compute matrix for {cam.name}: {e}")
-            continue
-        def mat_to_list(m):
-            return [[float(v) for v in row] for row in m]
-        t = mats.get('t')
-        P = mats.get('P')
-        f = mats.get('f')
-        Rt = mats.get('Rt')
-        entry = {
-            'f': float(f) if f is not None else None,
-            'K': mat_to_list(mats['K']),
-            'R': mat_to_list(mats['R']),
-            't': [float(t.x), float(t.y), float(t.z)],
-            'Rt': mat_to_list(Rt),
-            'P': mat_to_list(P),
-            'camera_name': cam.name
-        }
-        video_name = cam.name.split('.', 1)[1] + '_' + cam.name.split('.', 1)[0] if '.' in cam.name else cam.name
-        out[video_name] = entry
-    try:
-        out_path = os.path.join(resolve(p.annot_out_dir), 'cam_matrices.json')
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, 'w') as f:
-            json.dump(out, f, indent=2)
-        return out_path
-    except Exception as e:
-        raise ValueError(f"Failed to write cam_matrices.json: {e}")
 
 
 # --------------------------- Mesh / Keypoint extraction --------------------
@@ -674,48 +638,53 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
 
 
 def get_cam_matrix_for_cam(cam_obj, scene):
-    """Compute and cache camera matrices for a camera object.
-    Returns dict with keys 'f','K','R','t','Rt','P' in CV convention (x right, y down, z forward).
+    """Compute camera matrices for a Blender camera.
+
+    Returns a dict containing both:
+      * Matrices that operate directly on Blender-world coordinates (used by the
+        helper utilities in this exporter), and
+      * Pure CV extrinsics together with an explicit Blender→CV basis-change
+        matrix for downstream tooling.
     """
+
     cam_name = cam_obj.name
     cached = cam_name_2_matrix.get(cam_name)
-    if cached and cached.get('P') is not None:
+    if cached and cached.get('P_blender') is not None and cached.get('P') is not None:
         return cached
 
-    f, _, K_mat, _, _, _ = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
+    f, KRT, K_mat, R_4x4, T_4x4, Rt_mat = get_3x4_P_matrix_Blendercam2Blenderimage(cam_obj, scene)
     K_np = np.array(K_mat, dtype=float)
+    Rt_np = np.array(Rt_mat, dtype=float)
 
-    cam_world = cam_obj.matrix_world
-    R_cam2world = cam_world.to_3x3()
-    R_c2w_np = np.array(R_cam2world, dtype=float)
+    R_world_to_blcam = Rt_np[:, :3]
+    t_world_to_blcam = Rt_np[:, 3]
 
-    right = R_c2w_np[:, 0]
-    up = R_c2w_np[:, 1]
-    forward = -R_c2w_np[:, 2]  # Blender camera looks along -Z
+    blender_cam_2_cv = np.array(BLENDER_CAM_2_CV_CAM, dtype=float)
+    R_blender = blender_cam_2_cv @ R_world_to_blcam
+    t_blender = blender_cam_2_cv @ t_world_to_blcam
+    Rt_blender_cv = np.concatenate([R_blender, t_blender[:, None]], axis=1)
+    P_blender = K_np @ Rt_blender_cv
 
-    def _norm(v):
-        n = np.linalg.norm(v)
-        return v if n == 0 else v / n
+    F = BLENDERWORLD_2_CVWORLD
+    F_inv = np.linalg.inv(F)
 
-    right = _norm(right)
-    up = _norm(up)
-    forward = _norm(forward)
-    down = -up
-
-    R_cv = np.stack([right, down, forward], axis=0)
-
-    cam_center_world = np.array(cam_world.translation, dtype=float)
-    t_cv = -R_cv @ cam_center_world
+    R_cv = R_blender @ F_inv
+    t_cv = t_blender
     Rt_cv = np.concatenate([R_cv, t_cv[:, None]], axis=1)
-    P = K_np @ Rt_cv
+    P_cv = K_np @ Rt_cv
 
     cam_name_2_matrix[cam_name] = {
         'f': float(f) if f is not None else None,
-        'K': Matrix(K_np),
-        'R': Matrix(R_cv),
-        't': Vector(t_cv),
-        'Rt': Matrix(Rt_cv),
-        'P': Matrix(P),
+        'K': Matrix(K_np.tolist()),
+        'R': Matrix(R_cv.tolist()),
+        't': Vector(t_cv.tolist()),
+        'Rt': Matrix(Rt_cv.tolist()),
+        'P': Matrix(P_cv.tolist()),
+        'FROM_BLENDERWORLD': Matrix(F.tolist()),
+        'R_blender': Matrix(R_blender.tolist()),
+        't_blender': Vector(t_blender.tolist()),
+        'Rt_blender': Matrix(Rt_blender_cv.tolist()),
+        'P_blender': Matrix(P_blender.tolist()),
     }
     return cam_name_2_matrix[cam_name]
 
@@ -1178,7 +1147,7 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
             # compute camera matrix P and project using matrix (keeps parity with original script)
             cam_mats = get_cam_matrix_for_cam(cam_obj, scene)
-            P = cam_mats['P']
+            P = cam_mats['P_blender']
 
             EPS = 1e-8
             img_w = int(scene.render.resolution_x * (scene.render.resolution_percentage / 100.0))
@@ -1633,10 +1602,49 @@ class SYNTH_OT_export_keypoint_list(Operator):
 
 # --------------------------- Camera matrices export operator ----------------
 
+def export_cam_matrices(context):
+    scene = context.scene
+    p = scene.synth_props
+    out = {}
+    cam_collection = bpy.data.collections.get('Cameras')
+    cam_objs = cam_collection.objects if cam_collection else [o for o in bpy.data.objects if o.type == 'CAMERA']
+    cam_name_2_matrix.clear()
+    for cam in cam_objs:
+        if cam.type != 'CAMERA':
+            continue
+        try:
+            mats = get_cam_matrix_for_cam(cam, scene)
+        except Exception as e:
+            raise ValueError(f"Failed to compute matrix for {cam.name}: {e}")
+        def mat_to_list(m):
+            return [[float(v) for v in row] for row in m]
+
+        entry = {
+            'f': float(mats['f']) if mats.get('f') is not None else None,
+            'K': mat_to_list(mats['K']),
+            'R': mat_to_list(mats['R']),
+            't': [float(v) for v in mats['t']],
+            'Rt': mat_to_list(mats['Rt']),
+            'P': mat_to_list(mats['P']),
+            'FROM_BLENDERWORLD': mat_to_list(mats['FROM_BLENDERWORLD']),
+            'camera_name': cam.name
+        }
+        video_name = cam.name.split('.', 1)[1] + '_' + cam.name.split('.', 1)[0] if '.' in cam.name else cam.name
+        out[video_name] = entry
+    try:
+        out_path = os.path.join(resolve(p.annot_out_dir), 'cam_matrices.json')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, 'w') as f:
+            json.dump(out, f, indent=2)
+        return out_path
+    except Exception as e:
+        raise ValueError(f"Failed to write cam_matrices.json: {e}")
+    
+
 class SYNTH_OT_export_camera_matrices(Operator):
     bl_idname = "synth.export_camera_matrices"
     bl_label = "Export Camera Matrices"
-    bl_description = "Export computed camera parameters & matrices (f, K, R, T, P, Rt) for [Blender world -> CV image]-conversion for all scene cameras to cam_matrices.json in the annotation folder. -- NOTE -- K expects coordinates in CV-convention; y is down, z is positive camera look-at (forward), x is right -- P, R, T, Rt expect coordinates in Blender world convention: z is up, y is forward, x is right"
+    bl_description = "Export computed camera parameters & matrices (f, K, R, t, P, Rt) for [Blender world -> CV image]-conversion for all scene cameras to cam_matrices.json in the annotation folder. -- NOTE -- f is specified in mm, K is specified in pixels -- K and t expect coordinates in CV-convention; y is down, z is positive camera look-at (forward), x is right -- P, R, Rt expect coordinates in Blender world convention: z is up, y is forward, x is right"
 
     def execute(self, context):
         try:

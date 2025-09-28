@@ -4,6 +4,9 @@ from typing import Optional, Union
 
 import torch
 
+from .geometry import perspective_projection
+from .constants_edit import CV_2_BLENDERWORLD, PYTORCH3D_2_BLENDERWORLD
+
 
 @dataclass
 class CameraGroup:
@@ -13,10 +16,11 @@ class CameraGroup:
     K: torch.Tensor
     R: torch.Tensor
     t: torch.Tensor
+    from_blenderworld: torch.Tensor # A matrix M so that point3d_custom_coord_convention = M @ point3d_blenderworld
     image_size_wh: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
-        for name in ("P", "K", "R", "t", "image_size_wh"):
+        for name in ("P", "K", "R", "t", "from_blenderworld", "image_size_wh"):
             value = getattr(self, name)
             if value is None:
                 continue
@@ -32,6 +36,18 @@ class CameraGroup:
             else:
                 tensor = tensor.to(dtype=torch.float32)
             setattr(self, name, tensor.contiguous())
+
+    @property
+    def from_cv(self):
+        cv_to_blworld = CV_2_BLENDERWORLD.to(self.from_blenderworld.device, dtype=self.from_blenderworld.dtype)
+        cv_to_blworld = cv_to_blworld.unsqueeze(0).expand(self.batch_size, -1, -1)
+        return torch.matmul(self.from_blenderworld, cv_to_blworld)
+
+    @property
+    def from_pytorch3d(self):
+        p3d_to_blworld = PYTORCH3D_2_BLENDERWORLD.to(self.from_blenderworld.device, dtype=self.from_blenderworld.dtype)
+        p3d_to_blworld = p3d_to_blworld.unsqueeze(0).expand(self.batch_size, -1, -1)
+        return torch.matmul(self.from_blenderworld, p3d_to_blworld)
 
     @property
     def Rt(self) -> torch.Tensor:
@@ -73,5 +89,67 @@ class CameraGroup:
             K=self.K.to(device=device, dtype=target_dtype),
             R=self.R.to(device=device, dtype=target_dtype),
             t=self.t.to(device=device, dtype=target_dtype),
+            from_blenderworld=self.from_blenderworld.to(device=device, dtype=target_dtype),
             image_size_wh=image_size,
         )
+
+    def projection_matrices(self, blender: bool = False) -> torch.Tensor:
+        """Return projection matrices. If ``blender`` is True they expect Blender-world points."""
+        if not blender:
+            return self.P
+        R_blender = torch.matmul(self.R, self.from_blenderworld)
+        Rt = torch.cat([R_blender, self.t.unsqueeze(-1)], dim=2)
+        return torch.matmul(self.K, Rt)
+
+    def _expand_points(self, points: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        squeeze = False
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+            squeeze = True
+        if points.shape[0] == 1:
+            points = points.expand(self.batch_size, -1, -1)
+        elif points.shape[0] != self.batch_size:
+            raise ValueError("points batch dimension must be 1 or equal to number of cameras")
+        return points, squeeze
+
+    def points_from_blworld(self, points: torch.Tensor) -> torch.Tensor:
+        """Convert Blender-world points to CV world coordinates."""
+        points, squeeze = self._expand_points(points)
+        F_T = self.from_blenderworld.transpose(1, 2)
+        converted = torch.matmul(points, F_T)
+        return converted.squeeze(0) if squeeze else converted
+
+    def world_to_view_from_blworld(self, points: torch.Tensor) -> torch.Tensor:
+        """Transform Blender-world points into camera coordinates."""
+        pts_custom_conv = self.points_from_blworld(points)
+        pts_custom_conv, squeeze = self._expand_points(pts_custom_conv)
+        view = torch.einsum('bij,bkj->bki', self.R, pts_custom_conv) + self.t.unsqueeze(1)
+        return view.squeeze(0) if squeeze else view
+
+    def perspective_projection_from_blworld(self, points: torch.Tensor) -> torch.Tensor:
+        """Project Blender-world points using the stored projection matrices."""
+        pts_custom_conv = self.points_from_blworld(points)
+        pts_custom_conv, squeeze = self._expand_points(pts_custom_conv)
+        proj = perspective_projection(pts_custom_conv, self.K @ self.Rt)
+        return proj.squeeze(0) if squeeze else proj
+
+    def points_from_cv(self, points: torch.Tensor) -> torch.Tensor:
+        """Convert CV world points to the camera's working coordinate system."""
+        points, squeeze = self._expand_points(points)
+        F_T = self.from_cv.transpose(1, 2)
+        converted = torch.matmul(points, F_T)
+        return converted.squeeze(0) if squeeze else converted
+
+    def world_to_view_from_cv(self, points: torch.Tensor) -> torch.Tensor:
+        """Transform CV world points into camera coordinates."""
+        pts_custom = self.points_from_cv(points)
+        pts_custom, squeeze = self._expand_points(pts_custom)
+        view = torch.einsum('bij,bkj->bki', self.R, pts_custom) + self.t.unsqueeze(1)
+        return view.squeeze(0) if squeeze else view
+
+    def perspective_projection_from_cv(self, points: torch.Tensor) -> torch.Tensor:
+        """Project CV world points using the stored projection matrices."""
+        pts_custom = self.points_from_cv(points)
+        pts_custom, squeeze = self._expand_points(pts_custom)
+        proj = perspective_projection(pts_custom, self.P)
+        return proj.squeeze(0) if squeeze else proj

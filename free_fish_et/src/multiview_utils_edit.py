@@ -47,22 +47,25 @@ def triangulation_LBFGS(
 
     vn = points.shape[0]
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
+    from_bl_inv = camera_group.from_blenderworld.transpose(1, 2)
+
     Xs = []
     for i in range(vn):
         P = camera_group.P[i]
         X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
-        X_cart = X_h[:3] / X_h[3]
-        Xs.append(X_cart.squeeze())
+        X_custom_coord_conv = (X_h[:3] / X_h[3]).squeeze()
+        X_bl = torch.matmul(from_bl_inv[i], X_custom_coord_conv)
+        Xs.append(X_bl)
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
 
     X = X_init.clone().detach().requires_grad_()
-    
+
     losses: list[float] = []
     optimizer = torch.optim.LBFGS([X], lr=1, max_iter=100, line_search_fn='strong_wolfe')
 
     def closure() -> torch.Tensor:
-        projected_points = perspective_projection(
-            X.repeat(vn, 1, 1), camera_group.P
+        projected_points = camera_group.perspective_projection_from_blworld(
+            X.repeat(vn, 1, 1)
         )
         loss = projection_loss(projected_points.squeeze(), points)
         optimizer.zero_grad()
@@ -72,8 +75,8 @@ def triangulation_LBFGS(
     optimizer.step(closure)
 
     with torch.no_grad():
-        projected_points = perspective_projection(
-            X.repeat(vn, 1, 1), camera_group.P
+        projected_points = camera_group.perspective_projection_from_blworld(
+            X.repeat(vn, 1, 1)
         )
         loss = projection_loss(projected_points.squeeze(), points)
         losses.append(loss.detach().item())
@@ -89,12 +92,15 @@ def triangulation(
 
     vn = points.shape[0]
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
+    from_bl_inv = camera_group.from_blenderworld.transpose(1, 2)
+
     Xs = []
     for i in range(vn):
         P = camera_group.P[i]
         X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
-        X_cart = X_h[:3] / X_h[3]
-        Xs.append(X_cart.squeeze())
+        X_cv = (X_h[:3] / X_h[3]).squeeze()
+        X_bl = torch.matmul(from_bl_inv[i], X_cv)
+        Xs.append(X_bl)
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
 
     X = X_init.clone().detach().requires_grad_()
@@ -103,8 +109,8 @@ def triangulation(
     optimizer = torch.optim.Adam([X], lr=0.1)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [50, 90], gamma=0.1)
     for _ in range(100):
-        projected_points = perspective_projection(
-            X.repeat(vn, 1, 1), camera_group.P
+        projected_points = camera_group.perspective_projection_from_blworld(
+            X.repeat(vn, 1, 1)
         )
         loss = projection_loss(projected_points.squeeze(), points)
         optimizer.zero_grad()
@@ -128,6 +134,7 @@ def get_gt_3d(
     kpts_3d = keypoints.new_zeros((kn, 4))
 
     for k in range(kn):
+        # TODO: keypoint validity
         valid_views = keypoints[:, k, -1] > 0
         if valid_views.sum() < 2:
             continue
@@ -136,7 +143,7 @@ def get_gt_3d(
         if camera_group.image_size_wh is not None:
             img_size = camera_group.image_size_wh
             if img_size.dim() >= 2 and img_size.shape[0] == camera_group.batch_size:
-                image_size = img_size[valid_views]
+                image_size = img_size[valid_views].clone()
             else:
                 image_size = img_size.clone()
         sub_group = CameraGroup(
@@ -144,6 +151,7 @@ def get_gt_3d(
             K=camera_group.K[valid_views],
             R=camera_group.R[valid_views],
             t=camera_group.t[valid_views],
+            from_blenderworld=camera_group.from_blenderworld[valid_views],
             image_size_wh=image_size,
         ).to(keypoints.device)
 
@@ -219,16 +227,14 @@ def batch_render_reconstructions(
     vn, h, w, _ = imgs.shape
     imgs_out = imgs.clone() if torch.is_tensor(imgs) else torch.tensor(imgs).clone()
 
-    vertex_projections = perspective_projection(
-        vertex_world_coors_reconstructed.repeat(vn, 1, 1),
-        camera_group.P,
+    vertex_projections = camera_group.perspective_projection_from_blworld(
+        vertex_world_coors_reconstructed.repeat(vn, 1, 1)
     )
 
     keypoint_projections = None
     if kpts is not None:
-        keypoint_projections = perspective_projection(
-            kpts.repeat(vn, 1, 1),
-            camera_group.P,
+        keypoint_projections = camera_group.perspective_projection_from_blworld(
+            kpts.repeat(vn, 1, 1)
         )
 
     for view_idx in range(vn):

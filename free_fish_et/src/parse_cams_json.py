@@ -1,6 +1,8 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
+
+from .CameraGroups import CameraGroup
 
 KEY_ALIASES = {
     'P': ['P', 'projection', 'proj', 'projection_matrix', 'proj_m'],
@@ -208,8 +210,9 @@ class CameraSet:
         self.f_list: list[Tuple[float,float]] = []
         self.K_list: list[torch.Tensor] = []
         self.R_list: list[torch.Tensor] = []
-        self.T_list: list[torch.Tensor] = []
+        self.t_list: list[torch.Tensor] = []
         self.Rt_list: list[torch.Tensor] = []
+        self.from_blender_list: list[torch.Tensor] = []
         self.distortions_list: list[Tuple[float,float,float,float,float]] = []
         self.uniform_img_size = uniform_img_size
 
@@ -265,50 +268,38 @@ class CameraSet:
             except Exception as e:
                 raise ValueError(f'Distortion for view "{v}" could not be parsed: {e}')
 
+            from_bl = matrices_json.get('FROM_BLENDERWORLD') or matrices_json.get('from_blenderworld')
+            if from_bl is None:
+                raise ValueError(f'FROM_BLENDERWORLD not found for view "{v}" in index.json')
+            F_np = _to_numpy(from_bl)
+            F_np = _ensure_shape(F_np, (3,3))
+
             self.P_list.append(torch.tensor(P_np, dtype=torch.float32))
             if self.uniform_img_size:
                 image_size = self.index_json['image_sizes'][v]
                 K_np = _adjust_intrinsics_for_padding(K_np, image_size, self.uniform_img_size)
             self.K_list.append(torch.tensor(K_np, dtype=torch.float32))
             self.R_list.append(torch.tensor(R_np, dtype=torch.float32))
-            self.T_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
+            self.t_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
             Rt_np = np.concatenate([R_np, T_np.reshape(3, 1)], axis=1)
             self.Rt_list.append(torch.tensor(Rt_np, dtype=torch.float32))
             self.f_list.append((float(fx_fy[0]), float(fx_fy[1])))
+            self.from_blender_list.append(torch.tensor(F_np, dtype=torch.float32))
             self.distortions_list.append(tuple(float(x) for x in dist5))
 
-    def get_camera_matrices(self, keep_focal_scalar: bool = True, focal_tol: float = 1e-6):
-        """
-        Return camera matrices and distortion parameters for all views.
-        
-        **In the context of DSKv2, the fish mesh is going to be sepcified in the Blender coordinate system.**
-        That means: x-axis points to the right, y-axis points forward, and z-axis points up.
-        **Thus, the camera parameters P, R, t, Rt all should be specified so that they expect input coordinates in Blender coordinate conventions and return coordinates in CV coordinate convention** (x-axis points right, y-axis points down, z-axis points forward)
-        
-        **The camera intrinsic matrix K expects CV coordinate convention input and returns CV image coordinate convention output.**
+    def get_camera_group(self, device: Optional[Union[str, torch.device]] = None) -> CameraGroup:
+        image_sizes = []
+        for view in self.views:
+            size = self.index_json['image_sizes'][view]
+            image_sizes.append(size)
+        image_sizes_tensor = torch.tensor(image_sizes, dtype=torch.float32)
 
-        Returns:
-            P_stack (N, 3, 4): torch.float32
-            K_stack (N, 3, 3): torch.float32
-            R_stack (N, 3, 3): torch.float32
-            T_stack (N, 3):    torch.float32  <-- non-homogeneous translations
-            
-            focals  either
-                    (N,):    torch.float32  if every fx == fy and keep_focal_scalar==True
-                    (N,2):   torch.float32  otherwise (fx,fy) per view
-            dists   (N, 5):    torch.float32  <-- (rad_1, rad_2, tan_1, tan_2, rad_3)
-        """
-        P_stack = torch.stack(self.P_list, 0)
-        K_stack = torch.stack(self.K_list, 0)
-        R_stack = torch.stack(self.R_list, 0)
-        t_stack = torch.stack(self.T_list, 0)        # (N,3)
-        focals_2 = torch.tensor(self.f_list, dtype=torch.float32)  # (N,2)
-        dists = torch.tensor(self.distortions_list, dtype=torch.float32)  # (N,5)
-
-        if keep_focal_scalar and focals_2.shape[0] > 0:
-            # check fx == fy for all views within tolerance
-            if torch.allclose(focals_2[:,0], focals_2[:,1], atol=focal_tol, rtol=0):
-                focals = focals_2[:, 0].clone()  # (N,)
-                return P_stack, K_stack, R_stack, t_stack, focals, dists
-        # otherwise return (N,2)
-        return P_stack, K_stack, R_stack, t_stack, focals_2, dists
+        group = CameraGroup(
+            P=torch.stack(self.P_list, 0),
+            K=torch.stack(self.K_list, 0),
+            R=torch.stack(self.R_list, 0),
+            t=torch.stack(self.t_list, 0),
+            from_blenderworld=torch.stack(self.from_blender_list, 0),
+            image_size_wh=image_sizes_tensor,
+        )
+        return group if device is None else group.to(device)
