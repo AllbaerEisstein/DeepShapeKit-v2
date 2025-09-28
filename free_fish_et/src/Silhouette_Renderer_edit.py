@@ -59,11 +59,18 @@ class Silhouette_Renderer:
             faces_per_pixel=1,
         )
 
+        # I have no clue why we need this.....
+        invert_xy = torch.tensor([
+            [-1,0,0],
+            [0,-1,0],
+            [0,0,1]
+        ])
+
         cameras = PerspectiveCameras(
             image_size=image_size_batch,
             focal_length=focal_lengths,
             principal_point=principal_points,
-            R=R_p3d,
+            R=invert_xy.to(device=self.device, dtype=dtype) @ R_p3d.transpose(1,2),
             T=T_p3d,
             in_ndc=False,
             device=self.device,
