@@ -100,18 +100,18 @@ class fish_model:
 
         # repeat the pattern 0.0, -0.05, 0.0 for every bone (every three entries in bone_angle_min/max)
         for i in range(self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.05, 0.0
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
 
         # the last 3 bones should have different limits
         for i in range(self.n_body_bones - 3, self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.05, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.05, 0.0
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
 
         # the last bone should have a different limit
         for i in range(self.n_body_bones - 1, self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -0.07, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 0.07, 0.0
+            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
+            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
@@ -164,7 +164,7 @@ class fish_model:
         self.device_active = True
 
 
-    def __call__(self, global_ori, body_pose, body_bone_length, scale=1, pose2rot=True, deform=True):
+    def __call__(self, global_ori, body_pose, body_bone_length, scale=torch.tensor(1), pose2rot=True, deform=True):
         """
         Args:
             global_ori (BS, 3): BS (batch-size) different exponential map representations of global rotation

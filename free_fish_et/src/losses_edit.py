@@ -12,8 +12,7 @@ https://github.com/marcbadger/avian-mesh
 import torch
 import torch.nn.functional as F
 
-from src.geometry import perspective_projection, perspective_projection_ref
-import src.constants as constants
+from src.geometry import perspective_projection
 from typing import Optional
 
 
@@ -26,15 +25,13 @@ def gmof(x, sigma):
     return (sigma_squared * x_squared) / (sigma_squared + x_squared)
 
 
-def camera_fitting_loss(
+def keypoint_reprojection_loss_global(
     model_keypoints: torch.Tensor,
-    proj_m: torch.Tensor,  # rotation: torch.Tensor, camera_t: torch.Tensor, focal_length: torch.Tensor, camera_center: torch.Tensor,
+    proj_m: torch.Tensor,
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
-    distortion: Optional[torch.Tensor] = None,
 ):
     # Project model keypoints
-    # projected_keypoints = perspective_projection_ref(model_keypoints, rotation, camera_t, focal_length, camera_center, distortion)
     projected_keypoints = perspective_projection(model_keypoints, proj_m)
 
     # Weighted robust reprojection loss
@@ -47,13 +44,13 @@ def camera_fitting_loss(
     return total_loss.sum()
 
 
-def body_fitting_loss(
+def kpt_repr_plus_bone_pose_and_length_loss(
     model_keypoints: torch.Tensor,
     bone_angle_min: torch.Tensor,
     bone_angle_max: torch.Tensor,
     bone_length_min: torch.Tensor,
     bone_length_max: torch.Tensor,
-    proj_m: torch.Tensor,  # rotation: torch.Tensor, camera_t: torch.Tensor, focal_length: torch.Tensor, camera_center: torch.Tensor,
+    proj_m: torch.Tensor,
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
     body_pose: torch.Tensor,
@@ -64,11 +61,9 @@ def body_fitting_loss(
     bone_weight=1,
     pose_init: Optional[torch.Tensor] = None,
     bone_init: Optional[torch.Tensor] = None,
-    distortion: Optional[torch.Tensor] = None,
 ):
     # Project model keypoints
     device = body_pose.device
-    # projected_keypoints = perspective_projection_ref(model_keypoints, rotation, camera_t, focal_length, camera_center, distortion)
     projected_keypoints = perspective_projection(model_keypoints, proj_m)
 
     # Weighted robust reprojection loss
@@ -83,7 +78,7 @@ def body_fitting_loss(
                + (angle_min_lim - body_pose).clamp(0, float("Inf"))
     lim_loss = lim_weight * lim_loss
 
-    # Prior Loss
+    # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
     if pose_init == None or bone_init == None:
         prior_loss = body_pose.abs()
         prior_loss = prior_weight * prior_loss
@@ -111,19 +106,29 @@ def body_fitting_loss(
     return total_loss.sum()
 
 
+def mask_fitting_loss(proj_masks, masks, mask_weight):
+    # L1 mask loss
+    total_loss = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
+    total_loss = mask_weight * total_loss
+
+    return total_loss.sum()
+
+
+
+
+
+
 def kpts_fitting_loss(
     model_keypoints,
     proj_m,
     keypoints_2d,
     keypoints_conf,
-    # rotation, camera_t, focal_length, camera_center,
     body_pose,
     bone_length,
     prior_weight=1,
     pose_init=None,
     bone_init=None,
     sigma=100,
-    distortion=None,
 ):
     device = body_pose.device
 
@@ -145,14 +150,6 @@ def kpts_fitting_loss(
         ).abs().sum()
         init_loss = init_loss * prior_weight
         total_loss = reprojection_loss.sum(dim=-1) + init_loss.sum()
-
-    return total_loss.sum()
-
-
-def mask_fitting_loss(proj_masks, masks, mask_weight):
-    # L1 mask loss
-    total_loss = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
-    total_loss = mask_weight * total_loss
 
     return total_loss.sum()
 

@@ -629,14 +629,17 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
     with open(dataset_path / 'index.json', 'r') as jf:
         index_json = json.load(jf)
 
-    zero_dict = { # for reusing
-        kpt_name: [0.0, 0.0, 0.0]
-        for kpt_name in kpt_names_dict.values()
-    }
-    no_instance_detected_dict = { # for reusing
-        kpt_name: [-1.0, -1.0, -1.0]
-        for kpt_name in kpt_names_dict.values()
-    }
+    def make_zero_dict() -> dict[str, list[float]]:
+        return {
+            kpt_name: [0.0, 0.0, 0.0]
+            for kpt_name in kpt_names_dict.values()
+        }
+
+    def make_no_instance_detected_dict() -> dict[str, list[float]]:
+        return {
+            kpt_name: [-1.0, -1.0, -1.0]
+            for kpt_name in kpt_names_dict.values()
+        }
 
     views = index_json["frame_folders"]
 
@@ -651,7 +654,8 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
             frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
             instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                frame2prediction[frame_number] = InstancesKeypointsDict()
+                if frame_number not in frame2prediction:
+                    frame2prediction[frame_number] = InstancesKeypointsDict()
                 _, instances = infer_keypoints.inference(model, img)
 
                 if len(instances) != 1:
@@ -667,7 +671,7 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
                     In both cases, we indicate that with a -1 instance number and all -1 coordinate and conf values.
                     """
                     print(f"   keypoint-detection missed all instances in frame {frame_number} ({Path(img).name})")
-                    frame2prediction[frame_number]['-1'] = no_instance_detected_dict
+                    frame2prediction[frame_number]['-1'] = make_no_instance_detected_dict()
                     continue       
                 
                 # TODO: If keypoint detection detected multiple instances, get the instance with the best criteria, e.g. most keypoints detected. The other instance is considered a wrong detection.
@@ -677,9 +681,9 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
                     # we know there is an instance in the image because of the instance segmentation step,
                     # but keypoint detection missed it.
                     print("      keypoint-detection missed this instance")
-                    frame2prediction[frame_number][str(instance_number)] = no_instance_detected_dict
+                    frame2prediction[frame_number][str(instance_number)] = make_no_instance_detected_dict()
                 else:
-                    frame2prediction[frame_number][str(instance_number)] = zero_dict
+                    frame2prediction[frame_number][str(instance_number)] = make_zero_dict()
                     for index, (x, y, c) in enumerate(kpts):
                         print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
                         frame2prediction[frame_number][str(instance_number)][kpt_names_dict[index]] = [

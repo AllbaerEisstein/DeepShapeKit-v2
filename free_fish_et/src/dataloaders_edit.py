@@ -200,7 +200,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
             # extract keypoints for each instance
             for instance_number in self.instance_indices:
-                if str(instance_idx) not in self.view_2_frames_2_instances_2_kpts[view][frame_key].keys():
+                if str(instance_number) not in self.view_2_frames_2_instances_2_kpts[view][frame_key].keys():
                     kpt_present_mask[instance_number][view_index] = [False]*len(self.index_json["keypoint_list"])
                 else:
                     for kpt_index, kpt_name in enumerate(self.index_json["keypoint_list"]):
@@ -262,7 +262,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                     bboxes.append([0,0,0,0])
                     crops.append(np.zeros((1, 1), dtype=np.uint8))
                     masks.append(np.zeros((1, 1), dtype=np.uint8))
-                    full_masks.append(np.zeros((self.uniform_img_size[0], self.uniform_img_size[1]), dtype=np.uint8))
+                    full_masks.append(np.zeros((self.uniform_img_size[1], self.uniform_img_size[0]), dtype=np.uint8))
                     seg_mask_present_mask[instance_number][view_index] = False
                     continue
 
@@ -280,7 +280,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                     pad_y = (max_h - h) / 2.0
                     # bbox is specified in x1, y1, x2, y2 format
                     bbox = [bbox[0]+pad_x, bbox[1]+pad_y, bbox[2]+pad_x, bbox[3]+pad_y]
-                    full_mask = np.pad(full_mask, ((pad_x, pad_x), (pad_y, pad_y)))
+                    full_mask = np.pad(full_mask, ((pad_y, pad_y), (pad_x, pad_x)))
                     
                 bboxes.append(bbox)
                 crops.append(crop)
@@ -375,7 +375,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         #     print("PIL load OK")
         # except Exception as e:
         #     print("PIL failed:", e)
-        return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE)).transpose()
+        return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE))
     
     def _get_present_instances(self, f_idx: int) -> list[int]:
         """

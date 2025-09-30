@@ -16,15 +16,15 @@ if __name__ == '__main__':
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/left.mp4',
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/bottom.mp4',
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/top_right.mp4',
-                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/006_Positive Z (Fish Ventral Side).mp4',
-                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/004a_Positive X (Fish Front).mp4',
-                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/003_Fish Top R.mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/006_Positive Z (Fish Ventral Side).mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/004a_Positive X (Fish Front).mp4',
+                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders/003_Fish Top R.mp4',
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes/006_Positive Z (Fish Ventral Side).mp4',
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes/004a_Positive X (Fish Front).mp4',
                 # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes/003_Fish Top R.mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/006_Positive Z (Fish Ventral Side).mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/004a_Positive X (Fish Front).mp4',
-                '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/003_Fish Top R.mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/006_Positive Z (Fish Ventral Side).mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/004a_Positive X (Fish Front).mp4',
+                # '/home/jonathan/Documents/fish_reconstruction/deepshapekit-v2/bluegill_data/videos/bluegill_renders_axes_rotating/003_Fish Top R.mp4',
             ]
     ]
 
@@ -33,12 +33,12 @@ if __name__ == '__main__':
     segmentation_model_path = Path('src/DSKv2/cygill_seg.pt')
     pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
 
-    # mesh_path               = str(Path('src/DSKv2/Bluegill_Body_mesh.json'))
-    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
+    mesh_path               = str(Path('src/DSKv2/Bluegill_Body_mesh.json'))
+    pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
 
-    mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
-    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
-    pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube_rotating.json'))
+    # mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
+    # # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube.json'))
+    # pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Test_Cube_rotating.json'))
 
     cam_matrices_path       = Path('src/DSKv2/cam_matrices.json')
     

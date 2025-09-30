@@ -27,6 +27,7 @@ class LBS():
             parents (JN): list of indices of the parent of every joint (e.g. [-1,0,1,2,3,4]) for 6 joints
             weights (n_vertices, n_bones): 
         """
+        self.J = J
         # the head joint is just the origin of the mesh. it is excluded
         self.n_body_joints = J.shape[1] - 1
 

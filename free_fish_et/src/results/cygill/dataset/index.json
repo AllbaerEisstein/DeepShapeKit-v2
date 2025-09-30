@@ -727,7 +727,7 @@
   },
   "status": "keypoints_detected",
   "image_count": 151,
-  "max_n_instances": 4,
+  "max_n_instances": 1,
   "keypoint_list": [
     "mouth tip",
     "gill",

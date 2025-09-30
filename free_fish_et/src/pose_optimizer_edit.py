@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 from src import fish_model_edit as fish_model
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
-from src.losses_edit import camera_fitting_loss, body_fitting_loss, mask_fitting_loss
+from src.losses_edit import keypoint_reprojection_loss_global, kpt_repr_plus_bone_pose_and_length_loss, mask_fitting_loss
 
 
 class OptimizeMV:
@@ -111,7 +111,8 @@ class OptimizeMV:
         body_bone_length = init_body_bone_length.clone().detach()
         scale = init_scale.clone().detach()
 
-        # Stage 1: optimize global_orient, translation, scale
+        # ============ Stage 1: optimize global_orient, translation, scale ============
+        # ============ loss: keypoint reprojection l2 distance, mask l1 distance ======
         for param in [body_pose, body_bone_length]:
             param.requires_grad_(False)
         for param in [global_orient, global_t, scale]:
@@ -120,18 +121,26 @@ class OptimizeMV:
             [global_orient, global_t, scale], lr=self.step_size
         )
         for _ in range(self.num_iters):
+            print(f"Stage 1 - global ori: {global_orient}")
+            print(f"Stage 1 - body global t: {global_t}")
+            print(f"Stage 1 - scale: {scale}")
+            print(f"Stage 1 - body pose: {body_pose}")
+            print(f"Stage 1 - body bone length: {body_bone_length}")
+            # Apply global ori and scale
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=body_pose,
                 body_bone_length=body_bone_length,
                 scale=scale,
             )
-            # Reprojection loss
+            # Apply global t
             model_kpts = out["keypoints"].to(self.device) + global_t
+            # Keypoint reprojection loss
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             # TODO: filter missing keypoints before this step based on confidence
+            # -> in kpt reprojection loss, squared confidence is a factor for each keypoint loss
             loss = (
-                camera_fitting_loss(model_kpts, proj_m, kpts_2d, kpts_conf)
+                keypoint_reprojection_loss_global(model_kpts, proj_m, kpts_2d, kpts_conf)
                 + self.prior_weight * (global_t - init_t).abs().sum()
             )
             # Silhouette loss
@@ -145,7 +154,8 @@ class OptimizeMV:
             loss.backward()
             opt_global.step()
 
-        # Stage 2: refine body_pose, bone_length, global, scale
+        # ============ Stage 2: refine body_pose, bone_length, global_t, scale ============
+        # ============ loss: keypoint L2-distance, bone constraint loss (angle/length min and max)
         for param in [body_pose, body_bone_length, global_orient, global_t, scale]:
             param.requires_grad_(True)
         opt_body = torch.optim.Adam(
@@ -156,8 +166,14 @@ class OptimizeMV:
         # TODO: what happens here?
         kpts_conf[:, -3] = 0
         kpts_conf[:, -1] = 0
+        # TODO: is this disabling y == 0 keypoints?
         kpts_conf[keypoints[..., 2] == 0] = 0
         for _ in range(self.num_iters):
+            print(f"Stage 2 - global ori: {global_orient}")
+            print(f"Stage 2 - body global t: {global_t}")
+            print(f"Stage 2 - scale: {scale}")
+            print(f"Stage 2 - body pose: {body_pose}")
+            print(f"Stage 2 - body bone length: {body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=body_pose,
@@ -166,7 +182,7 @@ class OptimizeMV:
             )
             m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
-            loss = body_fitting_loss(
+            loss = kpt_repr_plus_bone_pose_and_length_loss(
                 m_kpts,
                 self.fish.bone_angle_min,
                 self.fish.bone_angle_max,
@@ -185,7 +201,8 @@ class OptimizeMV:
             loss.backward()
             opt_body.step()
 
-        # Stage 3: tail + silhouette offset
+
+        # ============ Stage 3: tail + silhouette offset ============
         # TODO: silhouette offset?
         sil_offset = torch.zeros((2, 3), device=self.device, requires_grad=True)
         for p in [body_pose, body_bone_length, global_orient, global_t, scale, sil_offset]:
@@ -206,6 +223,11 @@ class OptimizeMV:
         init_bp = body_pose.clone().detach()
         init_bl = body_bone_length.clone().detach()
         for _ in range(self.num_iters):
+            print(f"Stage 3 - global ori: {global_orient}")
+            print(f"Stage 3 - body global t: {global_t}")
+            print(f"Stage 3 - scale: {scale}")
+            print(f"Stage 3 - body pose: {body_pose}")
+            print(f"Stage 3 - body bone length: {body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=body_pose,
@@ -214,7 +236,7 @@ class OptimizeMV:
             )
             m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
-            loss = body_fitting_loss(
+            loss = kpt_repr_plus_bone_pose_and_length_loss(
                 m_kpts,
                 self.fish.bone_angle_min,
                 self.fish.bone_angle_max,

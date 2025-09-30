@@ -61,7 +61,7 @@ def triangulation_LBFGS(
     X = X_init.clone().detach().requires_grad_()
 
     losses: list[float] = []
-    optimizer = torch.optim.LBFGS([X], lr=1, max_iter=100, line_search_fn='strong_wolfe')
+    optimizer = torch.optim.LBFGS([X], lr=1, max_iter=1000, line_search_fn='strong_wolfe')
 
     def closure() -> torch.Tensor:
         projected_points = camera_group.perspective_projection_from_blworld(

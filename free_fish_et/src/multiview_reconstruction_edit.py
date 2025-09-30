@@ -111,11 +111,15 @@ def save_reconstruction_images(
     view_names: List[str],
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
-    draw_verts: bool = False
+    draw_verts: bool = False,
+    draw_coordinate_axes: bool = True,
+    annotate_global_t: bool = True,
+    annotate_keypoints_with_coords: bool = True,
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
-    overlay silhouette in red with given blend_factor, draw keypoints (blue), and save.
+    overlay silhouette in red with given blend_factor, draw keypoints (blue), optionally
+    project the world coordinate axes, and annotate projected world-space locations.
     """
 
     silhouettes = renderer(reconstructed_vertices_local, faces_from_vert_indices, global_t)
@@ -132,10 +136,50 @@ def save_reconstruction_images(
     keypoints_world = (reconstructed_keypoints_local + global_t).squeeze(0)
     keypoints_proj = cameras.perspective_projection_from_blworld(keypoints_world.unsqueeze(0)).detach().cpu()
     keypoints_proj = keypoints_proj.squeeze(0)
+    keypoints_world_np = keypoints_world.detach().cpu().numpy()
 
     verts_world = (reconstructed_vertices_local + global_t).squeeze(0)
     verts_proj = cameras.perspective_projection_from_blworld(verts_world.unsqueeze(0)).detach().cpu()
     verts_proj = verts_proj.squeeze(0)
+
+    global_t_tensor = global_t.reshape(1, 1, 3)
+    if global_t_tensor.device != verts_world.device:
+        global_t_tensor = global_t_tensor.to(verts_world.device)
+    global_t_proj = cameras.perspective_projection_from_blworld(global_t_tensor)
+    global_t_proj_np = global_t_proj.detach().cpu().numpy()
+    global_t_world_np = global_t_tensor.detach().cpu().numpy().reshape(3)
+
+    axes_projection_np = None
+    axes_metadata = None
+    if draw_coordinate_axes:
+        origin_world = torch.tensor([0.0,0.0,0.0], dtype=verts_world.dtype, device=verts_world.device)
+        axis_length = 50
+        axis_dirs = torch.eye(3, dtype=verts_world.dtype, device=verts_world.device)
+        tick_fracs = [n / 4.0 for n in range(1, axis_length * 4 + 1)]
+        world_points = [origin_world]
+        axes_metadata = {"origin_idx": 0, "axes": {}, "axis_length": axis_length}
+
+        for axis_idx, axis_name in enumerate(["x", "y", "z"]):
+            axis_vec = axis_dirs[axis_idx] * axis_length
+            end_point = origin_world + axis_vec
+            world_points.append(end_point)
+            end_idx = len(world_points) - 1
+
+            tick_indices = []
+            for frac in tick_fracs:
+                tick_point = origin_world + axis_vec * frac
+                world_points.append(tick_point)
+                tick_indices.append(len(world_points) - 1)
+
+            axes_metadata["axes"][axis_name] = {
+                "end_idx": end_idx,
+                "tick_indices": tick_indices,
+                "tick_fracs": tick_fracs,
+            }
+
+        axis_points_tensor = torch.stack(world_points, dim=0).unsqueeze(0)
+        axes_projection = cameras.perspective_projection_from_blworld(axis_points_tensor)
+        axes_projection_np = axes_projection.detach().cpu().numpy()
 
     for view_idx in range(n_views):
         # Read original image (BGR)
@@ -182,6 +226,19 @@ def save_reconstruction_images(
                 cv2.circle(blended, (ui, vi), radius=5, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
                 cv2.putText(blended, name, (ui, vi + 15), cv2.FONT_HERSHEY_SIMPLEX,
                             fontScale=0.35, color=(255, 0, 0), thickness=1, lineType=cv2.LINE_AA)
+                if annotate_keypoints_with_coords:
+                    kp_coords = keypoints_world_np[kp_idx]
+                    coord_text = f"({kp_coords[0]:.2f}, {kp_coords[1]:.2f}, {kp_coords[2]:.2f})"
+                    cv2.putText(
+                        blended,
+                        coord_text,
+                        (ui, vi + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.3,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
 
         if draw_verts:
             for vert_idx in range(verts_proj.size(1)):
@@ -189,6 +246,141 @@ def save_reconstruction_images(
                 vi = int(round(verts_proj[view_idx, vert_idx, 1].item()))
                 if 0 <= ui < W and 0 <= vi < H:
                     cv2.circle(blended, (ui, vi), radius=2, color=(0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+
+        if annotate_global_t:
+            gt_pt = global_t_proj_np[view_idx, 0]
+            if np.all(np.isfinite(gt_pt)):
+                ui_gt = int(round(float(gt_pt[0])))
+                vi_gt = int(round(float(gt_pt[1])))
+                if 0 <= ui_gt < W and 0 <= vi_gt < H:
+                    cv2.circle(
+                        blended,
+                        (ui_gt, vi_gt),
+                        radius=6,
+                        color=(0, 255, 255),
+                        thickness=-1,
+                        lineType=cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        blended,
+                        "global_t",
+                        (ui_gt + 6, vi_gt - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35,
+                        (0, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    coord_text = (
+                        f"({global_t_world_np[0]:.2f}, {global_t_world_np[1]:.2f}, {global_t_world_np[2]:.2f})"
+                    )
+                    cv2.putText(
+                        blended,
+                        coord_text,
+                        (ui_gt + 6, vi_gt + 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        if draw_coordinate_axes and axes_projection_np is not None and axes_metadata is not None:
+            origin_idx = axes_metadata["origin_idx"]
+            origin_pt = axes_projection_np[view_idx, origin_idx]
+            if np.all(np.isfinite(origin_pt)):
+                overlay = blended.copy()
+                axis_length_world = axes_metadata["axis_length"]
+
+                for axis_name, meta in axes_metadata["axes"].items():
+                    end_pt = axes_projection_np[view_idx, meta["end_idx"]]
+                    if not np.all(np.isfinite(end_pt)):
+                        continue
+
+                    p0 = origin_pt.astype(np.float32)
+                    p1 = end_pt.astype(np.float32)
+                    axis_vec_px = p1 - p0
+                    axis_len_px = np.linalg.norm(axis_vec_px)
+                    if axis_len_px < 1e-3:
+                        continue
+
+                    axis_dir_unit = axis_vec_px / axis_len_px
+                    perp_dir_unit = np.array([-axis_dir_unit[1], axis_dir_unit[0]], dtype=np.float32)
+                    tick_length_px = min(4.0, axis_len_px * 0.05)
+                    axis_line_thickness = 2
+
+                    cv2.line(
+                        overlay,
+                        tuple(np.round(p0).astype(int)),
+                        tuple(np.round(p1).astype(int)),
+                        color=(255, 255, 255),
+                        thickness=axis_line_thickness,
+                        lineType=cv2.LINE_AA,
+                    )
+
+                    for frac, tick_idx in zip(meta["tick_fracs"], meta["tick_indices"]):
+                        tick_pt = axes_projection_np[view_idx, tick_idx]
+                        if not np.all(np.isfinite(tick_pt)):
+                            continue
+
+                        tick_center = tick_pt.astype(np.float32)
+                        offset = perp_dir_unit * (tick_length_px * 0.5)
+                        tick_start = tick_center - offset
+                        tick_end = tick_center + offset
+                        cv2.line(
+                            overlay,
+                            tuple(np.round(tick_start).astype(int)),
+                            tuple(np.round(tick_end).astype(int)),
+                            color=(255, 255, 255),
+                            thickness=1,
+                            lineType=cv2.LINE_AA,
+                        )
+
+                        value = frac * axis_length_world
+                        if axis_length_world >= 10:
+                            text_value = f"{value:.0f}"
+                        elif axis_length_world >= 1:
+                            text_value = f"{value:.1f}".rstrip("0").rstrip(".")
+                        else:
+                            text_value = f"{value:.2f}".rstrip("0").rstrip(".")
+
+                        text_anchor = tick_center + perp_dir_unit * (tick_length_px + 6.0)
+                        cv2.putText(
+                            overlay,
+                            text_value,
+                            tuple(np.round(text_anchor).astype(int)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35,
+                            (255, 255, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                    label_anchor = p1 + axis_dir_unit * 12.0 + perp_dir_unit * 6.0
+                    cv2.putText(
+                        overlay,
+                        axis_name.upper(),
+                        tuple(np.round(label_anchor).astype(int)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+                origin_label_pos = origin_pt.astype(np.float32) + np.array([6.0, -6.0], dtype=np.float32)
+                cv2.putText(
+                    overlay,
+                    "0",
+                    tuple(np.round(origin_label_pos).astype(int)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                blended = cv2.addWeighted(overlay, 0.6, blended, 0.4, 0)
 
         # Prepare output dirs & filename
         view_output_dir = os.path.join(outdir, view_names[view_idx] + "_reconstruction_images")
@@ -282,16 +474,6 @@ def reconstruct(
             print(f"Sample {idx} missing, skipping")
             continue
 
-
-        # if not sample["full_kpts"]:
-        #     print(f"Frame {idx} missing keypoints, using last valid params")
-        #     # replicate last params
-        #     parameters.extend(parameters[-4:])
-        #     sample_data.append(sample_data[-1] if sample_data else [0])
-        #     pbar.update(1)
-        #     continue
-
-
         kpt_present_mask = instance_sample['kpt_present_mask']
         seg_mask_present_mask = instance_sample['seg_mask_present_mask']
 
@@ -330,42 +512,31 @@ def reconstruct(
             index=idx,
             bboxs=bboxes,
         )
-        reconstructed_vertices_local, reconstructed_keypoints_local, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
+        vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
 
         parameters += [global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est]
-        sample_data.append([views_indices, orig_img_paths, reconstructed_keypoints_local, bboxes, idx])
+        sample_data.append([views_indices, orig_img_paths, keypoints_world_est, bboxes, idx])
 
-        # save_rendered_views(
-        #     outdir,
-        #     instance_number,
-        #     idx,
-        #     img_paths,
-        #     mesh_vertices_after_reconstruction,
-        #     *cam_params,
-        #     principal_points,
-        #     keypoints_after_reconstruction,
-        #     bboxes,
-        # )
-
-        print(f"keypoints_after_reconstruction: {reconstructed_keypoints_local}")
-
+        out_reconstructed = fish(global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
+        reconstructed_keypoints_local = out_reconstructed["keypoints"].to(device)
+        reconstructed_vertices_local = out_reconstructed["vertices"].to(device)
 
         save_reconstruction_images(
             orig_image_paths=orig_img_paths,
             outdir=outdir,
             renderer=renderer,
             instance_number=instance_number,
-            cameras=camera_group_cpu,
+            cameras=camera_group_device,
             reconstructed_keypoints_local=reconstructed_keypoints_local,
             reconstructed_vertices_local=reconstructed_vertices_local,
-            faces_from_vert_indices=fish.faces.unsqueeze(0),
-            global_t=global_t_est,
+            faces_from_vert_indices=fish.faces.unsqueeze(0).to(device),
+            global_t=global_t_est.to(device),
             keypoint_names=dataset.index_json["keypoint_list"],
             view_names=dataset.views
         )
 
         if save_models:
-            save_obj_model(outdir, idx, instance_number, reconstructed_vertices_local, fish)
+            save_obj_model(outdir, idx, instance_number, vertices_world_est, fish)
 
         pbar.update(1)
 

@@ -52,18 +52,34 @@ def fit_geometry(
     camera_group = cameras.to(keypoints.device)
     observed_kpts_3d = mutils.get_gt_3d(keypoints, camera_group, LBFGS=True)
 
+    # Filter keypoints for confidence > 0
     valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0
     valid_kpts_3d = observed_kpts_3d[valid_kpts_3d_boolmask, :3]
     fish_mesh_kpts_local = fish_mesh_kpts_local[valid_kpts_3d_boolmask, :]
 
     # Procrustes with available 3D kpts
-    # procrustes 
-    R, t, s = mutils.Procrustes(fish_mesh_kpts_local, valid_kpts_3d)
-    aa, _ = cv2.Rodrigues(R.numpy())
+    # Procrustes yields R, t, s so that if applying R,t,s to the fish mesh, 
+    # the mesh keypoints align best with the triangulated observed keypoints
+    # (Procrustes because the gt fish might be articulated but we try to fit 
+    # the rest model to the keypoints anyway, just like Procrustes did)
+    R_matrix, t, s = mutils.Procrustes(fish_mesh_kpts_local, valid_kpts_3d)
+    R_exp_map, _ = cv2.Rodrigues(R_matrix.numpy())
 
-    init_ori = torch.tensor(aa).reshape(1, 3).float().to(keypoints.device)
+    init_ori = torch.tensor(R_exp_map).reshape(1, 3).float().to(keypoints.device)
     init_t = t
     init_s = s
+
+    # init_t = torch.tensor([
+    #     8.999272346496582,
+    #     -7.749894598980923e-16,
+    #     -0.0403549000620842
+    #   ]).float().to(keypoints.device)
+    # init_ori = torch.tensor([
+    #     1.3050808906555176,
+    #     1.1443520784378052,
+    #     -1.3050808906555176
+    #   ]).float().to(keypoints.device).unsqueeze(0)
+    #init_s = torch.tensor(1).to(keypoints.device)
 
     return init_ori, init_t, init_s
 
@@ -122,7 +138,7 @@ def fit_mesh(
     if init_body_pose is None:
         init_body_pose = torch.zeros([1, fish.n_body_bones * 3], device=device)
     if init_body_bone_length is None:
-        init_body_bone_length = torch.ones([1, fish.n_bones], device=device)
+        init_body_bone_length = torch.ones([1, fish.n_body_bones], device=device)
 
     #### Change suitable format for optimizer
     ###### particularly, combine orient and body pose
@@ -138,7 +154,7 @@ def fit_mesh(
     ), "All inputs must reside on the target device"
 
     ### Mesh fitting
-    vertices, global_ori_plus_pose_est, body_bone_est, scale_est, t, losses = optimizer(
+    vertices, global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est, losses = optimizer(
         init_ori_plus_pose,
         init_body_bone_length,
         init_t,
@@ -153,16 +169,22 @@ def fit_mesh(
     )
 
     ### Generating mesh output
-    fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
+    fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, deform=True)
 
     # NOTE:
     # things to check: Correct row-major, column major order always?
     # pixel/mm/m? E.g. in fish model there seems to be a conversion cm -> m
     # world/local coords for fish model?
-    vertex_posed = fish_output["vertices"] + t
-    mesh_keypoint = fish_output["keypoints"] + t
+    vertices_world_est = fish_output["vertices"] + global_t_est
+    keypoints_world_est = fish_output["keypoints"] + global_t_est
 
-    return vertex_posed, mesh_keypoint, t, global_ori_plus_pose_est, body_bone_est, scale_est, losses
+    return vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, losses
+    
+    # # sanity-checking code; this is meant for skipping reconstruction
+    # fish_output = fish(init_ori_plus_pose[:, 0:3], init_ori_plus_pose[:, 3:], init_body_bone_length, init_s, deform=True)
+    # vertices_world_est = fish_output["vertices"] + init_t.cpu()
+    # keypoints_world_est = fish_output["keypoints"] + init_t.cpu()
+    # return vertices_world_est, keypoints_world_est, init_t, init_ori_plus_pose, init_body_bone_length, init_s, None
 
 
 def multiview_rigid_alignment(
