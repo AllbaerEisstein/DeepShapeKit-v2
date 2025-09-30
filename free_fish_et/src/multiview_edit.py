@@ -93,10 +93,10 @@ def fit_mesh(
     renderer: Silhouette_Renderer,
     device: str,
     init_global_ori: Optional[torch.Tensor] = None,
-    init_t: Optional[torch.Tensor] = None,
-    init_s: Optional[torch.Tensor] = None,
     init_body_pose: Optional[torch.Tensor] = None,
     init_body_bone_length: Optional[torch.Tensor] = None,
+    init_s: Optional[torch.Tensor] = None,
+    init_t: Optional[torch.Tensor] = None,
     index: Optional[torch.Tensor] = None,
     bboxs: Optional[torch.Tensor] = None,
 ):
@@ -104,8 +104,6 @@ def fit_mesh(
     Only used in multiview and crossview fitting:
     Input:
         cameras: camera parameters for each view
-        init_pose (vn, 4*3): body pose in axis-angle (exclude root joint orient)
-        init_bone (vn, 4): bone length
     """
     # move to device
     camera_group = cameras.to(device)

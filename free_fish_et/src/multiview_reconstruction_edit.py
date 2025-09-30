@@ -496,9 +496,7 @@ def reconstruct(
 
 
         # initialize from previous solution if available
-        init = (
-            None  # (ori, pose, bone, scale, trans) unpacked inside multiview.fit_mesh
-        )
+        init = parameters[-1] if parameters else None
 
         result = multiview.fit_mesh(
             fish,
@@ -514,7 +512,7 @@ def reconstruct(
         )
         vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
 
-        parameters += [global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est]
+        parameters += [global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, global_t_est]
         sample_data.append([views_indices, orig_img_paths, keypoints_world_est, bboxes, idx])
 
         out_reconstructed = fish(global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
