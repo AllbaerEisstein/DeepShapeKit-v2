@@ -75,6 +75,11 @@ class fish_model:
         self.kintree_table = torch.tensor(dd["kintree_table"])[:, :]
         self.parent_indices = self.kintree_table[0][:]
 
+        # a bone group is a set of indices for bones and keypoints that are going to be reconstructed together in one optimizer stage
+        # keypoints and bones belonging to group 0 are at keypoint_groups[0] and bone_groups[0], respectively
+        self.bone_groups = torch.stack([bg["bone_indices"] for bg in dd["bone_groups"]])
+        self.keypoint_groups = torch.stack([bg["keypoint_indices"] for bg in dd["bone_groups"]])
+
         self.weights = torch.tensor(dd["weights"])
         self.vert2kpt = torch.tensor(dd["vert2kpt"])
 
@@ -141,24 +146,8 @@ class fish_model:
         self.bone_angle_max = self.bone_angle_max.to(self.device)
         self.bone_length_min = self.bone_length_min.to(self.device)
         self.bone_length_max = self.bone_length_max.to(self.device)
-        if not all(
-            self.faces.device == attr.device
-            for attr in [
-                self.kintree_table,
-                self.parent_indices,
-                self.weights,
-                self.vert2kpt,
-                self.J,
-                self.V,
-                self.bone_angle_min,
-                self.bone_angle_max,
-                self.bone_length_min,
-                self.bone_length_max,
-            ]
-        ):
-            raise ValueError(
-                "failed to move all fish object attributes to the same device"
-            )
+        self.bone_groups = self.bone_groups.to(self.device)
+        self.keypoint_groups = self.keypoint_groups.to(self.device)
         self.LBS = LBS(self.J, self.parent_indices, self.weights)
         self.device = self.faces.device
         self.device_active = True

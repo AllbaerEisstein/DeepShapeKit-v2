@@ -330,7 +330,7 @@ def _save_reconstruction_images(
                     draw_text(
                         blended,
                         f"{name}:\n{int(ci_pred*100)/100}",
-                        (ui_pred, vi_pred + conf_scaled_annot_radius + 10),
+                        (ui_pred, vi_pred + conf_scaled_annot_radius - 10),
                         font_scale=0.3,
                     )
                 metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = (
@@ -480,7 +480,7 @@ def _save_obj_model(
     model_dir = os.path.join(outdir, "models")
     _ensure_dir(model_dir)
 
-    obj_path = os.path.join(model_dir, f"{sample_index}_out_model_{fish_place - 1}.obj")
+    obj_path = os.path.join(model_dir, f"frame_{sample_index}_out_model_{fish_place}.obj")
     with open(obj_path, "w") as f:
         # vertices
         verts = vertex_posed[0]
@@ -516,6 +516,127 @@ def _save_pose_pickle(
         pickle.dump(data, pf, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+def _get_reconstruction_cache_paths(
+    outdir: str,
+    dataset_dir: str,
+    instance_number: int,
+) -> tuple[str, str]:
+    cache_dir = os.path.join(outdir, "reconstruction_cache")
+    dataset_name = os.path.basename(os.path.normpath(dataset_dir)) or "dataset"
+    filename = f"cache_{dataset_name}_instance_{instance_number}.pickle"
+    return cache_dir, os.path.join(cache_dir, filename)
+
+
+def _load_reconstruction_cache(cache_path: str) -> Optional[dict]:
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as handle:
+            return pickle.load(handle)
+    except Exception as exc:
+        print(f"Failed to load reconstruction cache '{cache_path}': {exc}")
+        return None
+
+
+def _save_reconstruction_cache(
+    cache_dir: str,
+    cache_path: str,
+    cache_payload: dict,
+) -> None:
+    _ensure_dir(cache_dir)
+    tmp_path = cache_path + ".tmp"
+    with open(tmp_path, "wb") as handle:
+        pickle.dump(cache_payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, cache_path)
+
+
+def _clear_reconstruction_cache(cache_path: str) -> None:
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except Exception as exc:
+        print(f"Warning: failed to remove reconstruction cache '{cache_path}': {exc}")
+
+
+def _save_pose_time_series_json(
+    outdir: str,
+    dataset_dir: str,
+    mesh_path: str,
+    fish: fish_model,
+    instance_number: int,
+    frame_payloads: list[dict],
+    dataset_meta: dict,
+) -> None:
+    if not frame_payloads:
+        return
+
+    pose_dir = os.path.join(outdir, "pose_time_series")
+    _ensure_dir(pose_dir)
+
+    dataset_name = os.path.basename(os.path.normpath(dataset_dir))
+    filename = f"pose_time_series_{dataset_name}_instance_{instance_number}.json"
+    path = os.path.join(pose_dir, filename)
+
+    processed_frames = sorted(payload["frame"] for payload in frame_payloads)
+    frame_start = processed_frames[0]
+    frame_end = processed_frames[-1]
+
+    fps = dataset_meta.get("fps")
+    if fps is not None:
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = None
+
+    meta = {
+        "source": "multiview_reconstruction_edit.py",
+        "dataset_dir": dataset_dir,
+        "dataset_name": dataset_name,
+        "instance": int(instance_number),
+        "bone_order": fish.dd.get("bone_order", []),
+        "virtual_bone_names": fish.dd.get("virtual_bone_names", []),
+        "frame_start": int(frame_start),
+        "frame_end": int(frame_end),
+        "frame_indices": processed_frames,
+        "mesh_file": mesh_path,
+    }
+
+    if fps is not None:
+        meta["fps"] = fps
+
+    if fps is not None and fps > 0:
+        def time_from_frame(frame_id: int) -> float:
+            return (frame_id - frame_start) / fps
+    else:
+        def time_from_frame(frame_id: int):
+            return None
+
+    frames = []
+    for payload in frame_payloads:
+        frame_dict = {
+            "frame": int(payload["frame"]),
+            "global_t": payload["global_t"],
+            "global_ori": payload["global_ori"],
+            "body_pose": payload["body_pose"],
+            "body_bone_length": payload["body_bone_length"],
+        }
+        if payload.get("scale") is not None:
+            frame_dict["scale"] = payload["scale"]
+        time_val = time_from_frame(frame_dict["frame"])
+        if time_val is None:
+            time_val = float(frame_dict["frame"] - frame_start)
+        frame_dict["time"] = time_val
+        frames.append(frame_dict)
+
+    payload = {
+        "meta": meta,
+        "frames": frames,
+    }
+
+    with open(path, "w", encoding="utf-8") as jf:
+        json.dump(payload, jf, indent=2)
+
+
 def reconstruct(
     mesh_path: str,
     dataset_dir: str,
@@ -528,6 +649,9 @@ def reconstruct(
     """
     Run multiview reconstruction for given frames.
     """
+
+    # --------------------------
+    # setup; instantiate classes
     device = setup_device(seed)
     print("Device:", device)
 
@@ -541,27 +665,71 @@ def reconstruct(
         mesh_path, device, camera_group_device
     )
 
+    # --------------------------
+    # load cache, if available
+    cache_dir, cache_path = _get_reconstruction_cache_paths(outdir, dataset_dir, instance_number)
+    cache_data = _load_reconstruction_cache(cache_path)
+
     parameters = []
     sample_data = []
+    pose_time_series_frames: list[dict] = []
+    processed_frames: set[int] = set()
+    cached_metrics: Optional[dict] = None
 
-    pbar = tqdm(total=len(frame_indices), desc=f"video {os.path.basename(dataset_dir)}")
+    if cache_data is not None:
+        cache_dataset = cache_data.get("dataset_dir")
+        cache_mesh = cache_data.get("mesh_path")
+        cache_frames = cache_data.get("frame_indices")
+        if (
+            (cache_dataset and cache_dataset != dataset_dir)
+            or (cache_mesh and cache_mesh != mesh_path)
+            or (cache_frames and list(cache_frames) != list(frame_indices))
+        ):
+            print("Existing reconstruction cache does not match current configuration; starting a new reconstruction run.")
+        else:
+            print(f"Resuming reconstruction from cache '{cache_path}'.")
+            parameters = cache_data.get("parameters", [])
+            sample_data = cache_data.get("sample_data", [])
+            pose_time_series_frames = cache_data.get("pose_time_series_frames", []) or []
+            cached_metrics = cache_data.get("metrics")
+            processed_frames = set(cache_data.get("processed_frames", []))
 
-    metrics = {
-        "orig_IoU": {
-            view_name: [] for view_name in dataset.views
-        },
-        "mask_IoU": {
-            view_name: [] for view_name in dataset.views
-        },
-        "keypoint_L2_distance": {
-            view_name: {
-                keypoint_name: [] for keypoint_name in dataset.index_json["keypoint_list"]
-            } for view_name in dataset.views
-        },
-    }
+    def _fresh_metrics() -> dict:
+        return {
+            "orig_IoU": {view_name: [] for view_name in dataset.views},
+            "mask_IoU": {view_name: [] for view_name in dataset.views},
+            "keypoint_L2_distance": {
+                view_name: {kpt: [] for kpt in dataset.index_json["keypoint_list"]}
+                for view_name in dataset.views
+            },
+        }
 
+    metrics = cached_metrics if cached_metrics is not None else _fresh_metrics()
 
+    if cached_metrics is not None:
+        cached_views = set(cached_metrics.get("orig_IoU", {}).keys())
+        if cached_views != set(dataset.views):
+            print("Cached reconstruction metrics do not match current dataset views; restarting reconstruction run.")
+            parameters = []
+            sample_data = []
+            pose_time_series_frames = []
+            processed_frames = set()
+            metrics = _fresh_metrics()
+
+    pbar = tqdm(
+        total=len(frame_indices),
+        desc=f"video {os.path.basename(dataset_dir)}",
+        initial=len(processed_frames),
+    )
+
+    # --------------------------
+    # loop through frames and reconstruct
     for idx in frame_indices:
+        if idx in processed_frames:
+            continue
+        
+        # --------------------------
+        # load from dataset
         try:
             instance_sample = dataset.__getitem__(idx, instance_number)
         except IndexError:
@@ -591,6 +759,8 @@ def reconstruct(
         views_indices, orig_img_paths = instance_sample['frames'], instance_sample['imgpaths']
         keypoints, masks, bboxes = _get_tensors_from_instance_sample(instance_sample)
 
+        # --------------------------
+        # reconstruct
 
         # initialize from previous solution if available
         init = parameters[-1] if parameters else None
@@ -609,12 +779,34 @@ def reconstruct(
         )
         vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
 
+        # --------------------------
+        # cache results
         parameters.append([global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, global_t_est])
         sample_data.append([views_indices, orig_img_paths, keypoints_world_est, bboxes, idx])
 
         out_reconstructed = fish(global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
         reconstructed_keypoints_local = out_reconstructed["keypoints"].to(device)
         reconstructed_vertices_local = out_reconstructed["vertices"].to(device)
+
+        global_ori_cpu = global_ori_plus_pose_est[:, :3].detach().cpu().view(-1).tolist()
+        body_pose_flat = global_ori_plus_pose_est[:, 3:].detach().cpu().view(-1).tolist()
+        body_pose_triplets = [
+            body_pose_flat[i : i + 3]
+            for i in range(0, len(body_pose_flat), 3)
+        ]
+        body_bone_lengths = body_bone_est.detach().cpu().view(-1).tolist()
+        global_t_list = global_t_est.detach().cpu().view(-1).tolist()
+        scale_list = scale_est.detach().cpu().view(-1).tolist()
+        pose_time_series_frames.append(
+            {
+                "frame": int(idx),
+                "global_ori": [float(x) for x in global_ori_cpu],
+                "body_pose": [[float(v) for v in triple] for triple in body_pose_triplets],
+                "body_bone_length": [float(v) for v in body_bone_lengths],
+                "global_t": [float(v) for v in global_t_list],
+                "scale": float(scale_list[0]) if scale_list else None,
+            }
+        )
 
         frame_metrics = _save_reconstruction_images(
             orig_image_paths=orig_img_paths,
@@ -643,9 +835,27 @@ def reconstruct(
             for kpt in dataset.index_json["keypoint_list"]:
                 metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
 
+        processed_frames.add(idx)
+
+        cache_payload = {
+            "parameters": parameters,
+            "sample_data": sample_data,
+            "metrics": metrics,
+            "pose_time_series_frames": pose_time_series_frames,
+            "processed_frames": sorted(processed_frames),
+            "last_frame": idx,
+            "frame_indices": list(frame_indices),
+            "dataset_dir": dataset_dir,
+            "mesh_path": mesh_path,
+            "instance_number": instance_number,
+        }
+        _save_reconstruction_cache(cache_dir, cache_path, cache_payload)
+
         pbar.update()
 
+    # reconstruction done
     pbar.close()
+
     _save_pose_pickle(
         outdir=outdir,
         start=frame_indices[0],
@@ -656,6 +866,18 @@ def reconstruct(
         mesh_file=mesh_path,
         index=frame_indices,
     )
+
+    _save_pose_time_series_json(
+        outdir=outdir,
+        dataset_dir=dataset_dir,
+        mesh_path=mesh_path,
+        fish=fish,
+        instance_number=instance_number,
+        frame_payloads=pose_time_series_frames,
+        dataset_meta=dataset.index_json,
+    )
+
+    _clear_reconstruction_cache(cache_path)
 
 
 

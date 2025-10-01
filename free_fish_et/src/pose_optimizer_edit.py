@@ -101,6 +101,9 @@ class OptimizeMV:
         batch_size = proj_m.shape[0]
         kpts_2d = keypoints[..., :2]
         kpts_conf = keypoints[..., 2].clone()
+        # in the extraction pipeline, undetected kpts have been set to conf=-1
+        # in the loss function, conf is a coefficient of the loss -> clamp to 0, 1
+        kpts_conf = kpts_conf.clamp(0.0, 1.0)
 
 
         # ===== Initialize parameters =====
@@ -161,12 +164,13 @@ class OptimizeMV:
         opt_body = torch.optim.Adam(
             [body_pose, body_bone_length, global_orient, global_t, scale], lr=self.step_size
         )
+        first_bone_group = self.fish.bone_groups[0]
+        first_kpt_group = self.fish.keypoint_groups[0]
         # relax tail keypoints
         kpts_conf = kpts_conf.fill_(0.8)
-        # TODO: what happens here?
-        kpts_conf[:, -3] = 0
-        kpts_conf[:, -1] = 0
-        # TODO: is this disabling y == 0 keypoints?
+        # Disable keypoints for this step that don't belong to the first bone group
+        kpts_conf[:, ~first_kpt_group] = 0
+        # reset the confidence of keypoints:
         kpts_conf[keypoints[..., 2] == 0] = 0
         for _ in range(self.num_iters):
             # print(f"Stage 2 - global ori: {global_orient}")

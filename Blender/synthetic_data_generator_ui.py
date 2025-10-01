@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Synthetic Dataset UI + TimedRender for YOLO Pose & Seg",
-    "author": "ChatGPT",
+    "author": "Jonathan Häßler",
     "version": (0, 4),
     # target Blender 4.5 and backwards-compatible with 2.8+
     "blender": (4, 5, 0),
@@ -22,10 +22,10 @@ from collections import defaultdict
 from mathutils import Vector, Matrix
 from bpy.props import (
     StringProperty, BoolProperty, FloatProperty, IntProperty,
-    PointerProperty
+    PointerProperty, CollectionProperty,
 )
 from bpy_extras.io_utils import ImportHelper
-from bpy.types import Panel, Operator, PropertyGroup
+from bpy.types import Panel, Operator, PropertyGroup, UIList 
 import cv2
 import numpy as np
 
@@ -50,6 +50,17 @@ BLENDERWORLD_2_CVWORLD = np.array([
 
 
 # --------------------------- Property Group ---------------------------------
+class SYNTH_BoneGroupItem(PropertyGroup):
+    names_csv: StringProperty(
+        name="Bones/Keypoints",
+        description="Comma-separated bone and/or keypoint names",
+        default=""
+    )
+    include_children: BoolProperty(
+        name="Include Children",
+        description="For bones listed here: also add all descendants recursively",
+        default=False
+    )
 
 class SYNTH_PropertyGroup(PropertyGroup):
     # Paths
@@ -122,6 +133,9 @@ class SYNTH_PropertyGroup(PropertyGroup):
         description="Comma separated list of keypoint (vertex group) names",
         default='mouth tip,gill,root of pelvic fin,caudal peduncle,middle of caudal fin,lower tip of caudal fin'
     )
+
+    bone_groups: CollectionProperty(type=SYNTH_BoneGroupItem)
+    bone_groups_index: IntProperty(default=-1)
 
     # Timers and rendering behaviour
     event_timer_interval: FloatProperty(
@@ -342,9 +356,22 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
 # --------------------------- Mesh extraction --------------------
 
 def get_mesh_json(context):
-    collection_name = context.scene.synth_props.collection_name
-    object_name = context.scene.synth_props.object_name
-    kpt_list = [kp.strip() for kp in context.scene.synth_props.keypoint_list_csv.split(',') if kp.strip()]
+    def _parse_csv_names(csv_text: str):
+        return [n.strip() for n in csv_text.split(",") if n.strip()]
+
+    def _dedupe_preserve_order(seq):
+        seen = set()
+        out = []
+        for s in seq:
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+        return out
+
+    p = context.scene.synth_props
+    collection_name = p.collection_name
+    object_name = p.object_name
+    kpt_list = _parse_csv_names(p.keypoint_list_csv)
 
     col = bpy.data.collections.get(collection_name)
     if col is None:
@@ -489,18 +516,83 @@ def get_mesh_json(context):
         for ch in bone_names_tree[n]['c']:
             queue.append(ch)
 
+    # -- Bone groups from UI (CSV per group)
+    def collect_children_recursive(bone_name, tree):
+        """Return [bone_name] + all descendants' names (DFS)."""
+        stack = [bone_name]
+        result = []
+        while stack:
+            b = stack.pop()
+            if b not in result:
+                result.append(b)
+                stack.extend(tree[b]['c'])
+        return result
 
+    bone_groups_out = []
+    missing_names = []  # collect all invalid names for a consolidated error, while skipping them
+
+    for group_item in p.bone_groups:
+        raw_names = _parse_csv_names(group_item.names_csv)
+        group_bone_names = []
+        group_kpt_names = []
+
+        for name in raw_names:
+            if name in bone_names_tree:
+                # it is a bone
+                if group_item.include_children:
+                    group_bone_names.extend(collect_children_recursive(name, bone_names_tree))
+                else:
+                    group_bone_names.append(name)
+            elif name in kpt_list:
+                # it is a keypoint
+                group_kpt_names.append(name)
+            else:
+                # unknown → record error and skip just this name
+                missing_names.append(name)
+
+        # dedupe while preserving user’s order
+        group_bone_names = _dedupe_preserve_order(group_bone_names)
+        group_kpt_names  = _dedupe_preserve_order(group_kpt_names)
+
+        # map to indices, skipping any that don’t resolve (shouldn’t happen after checks)
+        bone_indices = []
+        for bn in group_bone_names:
+            try:
+                bone_indices.append(bone_names_ordered.index(bn))
+            except ValueError:
+                missing_names.append(bn)
+
+        kpt_indices = []
+        for kn in group_kpt_names:
+            try:
+                kpt_indices.append(kpt_list.index(kn))
+            except ValueError:
+                missing_names.append(kn)
+
+        bone_groups_out.append({
+            "keypoints_names": group_kpt_names,
+            "bone_names": group_bone_names,
+            "keypoint_indices": kpt_indices,
+            "bone_indices": bone_indices,
+        })
+
+    # If requested: raise error for unknown names but we’ve already skipped them in groups
+    if missing_names:
+        # Raise once with all missing names; comment out the next line if you prefer a warning-only behavior.
+        raise ValueError(f"Unknown bone/keypoint name(s) in bone groups: {sorted(set(missing_names))}")
+
+    # -- joints
     # Convert joint positions to lists (object-space coordinates)
     # joint positions was built i
     joints = [[float(c) for c in v] for v in joint_positions]
     joint_indices = list(range(len(joints)))
     kintree_unique_joints = [parent_indices, joint_indices]
 
-    # geometry
+    # -- geometry
     verts = [[float(c) for c in v.co] for v in obj.data.vertices]
     faces = [list(p.vertices) for p in obj.data.polygons]
 
-    # weights: include columns for virtual bones (zeros)
+    # -- weights: include columns for virtual bones (zeros)
     n_verts = len(obj.data.vertices)
     n_bone_groups = len(bone_names_ordered)
     weights = [[0.0]*n_bone_groups for _ in range(n_verts)]
@@ -548,7 +640,8 @@ def get_mesh_json(context):
             }
             for bone_name, data in bone_names_tree.items()
         },                                       # a tree-dict of parents, children and joint indices of bones
-        'virtual_bone_names': virtual_bone_names # for identifying virtual bones
+        'virtual_bone_names': virtual_bone_names, # for identifying virtual bones
+        'bone_groups': bone_groups_out,
     }
 
     return out
@@ -1435,6 +1528,16 @@ class SYNTH_OT_apply_settings(Operator):
                 self.report({'WARNING'}, f"Could not create path {path_prop}: {e}")
         # invalidate camera matrix cache so K/R/T/P will be recomputed with new settings
         cam_name_2_matrix.clear()
+
+        # serialize bone groups (UI list) to a simple list of dicts
+        bone_groups_cfg = [
+            {
+                "names_csv": item.names_csv,
+                "include_children": bool(item.include_children),
+            }
+            for item in p.bone_groups
+        ]
+
         cfg = {
             'RENDER_OUT_DIR_BL': p.render_out_dir,
             'ANNOT_OUT_DIR_BL': p.annot_out_dir,
@@ -1454,6 +1557,7 @@ class SYNTH_OT_apply_settings(Operator):
             'draw_every_keypoint_face': p.draw_every_keypoint_face,
             'draw_lattice_for_kpt_annot': p.draw_lattice_for_kpt_annot,
             'create_yolo_datasets': p.create_yolo_datasets,
+            'BONE_GROUPS': bone_groups_cfg,
         }
         try:
             cfg_path = os.path.join(resolve(p.annot_out_dir), 'synth_config.json')
@@ -1577,6 +1681,26 @@ class SYNTH_OT_load_config(Operator):
         except Exception:
             pass
 
+
+        # Load Bone Groups (if any)
+        if 'BONE_GROUPS' in cfg and isinstance(cfg['BONE_GROUPS'], list):
+            try:
+                # clear existing list
+                p.bone_groups.clear()
+                # repopulate
+                for item in cfg['BONE_GROUPS']:
+                    # tolerate partial/old entries
+                    names_csv = item.get('names_csv', '')
+                    include_children = bool(item.get('include_children', False))
+                    slot = p.bone_groups.add()
+                    slot.names_csv = names_csv
+                    slot.include_children = include_children
+                # reset active index
+                p.bone_groups_index = min(max(len(p.bone_groups) - 1, 0), len(p.bone_groups) - 1) if p.bone_groups else -1
+            except Exception as e:
+                self.report({'WARNING'}, f"Could not load bone groups: {e}")
+
+
         self.report({'INFO'}, f"Loaded config from {path}")
         return {'FINISHED'}
 
@@ -1654,6 +1778,38 @@ class SYNTH_OT_export_camera_matrices(Operator):
         except Exception as e:
             self.report({'WARNING'}, f"Failed to export camera matrices: {e}")
             return {'CANCELLED'}
+
+
+# -------------------- Bone groups Operator -------------------------------------
+
+class SYNTH_UL_bone_groups(UIList):
+    """Draw one row per bone group with a text field + include_children toggle."""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "names_csv", text="", emboss=True)
+        row.prop(item, "include_children", text="children", emboss=True)
+
+class SYNTH_OT_bone_group_add(Operator):
+    bl_idname = "synth.bone_group_add"
+    bl_label = "Add Bone Group"
+    def execute(self, context):
+        p = context.scene.synth_props
+        item = p.bone_groups.add()
+        item.names_csv = ""
+        item.include_children = False
+        p.bone_groups_index = len(p.bone_groups) - 1
+        return {'FINISHED'}
+
+class SYNTH_OT_bone_group_remove(Operator):
+    bl_idname = "synth.bone_group_remove"
+    bl_label = "Remove Bone Group"
+    def execute(self, context):
+        p = context.scene.synth_props
+        idx = p.bone_groups_index
+        if 0 <= idx < len(p.bone_groups):
+            p.bone_groups.remove(idx)
+            p.bone_groups_index = min(idx, len(p.bone_groups) - 1)
+        return {'FINISHED'}
 
 
 # --------------------------- Mesh export operator ----------------
@@ -2209,6 +2365,20 @@ def create_animation_from_pose_time_series(context, timeseries_path):
         frame_idx = int(frame_entry['frame'])
         frame_num = frame_idx
 
+        scale_val = frame_entry.get('scale', None)
+        scale_float = None
+        if scale_val is not None:
+            try:
+                scale_float = float(scale_val)
+            except (TypeError, ValueError):
+                scale_float = None
+        if scale_float is not None:
+            scale_vec = Vector((scale_float, scale_float, scale_float))
+            new_obj.scale = scale_vec
+            new_arm.scale = scale_vec
+            new_obj.keyframe_insert(data_path="scale", frame=frame_num)
+            new_arm.keyframe_insert(data_path="scale", frame=frame_num)
+
         # root global transform from timeseries
         global_t = Vector(frame_entry['global_t'])
         global_ori_exp = Vector(frame_entry['global_ori'])
@@ -2362,6 +2532,22 @@ class SYNTH_PT_main_panel(Panel):
         box.prop(p, 'keypoint_list_csv')
         box.operator('synth.export_keypoint_list', icon='EXPORT')
         box = layout.box()
+        box.label(text="Bone Groups")
+
+        row = box.row()
+        row.template_list(
+            "SYNTH_UL_bone_groups",          # list type
+            "",                              # list id
+            context.scene.synth_props, "bone_groups",  # data & prop
+            context.scene.synth_props, "bone_groups_index",  # active index
+            rows=3
+        )
+
+        col = row.column(align=True)
+        col.operator("synth.bone_group_add", icon="ADD", text="")
+        col.operator("synth.bone_group_remove", icon="REMOVE", text="")
+
+        box = layout.box()
         box.label(text="Behaviour")
         box.prop(p, 'render_binary')
         box.prop(p, 'use_compositor')
@@ -2408,11 +2594,15 @@ class SYNTH_OT_unregister_timed_render(Operator):
 
 
 classes = (
+    SYNTH_BoneGroupItem,
     SYNTH_PropertyGroup,
     SYNTH_OT_apply_settings,
     SYNTH_OT_load_config,
     SYNTH_OT_export_keypoint_list,
     SYNTH_PT_main_panel,
+    SYNTH_UL_bone_groups,
+    SYNTH_OT_bone_group_add,
+    SYNTH_OT_bone_group_remove,
     SYNTH_OT_unregister_timed_render,
     TimedRender,
     SYNTH_OT_export_camera_matrices,

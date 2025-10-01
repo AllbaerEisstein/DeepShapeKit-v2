@@ -118,7 +118,7 @@ if __name__ == '__main__':
 
 
     n_frames = video_meta['image_count']
-    index = list(range(n_frames))
+    index = list(range(n_frames))[65:90]
 
     if 'reconstruct' in steps:
         print('reconstructing mesh model sequence...')
