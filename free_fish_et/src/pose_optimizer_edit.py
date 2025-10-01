@@ -121,11 +121,11 @@ class OptimizeMV:
             [global_orient, global_t, scale], lr=self.step_size
         )
         for _ in range(self.num_iters):
-            print(f"Stage 1 - global ori: {global_orient}")
-            print(f"Stage 1 - body global t: {global_t}")
-            print(f"Stage 1 - scale: {scale}")
-            print(f"Stage 1 - body pose: {body_pose}")
-            print(f"Stage 1 - body bone length: {body_bone_length}")
+            # print(f"Stage 1 - global ori: {global_orient}")
+            # print(f"Stage 1 - body global t: {global_t}")
+            # print(f"Stage 1 - scale: {scale}")
+            # print(f"Stage 1 - body pose: {body_pose}")
+            # print(f"Stage 1 - body bone length: {body_bone_length}")
             # Apply global ori and scale
             out = self.fish(
                 global_ori=global_orient,
@@ -169,11 +169,11 @@ class OptimizeMV:
         # TODO: is this disabling y == 0 keypoints?
         kpts_conf[keypoints[..., 2] == 0] = 0
         for _ in range(self.num_iters):
-            print(f"Stage 2 - global ori: {global_orient}")
-            print(f"Stage 2 - body global t: {global_t}")
-            print(f"Stage 2 - scale: {scale}")
-            print(f"Stage 2 - body pose: {body_pose}")
-            print(f"Stage 2 - body bone length: {body_bone_length}")
+            # print(f"Stage 2 - global ori: {global_orient}")
+            # print(f"Stage 2 - body global t: {global_t}")
+            # print(f"Stage 2 - scale: {scale}")
+            # print(f"Stage 2 - body pose: {body_pose}")
+            # print(f"Stage 2 - body bone length: {body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=body_pose,
@@ -223,11 +223,11 @@ class OptimizeMV:
         init_bp = body_pose.clone().detach()
         init_bl = body_bone_length.clone().detach()
         for _ in range(self.num_iters):
-            print(f"Stage 3 - global ori: {global_orient}")
-            print(f"Stage 3 - body global t: {global_t}")
-            print(f"Stage 3 - scale: {scale}")
-            print(f"Stage 3 - body pose: {body_pose}")
-            print(f"Stage 3 - body bone length: {body_bone_length}")
+            # print(f"Stage 3 - global ori: {global_orient}")
+            # print(f"Stage 3 - body global t: {global_t}")
+            # print(f"Stage 3 - scale: {scale}")
+            # print(f"Stage 3 - body pose: {body_pose}")
+            # print(f"Stage 3 - body bone length: {body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=body_pose,

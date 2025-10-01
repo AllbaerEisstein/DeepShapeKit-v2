@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from src.geometry import perspective_projection
 from typing import Optional
 
+from torchmetrics.classification import BinaryJaccardIndex
+
 
 def gmof(x, sigma):
     """
@@ -114,7 +116,10 @@ def mask_fitting_loss(proj_masks, masks, mask_weight):
     return total_loss.sum()
 
 
-
+def mask_jaccard_index(proj_masks, masks, mask_weight):
+    metric = BinaryJaccardIndex()
+    total_loss = mask_weight * metric(proj_masks, masks)
+    return total_loss.sum()
 
 
 
