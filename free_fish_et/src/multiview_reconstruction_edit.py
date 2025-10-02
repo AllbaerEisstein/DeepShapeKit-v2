@@ -141,7 +141,7 @@ def _save_reconstruction_images(
         text: str,
         position: tuple,
         *,
-        font_scale: float = 0.35,
+        font_scale: float = 0.2,
         color: tuple = (255, 255, 255),
         thickness: int = 1,
         line_type: int = cv2.LINE_AA,
@@ -302,7 +302,7 @@ def _save_reconstruction_images(
             vi = int(round(keypoints_proj[view_idx, kp_idx, 1].item()))
             if 0 <= ui < W and 0 <= vi < H:
                 draw_circle(blended, (ui, vi), radius=5, color=(255, 150, 0))
-                draw_text(blended, name, (ui, vi + 15), font_scale=0.35, color=(255, 150, 0))
+                draw_text(blended, name, (ui, vi + 15), color=(255, 150, 0))
                 if annotate_keypoints_with_coords:
                     kp_coords = keypoints_world_np[kp_idx]
                     coord_text = f"({kp_coords[0]:.2f}, {kp_coords[1]:.2f}, {kp_coords[2]:.2f})"
@@ -310,7 +310,6 @@ def _save_reconstruction_images(
                         blended,
                         coord_text,
                         (ui, vi + 30),
-                        font_scale=0.3,
                         color=(255, 255, 255),
                     )
             if keypoint_predictions is not None:
@@ -318,7 +317,7 @@ def _save_reconstruction_images(
                 vi_pred = int(round(keypoint_predictions[view_idx, kp_idx, 1].item()))
                 ci_pred = keypoint_predictions[view_idx, kp_idx, 2].item()
                 if ci_pred > 0:
-                    conf_scaled_annot_radius = int(ci_pred*10)
+                    conf_scaled_annot_radius = int(ci_pred*10)//2
                     cv2.circle(blended, (ui_pred, vi_pred), radius=1, color=(255,0,0), lineType=-1)
                     cv2.circle(
                         blended,
@@ -330,10 +329,9 @@ def _save_reconstruction_images(
                     namelen = len(name)
                     draw_text(
                         blended,
-                        f"{name[:min(namelen-1,4)]}...: {int(ci_pred*100)/100}",
+                        f"{name[:min(namelen-1,4)]}: {int(ci_pred*100)/100}",
                         (ui_pred, vi_pred + conf_scaled_annot_radius - 20),
                         color=(255,0,0),
-                        font_scale=0.3,
                     )
                 metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = (
                     ( (ui - ui_pred)**2 + (vi - vi_pred)**2 )**0.5
@@ -362,7 +360,6 @@ def _save_reconstruction_images(
                         blended,
                         "global_t",
                         (ui_gt + 6, vi_gt - 6),
-                        font_scale=0.35,
                         color=(0, 255, 255),
                     )
                     coord_text = (
@@ -426,7 +423,6 @@ def _save_reconstruction_images(
                                 lineType=cv2.LINE_AA,
                             )
 
-
                             text_value = f"{tick_value:.2f}".rstrip("0").rstrip(".")
 
                             if abs(tick_value) < 1e-6:
@@ -437,7 +433,6 @@ def _save_reconstruction_images(
                                 overlay,
                                 text_value,
                                 text_anchor,
-                                font_scale=0.35,
                             )
 
                         label_direction = axis_dir_unit if direction_name == "positive" else -axis_dir_unit
@@ -874,8 +869,8 @@ def reconstruct(
         dataset_meta=dataset.index_json,
     )
 
-    with open(os.path.join(outdir, f"metrics_instance_{instance_number}.json", "w")) as metrics_out_json:
-        json.dump(metrics, metrics_out_json)
+    with open(os.path.join(outdir, f"metrics_instance_{instance_number}.json"), "w") as metrics_out_json:
+        json.dump(metrics, metrics_out_json, indent=4)
 
     _clear_reconstruction_cache(cache_path)
 

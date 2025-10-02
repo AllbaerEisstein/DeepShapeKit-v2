@@ -16246,9 +16246,9 @@
         "root of pelvic fin",
         "caudal peduncle"
       ],
-      "bone_names": ["Bone.001", "Bone.002", "Bone.003", "Bone.004"],
+      "bone_names": ["Bone", "Bone.001", "Bone.002", "Bone.003", "Bone.004"],
       "keypoint_indices": [0, 1, 2, 3],
-      "bone_indices": [1, 2, 3, 4]
+      "bone_indices": [0, 1, 2, 3, 4]
     },
     {
       "keypoints_names": ["middle of caudal fin", "lower tip of caudal fin"],
