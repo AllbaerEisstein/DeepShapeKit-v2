@@ -58,9 +58,9 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     body_pose: torch.Tensor,
     bone_length: torch.Tensor,
     sigma=50,
-    lim_weight=1,
+    angle_constraint_weight=1,
     prior_weight=1,
-    bone_weight=1,
+    bone_length_constraint_weight=1,
     pose_init: Optional[torch.Tensor] = None,
     bone_init: Optional[torch.Tensor] = None,
 ):
@@ -78,7 +78,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     # Add a loss if the angle is lower than min or higher than max
     lim_loss =   (body_pose - angle_max_lim).clamp(0, float("Inf")) \
                + (angle_min_lim - body_pose).clamp(0, float("Inf"))
-    lim_loss = lim_weight * lim_loss
+    lim_loss = angle_constraint_weight * lim_loss
 
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
     if pose_init == None or bone_init == None:
@@ -96,7 +96,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     # Add a loss if the length is lower than min or higher than max
     bone_loss =   (bone_length - max_bone).clamp(0, float("Inf")) \
                 + (min_bone - bone_length).clamp(0, float("Inf"))
-    bone_loss = bone_weight * bone_loss
+    bone_loss = bone_length_constraint_weight * bone_loss
 
     total_loss = (
         reprojection_loss.sum(dim=-1)

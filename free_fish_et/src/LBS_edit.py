@@ -50,9 +50,6 @@ class LBS():
         batch_size = len(V)
         device = global_ori_plus_body_pose.device
         V_homog = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
-        # print(f"LBS: locs_rel_to_parents shape: {self.body_joint_locs_rel_to_parents.size()}")
-        # print(f"LBS: all_bone_length shape: {all_bone_length.size()}")
-        # print(f"LBS: global_ori_plus_body_pose shape: {global_ori_plus_body_pose.size()}")
         
         # scale the joint positions by the bone lengths -> init kin-tree excluded head joint, this step should exclude it, too
         # however, the head bone length is important since the first *body joint* has a location relative to its 
@@ -60,13 +57,13 @@ class LBS():
         body_joint_locs_rel_to_parents = (scale * self.body_joint_locs_rel_to_parents) * all_bone_length[:, :, None, None]
 
         if to_rotmats:
-            global_ori_plus_body_pose = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3)) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to tuple format ([[[a,b,c],[a1,b1,c1],...]])
+            global_ori_plus_body_pose = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3)) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to triplet format ([[[a,b,c],[a1,b1,c1],...]])
         global_ori_plus_body_pose = global_ori_plus_body_pose.view([batch_size, -1, 3, 3])
 
         T_for_joints_rel_to_parent = torch.zeros([batch_size, self.n_body_joints, 4, 4]).float().to(device) # 4x4 all-0 matrices for every joint (excluding head joint)
         T_for_joints_rel_to_parent[:, :, -1, -1] = 1 # last-row last-column entry (bottom right) is 1 (homogeneous transform)
-        # print(f"global_ori_plus_pose as matrix size: {global_ori_plus_body_pose.size()}")
-        # first joint just gets translated via bone_length-scaling; no rotation
+
+        # first body joint just gets translated via bone_length-scaling; no rotation
         T_for_joints_rel_to_parent[:, 0, :3, :]  = torch.cat([torch.eye(3, device=device).unsqueeze(0), body_joint_locs_rel_to_parents[:,0,:]], dim=-1)
         # now, T looks like this for the first body joint:
         #       1           0           0       loc_rel_to_parent[0]

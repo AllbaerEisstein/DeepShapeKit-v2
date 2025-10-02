@@ -77,8 +77,8 @@ class fish_model:
 
         # a bone group is a set of indices for bones and keypoints that are going to be reconstructed together in one optimizer stage
         # keypoints and bones belonging to group 0 are at keypoint_groups[0] and bone_groups[0], respectively
-        self.bone_groups = torch.stack([bg["bone_indices"] for bg in dd["bone_groups"]])
-        self.keypoint_groups = torch.stack([bg["keypoint_indices"] for bg in dd["bone_groups"]])
+        self.bone_groups = [bg["bone_indices"] for bg in dd["bone_groups"]]
+        self.keypoint_groups = [bg["keypoint_indices"] for bg in dd["bone_groups"]]
 
         self.weights = torch.tensor(dd["weights"])
         self.vert2kpt = torch.tensor(dd["vert2kpt"])
@@ -96,27 +96,11 @@ class fish_model:
 
         self.LBS = LBS(self.J, self.parent_indices, self.weights)
 
-        # TODO: let user choose which indices belong to which bodypart (best to define in synthetic data generator)
-        # Body_pose angle limit
-        # angle limits are specified in exponential map (axis-angle where angle is specified as the length of the axis vector)
-        # we minus index by 1 because we exclude root pose as it is modeled as global orient
-        self.bone_angle_min = [0.0] * (self.n_body_bones * 3)
-        self.bone_angle_max = [0.0] * (self.n_body_bones * 3)
-
-        # repeat the pattern 0.0, -0.05, 0.0 for every bone (every three entries in bone_angle_min/max)
-        for i in range(self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
-
-        # the last 3 bones should have different limits
-        for i in range(self.n_body_bones - 3, self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
-
-        # the last bone should have a different limit
-        for i in range(self.n_body_bones - 1, self.n_body_bones):
-            self.bone_angle_min[i * 3 : (i + 1) * 3] = 0.0, -1.0, 0.0
-            self.bone_angle_max[i * 3 : (i + 1) * 3] = -0.0, 1.0, 0.0
+        # TODO: Implement proper twist/swing joint limits
+        # Body_pose angle limit (choose loose limits)
+        # angle limits are specified for each component in an exponential map (axis-angle where angle is specified as the length of the axis vector)
+        self.bone_angle_min = [-3.14, -3.14, -3.14] * (self.n_body_bones)
+        self.bone_angle_max = [3.14, 3.14, 3.14] * (self.n_body_bones)
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
@@ -146,8 +130,6 @@ class fish_model:
         self.bone_angle_max = self.bone_angle_max.to(self.device)
         self.bone_length_min = self.bone_length_min.to(self.device)
         self.bone_length_max = self.bone_length_max.to(self.device)
-        self.bone_groups = self.bone_groups.to(self.device)
-        self.keypoint_groups = self.keypoint_groups.to(self.device)
         self.LBS = LBS(self.J, self.parent_indices, self.weights)
         self.device = self.faces.device
         self.device_active = True

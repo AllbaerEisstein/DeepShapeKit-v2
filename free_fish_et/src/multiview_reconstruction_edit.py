@@ -301,8 +301,8 @@ def _save_reconstruction_images(
             ui = int(round(keypoints_proj[view_idx, kp_idx, 0].item()))
             vi = int(round(keypoints_proj[view_idx, kp_idx, 1].item()))
             if 0 <= ui < W and 0 <= vi < H:
-                draw_circle(blended, (ui, vi), radius=5, color=(255, 0, 0))
-                draw_text(blended, name, (ui, vi + 15), font_scale=0.35, color=(255, 0, 0))
+                draw_circle(blended, (ui, vi), radius=5, color=(255, 150, 0))
+                draw_text(blended, name, (ui, vi + 15), font_scale=0.35, color=(255, 150, 0))
                 if annotate_keypoints_with_coords:
                     kp_coords = keypoints_world_np[kp_idx]
                     coord_text = f"({kp_coords[0]:.2f}, {kp_coords[1]:.2f}, {kp_coords[2]:.2f})"
@@ -319,18 +319,20 @@ def _save_reconstruction_images(
                 ci_pred = keypoint_predictions[view_idx, kp_idx, 2].item()
                 if ci_pred > 0:
                     conf_scaled_annot_radius = int(ci_pred*10)
-                    draw_circle(blended, (ui_pred, vi_pred), radius=1, color=(255, 255, 0), line_type=-1)
-                    draw_circle(
+                    cv2.circle(blended, (ui_pred, vi_pred), radius=1, color=(255,0,0), lineType=-1)
+                    cv2.circle(
                         blended,
                         (ui_pred, vi_pred),
                         radius=conf_scaled_annot_radius,
-                        color=(255, 255, 0),
-                        line_type=-1
+                        color=(255,0,0),
+                        lineType=-1
                     )
+                    namelen = len(name)
                     draw_text(
                         blended,
-                        f"{name}:\n{int(ci_pred*100)/100}",
-                        (ui_pred, vi_pred + conf_scaled_annot_radius - 10),
+                        f"{name[:min(namelen-1,4)]}...: {int(ci_pred*100)/100}",
+                        (ui_pred, vi_pred + conf_scaled_annot_radius - 20),
+                        color=(255,0,0),
                         font_scale=0.3,
                     )
                 metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = (
@@ -424,15 +426,9 @@ def _save_reconstruction_images(
                                 lineType=cv2.LINE_AA,
                             )
 
-                            if axis_length_world >= 10:
-                                if abs(tick_value) >= 1:
-                                    text_value = f"{tick_value:.0f}"
-                                else:
-                                    text_value = f"{tick_value:.1f}".rstrip("0").rstrip(".")
-                            elif axis_length_world >= 1:
-                                text_value = f"{tick_value:.1f}".rstrip("0").rstrip(".")
-                            else:
-                                text_value = f"{tick_value:.2f}".rstrip("0").rstrip(".")
+
+                            text_value = f"{tick_value:.2f}".rstrip("0").rstrip(".")
+
                             if abs(tick_value) < 1e-6:
                                 text_value = "0"
 
@@ -718,7 +714,7 @@ def reconstruct(
 
     pbar = tqdm(
         total=len(frame_indices),
-        desc=f"video {os.path.basename(dataset_dir)}",
+        desc=f"{os.path.basename(dataset_dir)} reconstruction frame {frame_indices[0]}",
         initial=len(processed_frames),
     )
 
@@ -741,7 +737,7 @@ def reconstruct(
         seg_mask_present_mask = instance_sample['seg_mask_present_mask']
 
         # QUESTION: how to deal with not enough keypoints/segmasks especially in first frame?
-        # TODO: fallback to previous segmasks, keypoints
+        # TODO: retroactively fallback to previous segmasks, keypoints
         if len([
                 view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
                 if view_with_seg_mask == True
@@ -851,6 +847,7 @@ def reconstruct(
         }
         _save_reconstruction_cache(cache_dir, cache_path, cache_payload)
 
+        pbar.desc = f"{os.path.basename(dataset_dir)} reconstruction frame {idx}"
         pbar.update()
 
     # reconstruction done
@@ -876,6 +873,9 @@ def reconstruct(
         frame_payloads=pose_time_series_frames,
         dataset_meta=dataset.index_json,
     )
+
+    with open(os.path.join(outdir, f"metrics_instance_{instance_number}.json", "w")) as metrics_out_json:
+        json.dump(metrics, metrics_out_json)
 
     _clear_reconstruction_cache(cache_path)
 

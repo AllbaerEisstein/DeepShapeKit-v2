@@ -34,6 +34,7 @@ if __name__ == '__main__':
     pose_model_path         = Path('src/DSKv2/cygill_pose.pt')
 
     mesh_path               = str(Path('src/DSKv2/Bluegill_Body_mesh.json'))
+    # mesh_path               = str(Path('src/DSKv2/Bluegill Better Articulation_Body.003_mesh.json'))
     pose_time_series_path   = str(Path('src/DSKv2/pose_time_series_Bluegill_Body.json'))
 
     # mesh_path               = str(Path('src/DSKv2/Test_Cube_mesh.json'))
