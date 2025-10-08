@@ -4,14 +4,17 @@ import multiprocessing as mp
 import re
 import threading
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from queue import Empty
+from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Optional
 
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
 except ImportError:  # pragma: no cover - tkinter unavailable in some envs
     tk = None
 
@@ -132,7 +135,7 @@ def read_keypoint_list(mesh_path: Path) -> List[str]:
 
 
 def run_pipeline(config: PipelineConfig, steps: List[str]) -> None:
-    videos = [Path(video) for video in config.videos]
+    videos = [Path(video).absolute() for video in config.videos]
     if not videos:
         raise ConfigError("At least one video path must be provided.")
 
@@ -207,12 +210,194 @@ def run_pipeline(config: PipelineConfig, steps: List[str]) -> None:
         )
 
 
+def _mean_median(values: List[float], metric_name: str) -> Dict[str, float]:
+    if not values:
+        raise ValueError(f"No values provided for metric '{metric_name}'.")
+    return {"mean": float(mean(values)), "median": float(median(values))}
+
+
+def _summarize_scalar_metric(metric_name: str, metric_data: Dict[str, List[float]]) -> Dict[str, Any]:
+    if not metric_data:
+        raise ValueError(f"Metric '{metric_name}' is empty.")
+
+    overall_values: List[float] = []
+    per_view: Dict[str, Dict[str, float]] = {}
+    per_frame_values: defaultdict[int, List[float]] = defaultdict(list)
+
+    for view, values in metric_data.items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Metric '{metric_name}' for view '{view}' is empty or invalid.")
+        per_view[view] = _mean_median(values, metric_name)
+        overall_values.extend(values)
+        for idx, value in enumerate(values):
+            per_frame_values[idx].append(value)
+
+    summary: Dict[str, Any] = {
+        "overall": _mean_median(overall_values, metric_name),
+        "by_view": per_view,
+        "by_frame": {
+            str(frame_idx): _mean_median(frame_values, metric_name)
+            for frame_idx, frame_values in sorted(per_frame_values.items())
+        },
+    }
+
+    return summary
+
+
+def _summarize_keypoint_metric(metric_name: str, metric_data: Dict[str, Dict[str, List[float]]]) -> Dict[str, Any]:
+    if not metric_data:
+        raise ValueError(f"Metric '{metric_name}' is empty.")
+
+    overall_values: List[float] = []
+    per_view_values: defaultdict[str, List[float]] = defaultdict(list)
+    per_keypoint_values: defaultdict[str, List[float]] = defaultdict(list)
+    per_frame_values: defaultdict[int, List[float]] = defaultdict(list)
+    per_view_keypoint_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+    for view, keypoints in metric_data.items():
+        if not isinstance(keypoints, dict) or not keypoints:
+            raise ValueError(f"Metric '{metric_name}' for view '{view}' is empty or invalid.")
+        view_summary: Dict[str, Dict[str, float]] = {}
+        for keypoint, values in keypoints.items():
+            if not isinstance(values, list) or not values:
+                raise ValueError(
+                    f"Metric '{metric_name}' for view '{view}', keypoint '{keypoint}' is empty or invalid."
+                )
+            stats = _mean_median(values, metric_name)
+            view_summary[keypoint] = stats
+            overall_values.extend(values)
+            per_view_values[view].extend(values)
+            per_keypoint_values[keypoint].extend(values)
+            for idx, value in enumerate(values):
+                per_frame_values[idx].append(value)
+        per_view_keypoint_summary[view] = view_summary
+
+    summary: Dict[str, Any] = {
+        "overall": _mean_median(overall_values, metric_name),
+        "by_view": {
+            view: _mean_median(values, metric_name)
+            for view, values in per_view_values.items()
+        },
+        "by_frame": {
+            str(frame_idx): _mean_median(values, metric_name)
+            for frame_idx, values in sorted(per_frame_values.items())
+        },
+        "by_keypoint": {
+            keypoint: _mean_median(values, metric_name)
+            for keypoint, values in per_keypoint_values.items()
+        },
+        "by_view_and_keypoint": per_view_keypoint_summary,
+    }
+
+    return summary
+
+
+def compute_metrics_summary(metrics_data: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    scalar_metrics = ["orig_IoU", "mask_IoU"]
+
+    for metric_name in scalar_metrics:
+        metric_values = metrics_data.get(metric_name)
+        if metric_values is not None:
+            summary[metric_name] = _summarize_scalar_metric(metric_name, metric_values)
+
+    keypoint_metric = metrics_data.get("keypoint_L2_distance")
+    if keypoint_metric is not None:
+        summary["keypoint_L2_distance"] = _summarize_keypoint_metric(
+            "keypoint_L2_distance", keypoint_metric
+        )
+
+    if not summary:
+        raise ValueError("No metrics found to summarize.")
+
+    return summary
+
+
+def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
+    def fmt(stats: Dict[str, Optional[float]]) -> str:
+        mean_val = stats.get("mean")
+        median_val = stats.get("median")
+        if mean_val is None or median_val is None:
+            return "mean=NA, median=NA"
+        return f"mean={mean_val:.4f}, median={median_val:.4f}"
+
+    sections: List[str] = []
+    metric_order = ["orig_IoU", "mask_IoU", "keypoint_L2_distance"]
+
+    sections.append("Overall metrics")
+    for metric_name in metric_order:
+        metric_summary = summary.get(metric_name)
+        if metric_summary and "overall" in metric_summary:
+            sections.append(f"  {metric_name}: {fmt(metric_summary['overall'])}")
+    sections.append("")
+
+    sections.append("Metrics by view")
+    for metric_name in metric_order:
+        metric_summary = summary.get(metric_name)
+        if not metric_summary:
+            continue
+        by_view = metric_summary.get("by_view", {})
+        if not by_view:
+            continue
+        sections.append(f"  {metric_name}:")
+        for view, stats in sorted(by_view.items()):
+            sections.append(f"    {view}: {fmt(stats)}")
+    sections.append("")
+
+    sections.append("Metrics by frame")
+    for metric_name in metric_order:
+        metric_summary = summary.get(metric_name)
+        if not metric_summary:
+            continue
+        by_frame = metric_summary.get("by_frame", {})
+        if not by_frame:
+            continue
+        sections.append(f"  {metric_name}:")
+        for frame_idx, stats in sorted(by_frame.items(), key=lambda x: int(x[0])):
+            sections.append(f"    frame {frame_idx}: {fmt(stats)}")
+    sections.append("")
+
+    keypoint_summary = summary.get("keypoint_L2_distance")
+    if keypoint_summary:
+        sections.append("Keypoint_L2_distance by keypoint")
+        for keypoint, stats in sorted(keypoint_summary.get("by_keypoint", {}).items()):
+            sections.append(f"  {keypoint}: {fmt(stats)}")
+        sections.append("")
+
+        sections.append("Keypoint_L2_distance by keypoint and view")
+        for view, keypoint_stats in sorted(
+            keypoint_summary.get("by_view_and_keypoint", {}).items()
+        ):
+            sections.append(f"  {view}:")
+            for keypoint, stats in sorted(keypoint_stats.items()):
+                sections.append(f"    {keypoint}: {fmt(stats)}")
+        sections.append("")
+
+        sections.append("Keypoint_L2_distance by frame")
+        for frame_idx, stats in sorted(
+            keypoint_summary.get("by_frame", {}).items(), key=lambda x: int(x[0])
+        ):
+            sections.append(f"  frame {frame_idx}: {fmt(stats)}")
+        sections.append("")
+
+        sections.append("Keypoint_L2_distance by view")
+        for view, stats in sorted(keypoint_summary.get("by_view", {}).items()):
+            sections.append(f"  {view}: {fmt(stats)}")
+        sections.append("")
+
+        sections.append("Keypoint_L2_distance overall")
+        sections.append(f"  {fmt(keypoint_summary['overall'])}")
+
+    return "\n".join(sections).strip()
+
+
 def _run_pipeline_subprocess(config_dict: Dict[str, Any], steps: List[str], queue: "mp.Queue") -> None:
     try:
         config = PipelineConfig.from_dict(config_dict)
         run_pipeline(config, steps)
     except Exception as exc:  # pragma: no cover - propagated back to GUI
         queue.put(("error", repr(exc), traceback.format_exc()))
+        raise
     else:
         queue.put(("success", None, None))
 
@@ -307,7 +492,7 @@ class PipelineGUI:
 
         control_frame = ttk.Frame(main)
         control_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
-        for col in range(7):
+        for col in range(8):
             control_frame.columnconfigure(col, weight=1)
 
         self._add_action_button(control_frame, 0, "Save config…", self.save_config)
@@ -316,8 +501,9 @@ class PipelineGUI:
         self._add_action_button(control_frame, 3, "predict_masks_yolo", lambda: self.run_step("masks"))
         self._add_action_button(control_frame, 4, "detect_keypoints_yolo", lambda: self.run_step("keypoints"))
         self._add_action_button(control_frame, 5, "reconstruct", lambda: self.run_step("reconstruct"))
+        self._add_action_button(control_frame, 6, "Show metrics", self.show_metrics)
         self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_execution, state=tk.DISABLED)
-        self.pause_button.grid(row=0, column=6, padx=2, sticky="ew")
+        self.pause_button.grid(row=0, column=7, padx=2, sticky="ew")
 
         status_label = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status_label.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -592,6 +778,55 @@ class PipelineGUI:
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def show_metrics(self) -> None:
+        try:
+            config = self.gather_config()
+        except ConfigError as exc:
+            messagebox.showerror("Configuration error", str(exc))
+            return
+
+        metrics_path = Path(config.final_output_folder) / f"metrics_instance_{config.instance_number}.json"
+        if not metrics_path.exists():
+            messagebox.showerror("Metrics not found", f"No metrics file found at {metrics_path}.")
+            return
+
+        try:
+            with metrics_path.open() as fp:
+                metrics_data = json.load(fp)
+        except Exception as exc:
+            messagebox.showerror("Read failed", f"Could not read metrics file: {exc}")
+            return
+
+        metrics_data = dict(metrics_data)
+        metrics_data.pop("metrics_summary", None)
+
+        try:
+            summary = compute_metrics_summary(metrics_data)
+            display_text = format_metrics_summary_text(summary)
+        except Exception as exc:
+            messagebox.showerror("Metrics error", str(exc))
+            return
+
+        metrics_data["metrics_summary"] = summary
+
+        try:
+            with metrics_path.open("w") as fp:
+                json.dump(metrics_data, fp, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Write failed", f"Could not update metrics file: {exc}")
+            return
+
+        self.set_status(f"Metrics summary saved to {metrics_path}.")
+        self._display_text_window("Metrics summary", display_text)
+
+    def _display_text_window(self, title: str, content: str) -> None:
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        text_area = ScrolledText(window, wrap="word", width=100, height=40)
+        text_area.pack(fill="both", expand=True)
+        text_area.insert("1.0", content)
+        text_area.configure(state="disabled")
 
 
 def run_gui(initial_config: PipelineConfig, steps: List[str]) -> None:

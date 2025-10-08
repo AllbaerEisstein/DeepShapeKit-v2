@@ -157,6 +157,9 @@ def _save_reconstruction_images(
     n_views, H, W = alpha.shape
 
     metrics = {
+        "mask_detection_IoU": {
+            view_name: None for view_name in view_names
+        },
         "orig_IoU": {
             view_name: None for view_name in view_names
         },
@@ -277,10 +280,15 @@ def _save_reconstruction_images(
             reprojection_mask_binary
         )
         if mask_predictions is not None:
+            mask_detection_iou = metric(
+                torch.tensor(padded_binary, device=device),
+                mask_predictions[view_idx].to(device=device)
+            ) # to evaluate the quality of yolo mask detection, given we are working with synthetic data
             mask_iou = metric(
                 mask_predictions[view_idx].to(device=device),
                 reprojection_mask_binary
             )
+            metrics["mask_detection_IoU"][view_names[view_idx]] = mask_detection_iou.item()
             metrics["mask_IoU"][view_names[view_idx]] = mask_iou.item()
         metrics["orig_IoU"][view_names[view_idx]] = orig_iou.item()
 
@@ -687,6 +695,7 @@ def reconstruct(
 
     def _fresh_metrics() -> dict:
         return {
+            "mask_detection_IoU": {view_name: [] for view_name in dataset.views},
             "orig_IoU": {view_name: [] for view_name in dataset.views},
             "mask_IoU": {view_name: [] for view_name in dataset.views},
             "keypoint_L2_distance": {
@@ -821,6 +830,7 @@ def reconstruct(
 
         # cache quality metrics for this frame
         for view in dataset.views:
+            metrics["mask_detection_IoU"][view].append(frame_metrics["mask_detection_IoU"][view])
             metrics["orig_IoU"][view].append(frame_metrics["orig_IoU"][view])
             metrics["mask_IoU"][view].append(frame_metrics["mask_IoU"][view])
             for kpt in dataset.index_json["keypoint_list"]:
