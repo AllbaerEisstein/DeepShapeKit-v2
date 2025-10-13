@@ -22,7 +22,7 @@ def gmof(x, sigma):
     """
     Implementation of robust Geman-McClure function
     """
-    x_squared = x**2
+    x_squared = x**2 # this squares element-wise
     sigma_squared = sigma**2
     return (sigma_squared * x_squared) / (sigma_squared + x_squared)
 
@@ -38,12 +38,17 @@ def keypoint_reprojection_loss_global(
 
     # Weighted robust reprojection loss
     sigma = 50
-    reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma)
-    reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1)
+    # this returns Geman-McClure rubustified x², y² for each kpt:
+    reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma) 
+    # here, sum x² and y² and scale by conf -> squared L2-error per kpt:
+    reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1) 
 
+    # finally, sum error of each kpt -> we get a sum of squared, Geman-McClure robustified L2-errors per view
     total_loss = reprojection_loss.sum(dim=-1)
 
-    return total_loss.sum()
+    # and, we return a scalar loss by summing over all views.
+    # -> views contribute equally
+    return total_loss.sum() 
 
 
 def kpt_repr_plus_bone_pose_and_length_loss(

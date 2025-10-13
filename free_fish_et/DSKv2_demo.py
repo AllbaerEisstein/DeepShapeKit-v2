@@ -134,10 +134,18 @@ def read_keypoint_list(mesh_path: Path) -> List[str]:
     )
 
 
-def run_pipeline(config: PipelineConfig, steps: List[str]) -> None:
+def run_pipeline(
+    config: PipelineConfig,
+    steps: List[str],
+    pause_event: Optional[Any] = None,
+) -> None:
     videos = [Path(video).absolute() for video in config.videos]
     if not videos:
         raise ConfigError("At least one video path must be provided.")
+
+    reconstruct_pause_event = (
+        pause_event if pause_event is not None and "reconstruct" in steps else None
+    )
 
     out_dir = Path(config.out_path)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +207,7 @@ def run_pipeline(config: PipelineConfig, steps: List[str]) -> None:
         frame_indices = parse_frame_selection(config.frame_range)
         if mesh_path is None:
             raise ConfigError("mesh_path must be provided for reconstruction.")
+        selected_views = resolve_dataset_views(dataset_folder_path, videos)
         reconstruct(
             mesh_path=str(mesh_path),
             dataset_dir=str(dataset_folder_path),
@@ -207,6 +216,8 @@ def run_pipeline(config: PipelineConfig, steps: List[str]) -> None:
             instance_number=config.instance_number,
             seed=config.seed,
             save_models=config.save_models,
+            video_names=selected_views,
+            pause_event=reconstruct_pause_event,
         )
 
 
@@ -391,10 +402,63 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
     return "\n".join(sections).strip()
 
 
-def _run_pipeline_subprocess(config_dict: Dict[str, Any], steps: List[str], queue: "mp.Queue") -> None:
+def resolve_dataset_views(dataset_dir: Path, requested_videos: List[Path]) -> List[str]:
+    index_path = dataset_dir / "index.json"
+    if not index_path.exists():
+        raise ConfigError(f"Dataset index file not found at {index_path}.")
+
+    with index_path.open() as fp:
+        index_data = json.load(fp)
+
+    available_views = index_data.get("frame_folders")
+    if not isinstance(available_views, list) or not available_views:
+        raise ConfigError("Dataset index does not list any frame folders.")
+
+    resolved: List[str] = []
+    missing: List[str] = []
+
+    for video_path in requested_videos:
+        stem = video_path.stem
+
+        candidate: Optional[str]
+        if stem in available_views:
+            candidate = stem
+        else:
+            undistorted = f"{stem}_undistorted"
+            if undistorted in available_views:
+                candidate = undistorted
+            else:
+                prefixed = next(
+                    (name for name in available_views if name.startswith(f"{stem}_")),
+                    None,
+                )
+                candidate = prefixed
+
+        if candidate is None:
+            missing.append(stem)
+        elif candidate not in resolved:
+            resolved.append(candidate)
+
+    if missing:
+        raise ConfigError(
+            "Requested view(s) not present in dataset: " + ", ".join(missing)
+        )
+
+    if not resolved:
+        raise ConfigError("No valid views selected for reconstruction.")
+
+    return resolved
+
+
+def _run_pipeline_subprocess(
+    config_dict: Dict[str, Any],
+    steps: List[str],
+    queue: "mp.Queue",
+    pause_event: Optional[Any] = None,
+) -> None:
     try:
         config = PipelineConfig.from_dict(config_dict)
-        run_pipeline(config, steps)
+        run_pipeline(config, steps, pause_event=pause_event)
     except Exception as exc:  # pragma: no cover - propagated back to GUI
         queue.put(("error", repr(exc), traceback.format_exc()))
         raise
@@ -424,6 +488,8 @@ class PipelineGUI:
         self.worker_process: Optional[mp.Process] = None
         self.worker_queue: Optional[mp.Queue] = None
         self.pause_requested: bool = False
+        self.worker_pause_event: Optional[mp.Event] = None
+        self.current_step: Optional[str] = None
 
         self._build_ui()
         self._refresh_video_listbox()
@@ -689,12 +755,16 @@ class PipelineGUI:
 
         self.pause_button.configure(state=tk.NORMAL)
         self.pause_requested = False
+        self.current_step = step
+
+        pause_event = mp.Event() if step == "reconstruct" else None
+        self.worker_pause_event = pause_event
 
         def task() -> None:
             queue: mp.Queue = mp.Queue()
             process = mp.Process(
                 target=_run_pipeline_subprocess,
-                args=(config.to_dict(), [step], queue),
+                args=(config.to_dict(), [step], queue, pause_event),
             )
             self.worker_process = process
             self.worker_queue = queue
@@ -713,6 +783,8 @@ class PipelineGUI:
 
             self.worker_process = None
             self.worker_queue = None
+            self.worker_pause_event = None
+            self.current_step = None
 
             if self.pause_requested:
                 self.root.after(0, lambda: self._on_step_paused(step))
@@ -742,6 +814,12 @@ class PipelineGUI:
 
         self.pause_requested = True
         self.pause_button.configure(state=tk.DISABLED)
+
+        if self.current_step == "reconstruct" and self.worker_pause_event is not None:
+            self.set_status("Pause requested; finishing current frame before stopping.")
+            self.worker_pause_event.set()
+            return
+
         self.set_status("Pausing current step…")
         self.worker_process.terminate()
 

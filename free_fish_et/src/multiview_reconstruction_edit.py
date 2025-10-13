@@ -4,7 +4,7 @@ import math
 import pickle
 import os
 import argparse
-from typing import List, Optional
+from typing import Any, List, Optional
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -113,14 +113,15 @@ def _save_reconstruction_images(
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
     draw_verts: bool = False,
-    draw_coordinate_axes: bool = True,
+    draw_coordinate_axes: bool = False,
     annotate_global_t: bool = True,
-    annotate_keypoints_with_coords: bool = True,
+    annotate_keypoints_with_coords: bool = False,
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
     overlay silhouette in red with given blend_factor, draw keypoints (blue), optionally
     project the world coordinate axes, and annotate projected world-space locations.
+    This function returns quality metrics of the 
     """
 
     def draw_circle(
@@ -644,6 +645,8 @@ def reconstruct(
     instance_number: int,
     seed: int = 1,
     save_models: bool = False,
+    video_names: Optional[List[str]] = None,
+    pause_event: Optional[Any] = None,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
@@ -654,7 +657,7 @@ def reconstruct(
     device = setup_device(seed)
     print("Device:", device)
 
-    dataset = Multiview_Dataset(root=dataset_dir)
+    dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
 
     camera_group_cpu = dataset.cams.get_camera_group()
     camera_group_device = camera_group_cpu.to(device)
@@ -852,10 +855,16 @@ def reconstruct(
         }
         _save_reconstruction_cache(cache_dir, cache_path, cache_payload)
 
+        if pause_event is not None and pause_event.is_set():
+            print("Pause requested; stopping after cache write.")
+            break
+
         pbar.desc = f"{os.path.basename(dataset_dir)} reconstruction frame {idx}"
         pbar.update()
 
     # reconstruction done
+    metrics['total_duration_min'] = str(pbar).split()[-2].split('<')[0].replace('[','')
+    metrics['seconds_per_frame'] = str(pbar).split()[-1].replace(']','')
     pbar.close()
 
     _save_pose_pickle(

@@ -1,7 +1,7 @@
 from collections import defaultdict
 import csv
 import os
-from typing import Optional
+from typing import List, Optional
 import cv2
 import numpy as np
 import torch
@@ -68,13 +68,36 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                 - folder — the <frame_folder> name
                 - bbox — [xmin, ymin, xmax, ymax] from the mask
     """
-    def __init__(self, root: str):
+    def __init__(self, root: str, views: Optional[List[str]] = None):
         self.root = Path(root)
         print("DATASET ROOT: "+str(self.root))
         with open(self.root / 'index.json', 'r') as jf:
-            self.index_json = json.load(jf)
-        # !! This specifies the video ordering
-        self.views: list[str] = self.index_json["frame_folders"]
+            index_json = json.load(jf)
+
+        available_views = index_json.get("frame_folders", [])
+        if not isinstance(available_views, list) or not available_views:
+            raise ValueError("Dataset index does not list any frame folders.")
+
+        if views is None:
+            selected_views = available_views
+        else:
+            missing_views = [view for view in views if view not in available_views]
+            if missing_views:
+                raise ValueError(
+                    f"Requested view(s) not present in dataset: {', '.join(missing_views)}"
+                )
+            selected_views = [view for view in views if view in available_views]
+            if not selected_views:
+                raise ValueError("No valid views selected for dataset.")
+
+        self.views: list[str] = list(selected_views)
+        self.index_json = dict(index_json)
+        self.index_json["frame_folders"] = self.views
+        for key in ("index_files", "image_sizes", "camera_matrices"):
+            if key in self.index_json and isinstance(self.index_json[key], dict):
+                self.index_json[key] = {
+                    k: v for k, v in self.index_json[key].items() if k in self.views
+                }
 
         self.view_2_frames_2_instances_2_kpts: dict[str, dict[str, InstancesKeypointsDict]] = {
             #                                        |         |     └──> dict mapping instance number str to the dict kptname->[x,y,c]
@@ -668,6 +691,5 @@ class UniLabDataset(object):
 
     def __len__(self):
         return len(self.imgs)
-
 
 
