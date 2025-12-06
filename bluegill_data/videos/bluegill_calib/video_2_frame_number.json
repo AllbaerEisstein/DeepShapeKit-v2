@@ -1,0 +1,34 @@
+{
+    "cam-1_15-17-14-calibration": {
+        "sequences": [
+            [614, 914], 
+            [3268, 4022]
+        ],
+        "best_sequences_idx": [1]
+    },
+    "cam-2_15-17-14-calibration": {
+        "sequences": [
+            [129, 344],
+            [1777, 2876]
+        ],
+        "best_sequences_idx": [1]
+    },
+    "cam-3_15-17-14-calibration": {
+        "sequences": [
+            [330, 657], 
+            [1355, 1552], 
+            [1775, 2372], 
+            [4031, 4272]
+        ],
+        "best_sequences_idx": [2,3] 
+    },
+    "cam-4_15-17-14-calibration": {
+        "sequences": [
+            [141, 1564], 
+            [1778,1934], 
+            [2236,3014], 
+            [3481,4284]  
+        ], 
+        "best_sequences_idx": [2,3]
+    }
+}
