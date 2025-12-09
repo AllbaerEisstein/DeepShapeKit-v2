@@ -6,6 +6,3 @@ bluegill_data/synthetic_data/*.txt
 *yolo11*.pt
 train_yolo/runs
 free_fish_et/src/results/*
-calibration/calib_outputs/*/*.png
-calibration/calib_outputs/*/*.jpeg
-calibration/calib_outputs/*/*.jpg

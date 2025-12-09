@@ -1,0 +1,10 @@
+# ignore common image types in calib_outputs and any subdirectory
+calib_outputs/**/*.png
+calib_outputs/**/*.jpg
+calib_outputs/**/*.jpeg
+calib_outputs/**/*.bmp
+calib_outputs/**/*.tif
+calib_outputs/**/*.tiff
+
+# keep placeholder files so directory structure gets tracked
+!calib_outputs/**/.gitkeep
