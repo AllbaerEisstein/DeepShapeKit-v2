@@ -1,0 +1,57 @@
+{
+  "frame_folders": [
+    "cam-1_15-17-14-calibration",
+    "cam-2_15-17-14-calibration",
+    "cam-3_15-17-14-calibration",
+    "cam-4_15-17-14-calibration"
+  ],
+  "index_files": {
+    "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/files.csv",
+    "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/files.csv",
+    "cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/files.csv",
+    "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/files.csv"
+  },
+  "image_sizes": {
+    "cam-1_15-17-14-calibration": [1504, 2048],
+    "cam-2_15-17-14-calibration": [1200, 1700],
+    "cam-3_15-17-14-calibration": [1904, 1600],
+    "cam-4_15-17-14-calibration": [1000, 800]
+  },
+  "image_count": 11038,
+  "imgpoints": {
+    "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/imgpoints.json",
+    "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/imgpoints.json",
+    "cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/imgpoints.json",
+    "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/imgpoints.json"
+  },
+  "imgpoints_processed": {
+    "cam-1_15-17-14-calibration": {
+      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/processed_objpoints.json",
+      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/processed_imgpoints.json"
+    },
+    "cam-2_15-17-14-calibration": {
+      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/processed_objpoints.json",
+      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/processed_imgpoints.json"
+    },
+    "cam-3_15-17-14-calibration": {
+      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/processed_objpoints.json",
+      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/processed_imgpoints.json"
+    },
+    "cam-4_15-17-14-calibration": {
+      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/processed_objpoints.json",
+      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/processed_imgpoints.json"
+    }
+  },
+  "calib": {
+    "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-1_15-17-14-calibration_calibration.json",
+    "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-2_15-17-14-calibration_calibration.json",
+    "cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-3_15-17-14-calibration_calibration.json",
+    "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-4_15-17-14-calibration_calibration.json"
+  },
+  "status": {
+    "step": "corner_labelling",
+    "video": "cam-1_15-17-14-calibration",
+    "frame": 0,
+    "row": 0
+  }
+}
