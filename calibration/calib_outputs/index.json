@@ -29,47 +29,11 @@
       800
     ]
   },
-  "image_count": 11038,
-  "imgpoints": {
-    "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/imgpoints.json",
-    "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/imgpoints.json",
-    "cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/imgpoints.json",
-    "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/imgpoints.json"
-  },
-  "imgpoints_processed": {
-    "cam-1_15-17-14-calibration": {
-      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/processed_objpoints.json",
-      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/processed_imgpoints.json"
-    },
-    "cam-2_15-17-14-calibration": {
-      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/processed_objpoints.json",
-      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-2_15-17-14-calibration/processed_imgpoints.json"
-    },
-    "cam-3_15-17-14-calibration": {
-      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/processed_objpoints.json",
-      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-3_15-17-14-calibration/processed_imgpoints.json"
-    },
-    "cam-4_15-17-14-calibration": {
-      "objpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/processed_objpoints.json",
-      "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/processed_imgpoints.json"
-    }
-  },
-  "calib": {
-    "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-1_15-17-14-calibration_calibration.json",
-    "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-2_15-17-14-calibration_calibration.json",
-    "cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-3_15-17-14-calibration_calibration.json",
-    "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-4_15-17-14-calibration_calibration.json"
-  },
+  "image_count": 1727,
   "status": {
-    "step": "pipeline_complete",
+    "step": "reorder",
     "video": "cam-1_15-17-14-calibration",
     "frame": 0,
     "row": 0
-  },
-  "stereo_calib": {
-    "cam-1_15-17-14-calibration__cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/stereo/cam-1_15-17-14-calibration__cam-4_15-17-14-calibration_stereo.json",
-    "cam-2_15-17-14-calibration__cam-3_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/stereo/cam-2_15-17-14-calibration__cam-3_15-17-14-calibration_stereo.json",
-    "cam-2_15-17-14-calibration__cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/stereo/cam-2_15-17-14-calibration__cam-4_15-17-14-calibration_stereo.json",
-    "cam-3_15-17-14-calibration__cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/stereo/cam-3_15-17-14-calibration__cam-4_15-17-14-calibration_stereo.json"
   }
 }
