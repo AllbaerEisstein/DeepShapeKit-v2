@@ -53,12 +53,12 @@
       "imgpoints": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/processed_imgpoints.json"
     }
   },
-  "image_count": 1727,
+  "image_count": 2518,
   "status": {
-    "step": "pipeline_complete",
+    "step": "detect",
     "video": "cam-1_15-17-14-calibration",
-    "frame": 0,
-    "row": 0
+    "frame": 912,
+    "row": 216
   },
   "calib": {
     "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-1_15-17-14-calibration_calibration.json",
