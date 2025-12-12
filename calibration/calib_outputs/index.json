@@ -55,10 +55,10 @@
   },
   "image_count": 2518,
   "status": {
-    "step": "detect",
+    "step": "pipeline_complete",
     "video": "cam-1_15-17-14-calibration",
-    "frame": 912,
-    "row": 216
+    "frame": 0,
+    "row": 0
   },
   "calib": {
     "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-1_15-17-14-calibration_calibration.json",
