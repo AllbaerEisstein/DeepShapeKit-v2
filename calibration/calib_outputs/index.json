@@ -12,10 +12,22 @@
     "cam-4_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-4_15-17-14-calibration/files.csv"
   },
   "image_sizes": {
-    "cam-1_15-17-14-calibration": [1504, 2048],
-    "cam-2_15-17-14-calibration": [1200, 1700],
-    "cam-3_15-17-14-calibration": [1904, 1600],
-    "cam-4_15-17-14-calibration": [1000, 800]
+    "cam-1_15-17-14-calibration": [
+      1504,
+      2048
+    ],
+    "cam-2_15-17-14-calibration": [
+      1200,
+      1700
+    ],
+    "cam-3_15-17-14-calibration": [
+      1904,
+      1600
+    ],
+    "cam-4_15-17-14-calibration": [
+      1000,
+      800
+    ]
   },
   "imgpoints": {
     "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/cam-1_15-17-14-calibration/imgpoints.json",
@@ -42,12 +54,12 @@
     }
   },
   "status": {
-    "step": "corner_labelling",
+    "step": "pipeline_complete",
     "video": "cam-1_15-17-14-calibration",
     "frame": 0,
     "row": 0
   },
-  "image_count": 2679,
+  "image_count": 3316,
   "calib": {
     "cam-1_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-1_15-17-14-calibration_calibration.json",
     "cam-2_15-17-14-calibration": "/mnt/c/Users/User/Documents/Studium/Bachelor/deepshapekit-v2/calibration/calib_outputs/calibration/cam-2_15-17-14-calibration_calibration.json",
