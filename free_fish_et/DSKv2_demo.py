@@ -172,6 +172,7 @@ def run_pipeline(
             dataset_folder_name=config.dataset_folder_name,
             also_create_frame2video_csv=config.also_create_frame2video_csv,
             undistort=config.undistort,
+            frames=parse_frame_selection(config.frame_range) if config.frame_range else None
         )
 
     if "masks" in steps:

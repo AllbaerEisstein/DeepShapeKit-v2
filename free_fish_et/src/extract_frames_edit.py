@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import Optional
 import cv2
 import csv
 import json
@@ -22,7 +23,14 @@ from src.parse_cams_json import (
 from src.types import *
 
 
-def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir: Path, dataset_folder_name: str = 'dataset', also_create_frame2video_csv: bool = False, undistort: bool = False):
+def extract_from_video(
+        videos: list[Path], 
+        cam_matrices_json_path: Path, 
+        out_dir: Path, dataset_folder_name: str = 'dataset', 
+        also_create_frame2video_csv: bool = False, 
+        undistort: bool = False, 
+        frames: Optional[List[int]] = None
+    ):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
@@ -56,6 +64,7 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
 
     destination = out_dir / dataset_folder_name
     destination.mkdir(exist_ok=True)
+    max_frame_number = max(frames) if frames is not None else -1
 
     json_out_path = destination / 'index.json'
     json_index = {
@@ -197,6 +206,12 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                     success, frame = capture.read()
                     if not success:
                         break
+                    if frames is not None:
+                        if frame_number > max_frame_number:
+                            break
+                        if frame_number not in frames:
+                            frame_number += 1
+                            continue
                     if undistort and needs_undistortion:
                         frame = cv2.undistort(frame, np.array(K), undistort_coeffs, None, np.array(newK))
                     
