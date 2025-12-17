@@ -12,6 +12,13 @@ from PIL import Image, ImageDraw
 
 import src.infer_mask as infer_mask
 import src.infer_keypoints as infer_keypoints
+from src.parse_cams_json import (
+    KEY_ALIASES,
+    _find_any,
+    _parse_distortion,
+    _parse_focal,
+    _parse_K,
+)
 from src.types import *
 
 
@@ -78,38 +85,67 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
         finally:
             capture.release()
 
-        video_name = video_path.stem
+        base_video_name = video_path.stem
+        video_name = base_video_name
 
         needs_undistortion = False
+        K = None
+        distortions = None
+        newK = None
+        new_focal_mm = None
+        undistort_coeffs = None
         if undistort:
-            matrices_json = cam_matrices.get(video_name, None)
+            matrices_json = cam_matrices.get(base_video_name, None)
             if matrices_json is None:
-                raise ValueError(f'No camera matrices found for view "{video_name}" in {cam_matrices_json_path}')
-            K = matrices_json.get('K', None)
-            f = matrices_json.get('f', None)
-            d = matrices_json.get('dist', None)
-            if d is not None:
-                rad_1 = d.get('k1', None)
-                rad_2 = d.get('k2', None)
-                tan_1 = d.get('p1', None)
-                tan_2 = d.get('p2', None)
-                rad_3 = d.get('k3', None)
-                for coeff, name in [ (rad_1, 'k1'), (rad_2, 'k2'), (tan_1, 'p1'), (tan_2, 'p2'), (rad_3, 'k3') ]:
-                    if coeff is None:
-                        raise ValueError(f'Distortion coefficient "{name}" not found in {cam_matrices_json_path}')
-                distortions = (rad_1, rad_2, tan_1, tan_2, rad_3)
+                raise ValueError(f'No camera matrices found for view "{base_video_name}" in {cam_matrices_json_path}')
+
+            K_raw = _find_any(matrices_json, KEY_ALIASES['K'])
+            dist_raw = _find_any(matrices_json, KEY_ALIASES['distortion'])
+            focal_raw = _find_any(matrices_json, KEY_ALIASES['f'])
+            try:
+                K = _parse_K(K_raw)
+            except Exception as exc:
+                raise ValueError(f'Intrinsic matrix for view "{base_video_name}" could not be parsed: {exc}')
             if K is None:
-                raise ValueError(f'No intrinsic matrix "K" found for view "{video_name}" in {cam_matrices_json_path}')
-            if d is None or distortions == (0.0,)*5:
-                print(f"No undistortion possible or necessary for video {video_name}. Distortion coefficients not specified or all 0.0.")
-                needs_undistortion = False
+                raise ValueError(f'No intrinsic matrix found for view "{base_video_name}" in {cam_matrices_json_path} (checked aliases: {KEY_ALIASES["K"]})')
+
+            try:
+                distortions = _parse_distortion(dist_raw)
+            except Exception as exc:
+                raise ValueError(f'Distortion coefficients for view "{base_video_name}" could not be parsed: {exc}')
+
+            try:
+                focal_pair = _parse_focal(focal_raw) if focal_raw is not None else None
+            except Exception as exc:
+                raise ValueError(f'Focal length for view "{base_video_name}" could not be parsed: {exc}')
+
+            undistort_coeffs = distortions
+            if distortions == (0.0,) * 5:
+                print(f"No undistortion possible or necessary for video {base_video_name}. Distortion coefficients not specified or all 0.0.")
             else:
                 # TODO: Which camera parameters are actually changed by getOptimalNewCameraMatrix?
-                newK, _ = cv2.getOptimalNewCameraMatrix(np.array(K), distortions, [int(vwidth), int(vheight)], 1, [int(vwidth), int(vheight)], False)
-                new_focal_mm = (newK[0][0] * (f / K[0][0])) if f is not None else None
-                new_dist = (0.0,)*5
-                video_name = video_name + "_undistorted"
-                original_entry = cam_matrices.get(video_name.replace("_undistorted", ""), {})
+                newK, _ = cv2.getOptimalNewCameraMatrix(
+                    np.array(K, dtype=float),
+                    np.array(distortions, dtype=float),
+                    [int(vwidth), int(vheight)],
+                    1,
+                    [int(vwidth), int(vheight)],
+                    False
+                )
+                if focal_pair is not None:
+                    fx_px = K[0][0]
+                    fy_px = K[1][1] if K.shape[0] > 1 else K[0][0]
+                    fx_mm = newK[0][0] * (focal_pair[0] / fx_px) if fx_px != 0 else None
+                    fy_mm = newK[1][1] * (focal_pair[1] / fy_px) if fy_px != 0 else None
+                    if fx_mm is not None and fy_mm is not None:
+                        new_focal_mm = [fx_mm, fy_mm]
+                    elif fx_mm is not None:
+                        new_focal_mm = fx_mm
+                    elif fy_mm is not None:
+                        new_focal_mm = fy_mm
+                new_dist = (0.0,) * 5
+                video_name = base_video_name + "_undistorted"
+                original_entry = cam_matrices.get(base_video_name, {})
                 updated_entry = {
                     "K": [list(row) for row in newK],
                     "f": new_focal_mm,
@@ -121,11 +157,21 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                         "rad_3": new_dist[4],
                     },
                 }
-                for key in ["R", "t", "Rt", "P", "FROM_BLENDERWORLD"]:
-                    if key in original_entry:
-                        updated_entry[key] = original_entry[key]
+                for aliases, key_name in [
+                    (KEY_ALIASES['R'], 'R'),
+                    (KEY_ALIASES['T'], 't'),
+                    (KEY_ALIASES['P'], 'P'),
+                ]:
+                    val = _find_any(original_entry, aliases)
+                    if val is not None:
+                        updated_entry[key_name] = val
+                if "Rt" in original_entry:
+                    updated_entry["Rt"] = original_entry["Rt"]
+                for fb_key in ["FROM_BLENDERWORLD", "from_blenderworld"]:
+                    if fb_key in original_entry:
+                        updated_entry["FROM_BLENDERWORLD"] = original_entry[fb_key]
+                        break
                 cam_matrices[video_name] = updated_entry
-                distortions = new_dist
                 needs_undistortion = True
 
 
@@ -152,7 +198,7 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                     if not success:
                         break
                     if undistort and needs_undistortion:
-                        frame = cv2.undistort(frame, np.array(K), distortions, None, np.array(newK))
+                        frame = cv2.undistort(frame, np.array(K), undistort_coeffs, None, np.array(newK))
                     
                     filename = f"{video_name}_{frame_number}.png"
                     abs_file_path = origin_folder / filename
