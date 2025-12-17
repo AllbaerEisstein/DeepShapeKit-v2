@@ -87,14 +87,14 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
                 raise ValueError(f'No camera matrices found for view "{video_name}" in {cam_matrices_json_path}')
             K = matrices_json.get('K', None)
             f = matrices_json.get('f', None)
-            d = matrices_json.get('distortion', None)
+            d = matrices_json.get('dist', None)
             if d is not None:
-                rad_1 = d.get('rad_1', None)
-                rad_2 = d.get('rad_2', None)
-                tan_1 = d.get('tan_1', None)
-                tan_2 = d.get('tan_2', None)
-                rad_3 = d.get('rad_3', None)
-                for coeff, name in [ (rad_1, 'rad_1'), (rad_2, 'rad_2'), (tan_1, 'tan_1'), (tan_2, 'tan_2'), (rad_3, 'rad_3') ]:
+                rad_1 = d.get('k1', None)
+                rad_2 = d.get('k2', None)
+                tan_1 = d.get('p1', None)
+                tan_2 = d.get('p2', None)
+                rad_3 = d.get('k3', None)
+                for coeff, name in [ (rad_1, 'k1'), (rad_2, 'k2'), (tan_1, 'p1'), (tan_2, 'p2'), (rad_3, 'k3') ]:
                     if coeff is None:
                         raise ValueError(f'Distortion coefficient "{name}" not found in {cam_matrices_json_path}')
                 distortions = (rad_1, rad_2, tan_1, tan_2, rad_3)
@@ -106,7 +106,7 @@ def extract_from_video(videos: list[Path], cam_matrices_json_path: Path, out_dir
             else:
                 # TODO: Which camera parameters are actually changed by getOptimalNewCameraMatrix?
                 newK, _ = cv2.getOptimalNewCameraMatrix(np.array(K), distortions, [int(vwidth), int(vheight)], 1, [int(vwidth), int(vheight)], False)
-                new_focal_mm = newK[0][0] * (f / K[0][0])
+                new_focal_mm = (newK[0][0] * (f / K[0][0])) if f is not None else None
                 new_dist = (0.0,)*5
                 video_name = video_name + "_undistorted"
                 original_entry = cam_matrices.get(video_name.replace("_undistorted", ""), {})
