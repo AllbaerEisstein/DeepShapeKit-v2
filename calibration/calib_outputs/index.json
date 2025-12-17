@@ -54,7 +54,7 @@
     }
   },
   "status": {
-    "step": "pipeline_complete",
+    "step": "stereo",
     "video": "cam-1_15-17-14-calibration",
     "frame": 0,
     "row": 0
