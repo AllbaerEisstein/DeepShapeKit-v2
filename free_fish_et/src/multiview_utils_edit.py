@@ -140,8 +140,8 @@ def get_gt_3d(
             continue
         obs = keypoints[valid_views, k, :2]
         image_size = None
-        if camera_group.image_size_wh is not None:
-            img_size = camera_group.image_size_wh
+        if camera_group.original_image_size_wh is not None:
+            img_size = camera_group.original_image_size_wh
             if img_size.dim() >= 2 and img_size.shape[0] == camera_group.batch_size:
                 image_size = img_size[valid_views].clone()
             else:
@@ -152,7 +152,7 @@ def get_gt_3d(
             R=camera_group.R[valid_views],
             t=camera_group.t[valid_views],
             from_blenderworld=camera_group.from_blenderworld[valid_views],
-            image_size_wh=image_size,
+            original_image_size_wh=image_size,
         ).to(keypoints.device)
 
         if LBFGS:

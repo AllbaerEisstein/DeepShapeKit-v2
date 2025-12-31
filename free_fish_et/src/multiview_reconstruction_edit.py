@@ -639,13 +639,13 @@ def reconstruct(
     # --------------------------
     # setup; instantiate classes
     device = setup_device(seed)
+
+    print("Starting multiview reconstruction with the following settings:")
     print("Device:", device)
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
     camera_group_cpu = dataset.cams.get_camera_group()
     camera_group_device = camera_group_cpu.to(device)
-    camera_group_uniform_img_size_cpu = dataset.cams_uniform_img_size.get_camera_group()
-    camera_group_uniform_img_size_device = camera_group_uniform_img_size_cpu.to(device)
 
     fish = fish_model(mesh_json_path=mesh_path)
     optimizer = OptimizeMV(
@@ -658,7 +658,7 @@ def reconstruct(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer = Silhouette_Renderer(device, camera_group_uniform_img_size_device)
+    renderer = Silhouette_Renderer(device, camera_group_device)
 
     # --------------------------
     # load cache, if available

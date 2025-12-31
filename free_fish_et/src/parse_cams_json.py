@@ -177,7 +177,7 @@ def _parse_distortion(d_obj: Any) -> Tuple[float,float,float,float,float]:
         return (rad_1, rad_2, tan_1, tan_2, rad_3)
     raise ValueError(f'Could not parse distortion from {d_obj}')
 
-def _adjust_intrinsics_for_padding(K, orig_size, max_size):
+def _adjust_intrinsics_for_padding(K, original_size_wh, target_size_wh):
     """
     Shift the principal point to a new location suitable for the new image size `max_size`.
     This assumes that the original image was padded where left and right padding was equal, and top and bottom padding was equal.
@@ -186,8 +186,8 @@ def _adjust_intrinsics_for_padding(K, orig_size, max_size):
         orig_size: (w, h)
         max_size: (max_w, max_h)
     """
-    w, h = orig_size
-    max_w, max_h = max_size
+    w, h = original_size_wh
+    max_w, max_h = target_size_wh
 
     pad_x = (max_w - w) / 2.0
     pad_y = (max_h - h) / 2.0
@@ -282,9 +282,6 @@ class CameraSet:
             F_np = _ensure_shape(F_np, (3,3))
 
             self.P_list.append(torch.tensor(P_np, dtype=torch.float32))
-            if self.uniform_img_size:
-                image_size = self.index_json['image_sizes'][v]
-                K_np = _adjust_intrinsics_for_padding(K_np, image_size, self.uniform_img_size)
             self.K_list.append(torch.tensor(K_np, dtype=torch.float32))
             self.R_list.append(torch.tensor(R_np, dtype=torch.float32))
             self.t_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
@@ -307,6 +304,7 @@ class CameraSet:
             R=torch.stack(self.R_list, 0),
             t=torch.stack(self.t_list, 0),
             from_blenderworld=torch.stack(self.from_blender_list, 0),
-            image_size_wh=image_sizes_tensor,
+            original_image_size_wh=image_sizes_tensor,
+            target_uniform_image_size=torch.tensor(self.uniform_img_size, dtype=torch.float32) if self.uniform_img_size is not None else None,
         )
         return group if device is None else group.to(device)

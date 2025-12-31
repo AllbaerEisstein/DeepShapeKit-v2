@@ -21,36 +21,29 @@ class Silhouette_Renderer:
     def __init__(self, device: str, camera_group: CameraGroup):
         self.device = torch.device(device)
 
-        cg = camera_group.to(self.device)
-        if cg.image_size_wh is None:
+        self.orig_cg = camera_group.to(self.device)
+        if self.orig_cg.original_image_size_wh is None:
             raise ValueError("CameraGroup.image_size_wh is required for rendering silhouettes")
+        
+        # Use camera group with uniform image size for rendering
+        self.uniform_cg = self.orig_cg.with_intrinsics_adjusted_for_uniform_image_size
 
-        dtype = cg.R.dtype
-        self.n_batches = cg.batch_size
+        dtype = self.uniform_cg.R.dtype
+        self.n_batches = self.uniform_cg.batch_size
 
-        R_custom_conv = cg.R
-        t_custom_conv = cg.t
-        CUSTOMCONV_2_P3D = cg.from_pytorch3d.transpose(1,2)
+        R_custom_conv = self.uniform_cg.R
+        t_custom_conv = self.uniform_cg.t
+        CUSTOMCONV_2_P3D = self.uniform_cg.from_pytorch3d.transpose(1,2)
         R_p3d = torch.matmul(CUSTOMCONV_2_P3D, R_custom_conv)
         T_p3d = torch.matmul(CUSTOMCONV_2_P3D, t_custom_conv.unsqueeze(-1)).squeeze(-1)
 
-        principal_points = cg.principal_points.to(self.device, dtype=dtype)
-        focal_lengths = cg.focal_lengths_px.to(self.device, dtype=dtype)
+        principal_points = self.uniform_cg.principal_points.to(self.device, dtype=dtype)
+        focal_lengths = self.uniform_cg.focal_lengths_px.to(self.device, dtype=dtype)
 
-        image_hw = cg.image_size_hw.to(self.device, dtype=dtype)
-        if image_hw.ndim == 1:
-            image_size_batch = image_hw.unsqueeze(0).expand(self.n_batches, -1)
-        elif image_hw.shape[0] == self.n_batches:
-            image_size_batch = image_hw
-        else:
-            image_size_batch = image_hw.expand(self.n_batches, -1)
-        if self.n_batches > 1:
-            first_size = image_size_batch[0:1]
-            if not torch.allclose(image_size_batch, first_size, atol=1e-4, rtol=0.0):
-                raise ValueError("All cameras must share the same image size for batched rendering.")
+        image_hw = self.uniform_cg.original_image_size_hw.to(self.device, dtype=dtype)
 
-        height = int(torch.round(image_size_batch[0, 0]).item())
-        width = int(torch.round(image_size_batch[0, 1]).item())
+        height = int(torch.round(image_hw[0, 0]).item())
+        width = int(torch.round(image_hw[0, 1]).item())
 
         blend_params = BlendParams(sigma=1e-2, gamma=1e-4)
         raster_settings = RasterizationSettings(
@@ -67,7 +60,7 @@ class Silhouette_Renderer:
         ])
 
         cameras = PerspectiveCameras(
-            image_size=image_size_batch,
+            image_size=image_hw,
             focal_length=focal_lengths,
             principal_point=principal_points,
             R=invert_xy.to(device=self.device, dtype=dtype) @ R_p3d.transpose(1,2),
