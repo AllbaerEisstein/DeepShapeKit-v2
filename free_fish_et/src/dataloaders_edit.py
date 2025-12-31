@@ -160,7 +160,8 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         self.uniform_img_size = (max([value[0] for value in self.index_json['image_sizes'].values()]), 
                                  max([value[1] for value in self.index_json['image_sizes'].values()]))
 
-        self.cams = CameraSet(self.index_json, self.views)
+        self.cams_uniform_img_size = CameraSet(self.index_json, self.views, uniform_img_size=self.uniform_img_size)
+        self.cams = CameraSet(self.index_json, self.views, uniform_img_size=None)
 
         self.instance_indices = list(range(self.index_json['max_n_instances']))
 

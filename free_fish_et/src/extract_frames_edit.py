@@ -110,7 +110,7 @@ def extract_from_video(
 
             K_raw = _find_any(matrices_json, KEY_ALIASES['K'])
             dist_raw = _find_any(matrices_json, KEY_ALIASES['distortion'])
-            focal_raw = _find_any(matrices_json, KEY_ALIASES['f'])
+            #focal_raw = _find_any(matrices_json, KEY_ALIASES['f'])
             try:
                 K = _parse_K(K_raw)
             except Exception as exc:
@@ -123,10 +123,10 @@ def extract_from_video(
             except Exception as exc:
                 raise ValueError(f'Distortion coefficients for view "{base_video_name}" could not be parsed: {exc}')
 
-            try:
-                focal_pair = _parse_focal(focal_raw) if focal_raw is not None else None
-            except Exception as exc:
-                raise ValueError(f'Focal length for view "{base_video_name}" could not be parsed: {exc}')
+            # try:
+            #     focal_pair = _parse_focal(focal_raw) if focal_raw is not None else None
+            # except Exception as exc:
+            #     raise ValueError(f'Focal length for view "{base_video_name}" could not be parsed: {exc}')
 
             undistort_coeffs = distortions
             if distortions == (0.0,) * 5:
@@ -141,23 +141,23 @@ def extract_from_video(
                     [int(vwidth), int(vheight)],
                     False
                 )
-                if focal_pair is not None:
-                    fx_px = K[0][0]
-                    fy_px = K[1][1] if K.shape[0] > 1 else K[0][0]
-                    fx_mm = newK[0][0] * (focal_pair[0] / fx_px) if fx_px != 0 else None
-                    fy_mm = newK[1][1] * (focal_pair[1] / fy_px) if fy_px != 0 else None
-                    if fx_mm is not None and fy_mm is not None:
-                        new_focal_mm = [fx_mm, fy_mm]
-                    elif fx_mm is not None:
-                        new_focal_mm = fx_mm
-                    elif fy_mm is not None:
-                        new_focal_mm = fy_mm
+
+                # fx_px = K[0][0]
+                # fy_px = K[1][1] if K.shape[0] > 1 else K[0][0]
+                # fx_mm = newK[0][0] * (focal_pair[0] / fx_px) if fx_px != 0 else None
+                # fy_mm = newK[1][1] * (focal_pair[1] / fy_px) if fy_px != 0 else None
+                # if fx_mm is not None and fy_mm is not None:
+                #     new_focal_mm = [fx_mm, fy_mm]
+                # elif fx_mm is not None:
+                #     new_focal_mm = fx_mm
+                # elif fy_mm is not None:
+                #     new_focal_mm = fy_mm
                 new_dist = (0.0,) * 5
                 video_name = base_video_name + "_undistorted"
                 original_entry = cam_matrices.get(base_video_name, {})
                 updated_entry = {
                     "K": [list(row) for row in newK],
-                    "f": new_focal_mm,
+                    #"f": new_focal_mm,
                     "distortion": {
                         "rad_1": new_dist[0],
                         "rad_2": new_dist[1],

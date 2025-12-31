@@ -6,6 +6,7 @@ import torch
 
 from .geometry import perspective_projection
 from .constants_edit import CV_2_BLENDERWORLD, PYTORCH3D_2_BLENDERWORLD
+from .parse_cams_json import _adjust_intrinsics_for_padding
 
 
 @dataclass
@@ -17,13 +18,14 @@ class CameraGroup:
     R: torch.Tensor
     t: torch.Tensor
     from_blenderworld: torch.Tensor # A matrix M so that point3d_custom_coord_convention = M @ point3d_blenderworld
-    image_size_wh: Optional[torch.Tensor] = None
+    image_size_wh: torch.Tensor
+    is_uniform_image_size: bool = False
 
     def __post_init__(self) -> None:
         for name in ("P", "K", "R", "t", "from_blenderworld", "image_size_wh"):
             value = getattr(self, name)
             if value is None:
-                continue
+                raise ValueError(f"CameraGroup.{name} cannot be None")
             tensor = torch.as_tensor(value)
             if name in {"P", "K", "R"} and tensor.ndim == 2:
                 tensor = tensor.unsqueeze(0)
@@ -91,6 +93,49 @@ class CameraGroup:
             t=self.t.to(device=device, dtype=target_dtype),
             from_blenderworld=self.from_blenderworld.to(device=device, dtype=target_dtype),
             image_size_wh=image_size,
+        )
+    
+    def get_cg_for_new_image_size(self, target_size_wh: Optional[torch.Tensor] = None) -> "CameraGroup":
+        """Return a CameraGroup with adjusted intrinsics for the target image size. (default: use uniform_image_size)
+        Shift the principal point to a new location suitable for the new image size.
+        This assumes that the original image was padded where left and right padding was equal, and top and bottom padding was equal.
+        Args:
+            target_size_wh: Optional torch.Tensor of shape (2,) or (batch_size, 2) specifying the target image size (width, height).
+        """
+        if target_size_wh is None:
+            raise ValueError("target_size_wh argument is required to get adjusted CameraGroup")
+        if self.image_size_wh is None:
+            raise ValueError("CameraGroup.image_size_wh is required to get adjusted CameraGroup")
+        
+        if target_size_wh.ndim == 1:
+            new_uniform_size = target_size_wh
+            target_size_wh = target_size_wh.expand(self.batch_size, -1)
+            new_is_uniform_size = True
+        elif target_size_wh.shape[0] == self.batch_size:
+            first_size = target_size_wh[0:1]
+            new_is_uniform_size = torch.allclose(target_size_wh, first_size, atol=1e-4, rtol=0.0)
+        else:
+            raise ValueError("target_size_wh must have shape (2,) or (batch_size, 2)")
+        
+        w, h = self.image_size_wh[:,0], self.image_size_wh[:,1]
+        target_w, target_h = target_size_wh[:,0], target_size_wh[:,1]
+
+        pad_x = (target_w - w) / 2.0
+        pad_y = (target_h - h) / 2.0
+
+        K_new = self.K.clone().detach()
+        K_new[:,0,2] += pad_x
+        K_new[:,1,2] += pad_y
+        P_new = K_new @ self.Rt
+
+        return CameraGroup(
+            P=P_new,
+            K=K_new,
+            R=self.R,
+            t=self.t,
+            from_blenderworld=self.from_blenderworld,
+            image_size_wh=target_size_wh,
+            is_uniform_image_size=new_is_uniform_size
         )
 
     def projection_matrices(self, blender: bool = False) -> torch.Tensor:

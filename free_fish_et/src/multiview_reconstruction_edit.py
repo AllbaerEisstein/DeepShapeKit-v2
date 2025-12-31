@@ -34,24 +34,6 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def initialize_model(
-    mesh_file: str, device: str, cameras: CameraGroup
-) -> tuple:
-    fish = fish_model(mesh_json_path=mesh_file)
-    optimizer = OptimizeMV(
-        num_iters=100,
-        lim_weight=200,
-        prior_weight=30,
-        bone_weight=200,
-        mask_weight=200,
-        smooth_weights=[100, 100, 20],
-        device=torch.device(device),
-        fish_model_obj=fish,
-    )
-    renderer = Silhouette_Renderer(device, cameras)
-    return fish, optimizer, renderer
-
-
 def _get_tensors_from_instance_sample(sample: dict):
     """
     Just read a dict and return relevant contents.
@@ -652,20 +634,31 @@ def reconstruct(
     Run multiview reconstruction for given frames.
     """
 
+    _ensure_dir(outdir)
+
     # --------------------------
     # setup; instantiate classes
     device = setup_device(seed)
     print("Device:", device)
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
-
     camera_group_cpu = dataset.cams.get_camera_group()
     camera_group_device = camera_group_cpu.to(device)
+    camera_group_uniform_img_size_cpu = dataset.cams_uniform_img_size.get_camera_group()
+    camera_group_uniform_img_size_device = camera_group_uniform_img_size_cpu.to(device)
 
-    _ensure_dir(outdir)
-    fish, optimizer, renderer = initialize_model(
-        mesh_path, device, camera_group_device
+    fish = fish_model(mesh_json_path=mesh_path)
+    optimizer = OptimizeMV(
+        num_iters=100,
+        lim_weight=200,
+        prior_weight=30,
+        bone_weight=200,
+        mask_weight=200,
+        smooth_weights=[100, 100, 20],
+        device=torch.device(device),
+        fish_model_obj=fish,
     )
+    renderer = Silhouette_Renderer(device, camera_group_uniform_img_size_device)
 
     # --------------------------
     # load cache, if available
