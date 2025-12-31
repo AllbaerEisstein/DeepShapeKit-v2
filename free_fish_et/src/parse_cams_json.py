@@ -229,21 +229,6 @@ class CameraSet:
             #f_raw = _find_any(matrices_json, KEY_ALIASES['f'])
             d_raw = _find_any(matrices_json, KEY_ALIASES['distortion'])
 
-            if P_raw is None:
-                raise ValueError(f'No projection matrix found for view "{v}" in index.json (checked aliases).')
-            P_np = _to_numpy(P_raw)
-            try:
-                if P_np.ndim == 1 and P_np.size == 12:
-                    P_np = P_np.reshape((3,4))
-                elif P_np.ndim == 2 and P_np.shape == (4,3):
-                    P_np = P_np.T
-                elif P_np.ndim == 2 and P_np.shape == (4,4):
-                    P_np = P_np[:3, :4]
-                else:
-                    P_np = _ensure_shape(P_np, (3,4), transpose_if_needed=True)
-            except Exception as e:
-                raise ValueError(f'Projection matrix P for view "{v}" could not be coerced to (3,4): {e}')
-
             try:
                 K_np = _parse_K(K_raw if K_raw is not None else matrices_json.get('K', None))
             except Exception as e:
@@ -258,6 +243,27 @@ class CameraSet:
                 T_np = _parse_T(T_raw if T_raw is not None else matrices_json.get('T', None))
             except Exception as e:
                 raise ValueError(f'Translation T for view "{v}" could not be parsed: {e}')
+            
+            if P_raw is None:
+                # Try to compute P from K, R, T
+                try:
+                    RT_np = np.concatenate([R_np, T_np.reshape(3,1)], axis=1)
+                    P_np = K_np @ RT_np
+                except Exception as e:
+                    raise ValueError(f'No projection matrix found for view "{v}" in index.json (checked aliases). Tried to compute P from K,R,T but failed: {e}')
+            else :
+                P_np = _to_numpy(P_raw)
+            try:
+                if P_np.ndim == 1 and P_np.size == 12:
+                    P_np = P_np.reshape((3,4))
+                elif P_np.ndim == 2 and P_np.shape == (4,3):
+                    P_np = P_np.T
+                elif P_np.ndim == 2 and P_np.shape == (4,4):
+                    P_np = P_np[:3, :4]
+                else:
+                    P_np = _ensure_shape(P_np, (3,4), transpose_if_needed=True)
+            except Exception as e:
+                raise ValueError(f'Projection matrix P for view "{v}" could not be coerced to (3,4): {e}')
 
             # try:
             #     fx_fy = _parse_focal(f_raw if f_raw is not None else matrices_json.get('f', None))
