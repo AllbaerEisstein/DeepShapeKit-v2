@@ -9,7 +9,7 @@ KEY_ALIASES = {
     'K': ['K', 'intrinsic', 'intrinsics', 'camera_matrix'],
     'R': ['R', 'rotation', 'rot', 'rotation_matrix'],
     'T': ['T', 't', 'translation', 'translation_vector', 'translation_matrix', 'transform'],
-    'f': ['f', 'focal_length', 'fx', 'fy', 'focal'],
+    #'f': ['f', 'focal_length', 'fx', 'fy', 'focal'],
     'distortion': ['distortion', 'distortions', 'dist'],
 }
 
@@ -131,27 +131,28 @@ def _parse_K(arr: Any) -> np.ndarray:
         return a[:3, :3]
     raise ValueError(f'Could not parse intrinsics K from array with shape {a.shape}')
 
-def _parse_focal(f_val: Any) -> Tuple[float,float]:
-    if f_val is None:
-        return None
-    if isinstance(f_val, dict):
-        fx = f_val.get('fx', f_val.get('f', None))
-        fy = f_val.get('fy', f_val.get('f', None))
-        if fx is None:
-            raise ValueError('Focal dictionary missing fx/f')
-        fy = fy if fy is not None else fx
-        return float(fx), float(fy)
-    a = _to_numpy(f_val)
-    if a is None:
-        return None
-    if a.ndim == 0:
-        return float(a), float(a)
-    if a.ndim == 1:
-        if a.size == 1:
-            return float(a[0]), float(a[0])
-        if a.size >= 2:
-            return float(a[0]), float(a[1])
-    raise ValueError(f'Could not parse focal from {f_val} (shape {a.shape})')
+## NOTE: We assume that K specifies the focal lengths in pixels; we don't require focal lengths in millimeter.
+# def _parse_focal(f_val: Any) -> Tuple[float,float]:
+#     if f_val is None:
+#         return None
+#     if isinstance(f_val, dict):
+#         fx = f_val.get('fx', f_val.get('f', None))
+#         fy = f_val.get('fy', f_val.get('f', None))
+#         if fx is None:
+#             raise ValueError('Focal dictionary missing fx/f')
+#         fy = fy if fy is not None else fx
+#         return float(fx), float(fy)
+#     a = _to_numpy(f_val)
+#     if a is None:
+#         return None
+#     if a.ndim == 0:
+#         return float(a), float(a)
+#     if a.ndim == 1:
+#         if a.size == 1:
+#             return float(a[0]), float(a[0])
+#         if a.size >= 2:
+#             return float(a[0]), float(a[1])
+#     raise ValueError(f'Could not parse focal from {f_val} (shape {a.shape})')
 
 def _parse_distortion(d_obj: Any) -> Tuple[float,float,float,float,float]:
     if d_obj is None:
@@ -207,7 +208,7 @@ class CameraSet:
         self.views = views
         self.cam_matrices = index_json.get('camera_matrices', {})
         self.P_list: list[torch.Tensor] = []
-        self.f_list: list[Tuple[float,float]] = []
+        #self.f_list: list[Tuple[float,float]] = []
         self.K_list: list[torch.Tensor] = []
         self.R_list: list[torch.Tensor] = []
         self.t_list: list[torch.Tensor] = []
@@ -225,7 +226,7 @@ class CameraSet:
             K_raw = _find_any(matrices_json, KEY_ALIASES['K'])
             R_raw = _find_any(matrices_json, KEY_ALIASES['R'])
             T_raw = _find_any(matrices_json, KEY_ALIASES['T'])
-            f_raw = _find_any(matrices_json, KEY_ALIASES['f'])
+            #f_raw = _find_any(matrices_json, KEY_ALIASES['f'])
             d_raw = _find_any(matrices_json, KEY_ALIASES['distortion'])
 
             if P_raw is None:
@@ -258,10 +259,10 @@ class CameraSet:
             except Exception as e:
                 raise ValueError(f'Translation T for view "{v}" could not be parsed: {e}')
 
-            try:
-                fx_fy = _parse_focal(f_raw if f_raw is not None else matrices_json.get('f', None))
-            except Exception as e:
-                raise ValueError(f'Focal length for view "{v}" could not be parsed: {e}')
+            # try:
+            #     fx_fy = _parse_focal(f_raw if f_raw is not None else matrices_json.get('f', None))
+            # except Exception as e:
+            #     raise ValueError(f'Focal length for view "{v}" could not be parsed: {e}')
 
             try:
                 dist5 = _parse_distortion(d_raw if d_raw is not None else matrices_json.get('distortion', None))
@@ -283,7 +284,7 @@ class CameraSet:
             self.t_list.append(torch.tensor(T_np.reshape(3,), dtype=torch.float32))
             Rt_np = np.concatenate([R_np, T_np.reshape(3, 1)], axis=1)
             self.Rt_list.append(torch.tensor(Rt_np, dtype=torch.float32))
-            self.f_list.append((float(fx_fy[0]), float(fx_fy[1])))
+            #self.f_list.append((float(fx_fy[0]), float(fx_fy[1])))
             self.from_blender_list.append(torch.tensor(F_np, dtype=torch.float32))
             self.distortions_list.append(tuple(float(x) for x in dist5))
 
