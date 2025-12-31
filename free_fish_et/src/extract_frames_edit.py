@@ -17,7 +17,7 @@ from src.parse_cams_json import (
     KEY_ALIASES,
     _find_any,
     _parse_distortion,
-    _parse_focal,
+    #_parse_focal,
     _parse_K,
 )
 from src.types import *
