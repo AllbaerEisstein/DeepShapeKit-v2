@@ -34,21 +34,6 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def _get_tensors_from_instance_sample(sample: dict):
-    """
-    Just read a dict and return relevant contents.
-    """
-    keypoints = sample["keypoints"]
-    masks = sample["masks_full"]
-    bboxes = sample["bboxes"]
-
-    # Normalize mask to [0,1] on appropriate device
-    masks = masks / 255.0
-    keypoints = keypoints
-    bboxes = bboxes
-    return keypoints, masks, bboxes
-
-
 def save_rendered_views(
     outdir: str,
     instance_number: int,
@@ -737,7 +722,6 @@ def reconstruct(
         seg_mask_present_mask = instance_sample['seg_mask_present_mask']
 
         # QUESTION: how to deal with not enough keypoints/segmasks especially in first frame?
-        # TODO: retroactively fallback to previous segmasks, keypoints
         if len([
                 view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
                 if view_with_seg_mask == True
@@ -752,8 +736,18 @@ def reconstruct(
             print(f"Less than two views with keypoints in sample for frame {idx} -> skipping")
             pbar.update()
             continue
+
         views_indices, orig_img_paths = instance_sample['frames'], instance_sample['imgpaths']
-        keypoints, masks, bboxes = _get_tensors_from_instance_sample(instance_sample)
+
+        # mask, bboxes, keypoint are specified in uniform_image_size coordinates (adjustment happened in dataset creation)
+        keypoints = instance_sample["keypoints"]
+        masks = instance_sample["masks_full"]
+        bboxes = instance_sample["bboxes"]
+        # Normalize mask to [0,1] on appropriate device
+        masks = masks / 255.0
+        keypoints = keypoints
+        bboxes = bboxes
+
 
         # --------------------------
         # reconstruct

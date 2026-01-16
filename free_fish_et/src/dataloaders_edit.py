@@ -160,7 +160,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         self.uniform_img_size = (max([value[0] for value in self.index_json['image_sizes'].values()]), 
                                  max([value[1] for value in self.index_json['image_sizes'].values()]))
 
-        self.cams = CameraSet(self.index_json, self.views, uniform_img_size=None)
+        self.cams = CameraSet(self.index_json, self.views, uniform_img_size=self.uniform_img_size)
 
         self.instance_indices = list(range(self.index_json['max_n_instances']))
 
@@ -240,6 +240,22 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                 flip=False
             )
 
+            # pad the image to match the maximum image size and also adjust keypoint coordinates accordingly
+            orig_img_size = (self.index_json['image_sizes'][view][0], self.index_json['image_sizes'][view][1])
+            needs_padding = orig_img_size != self.uniform_img_size
+            pad_x = 0.0
+            pad_y = 0.0
+            if needs_padding:
+                w, h = orig_img_size
+                max_w, max_h = self.uniform_img_size
+                pad_x = (max_w - w) / 2.0
+                pad_y = (max_h - h) / 2.0
+                for inst_kpts in kpt_list:
+                    valid = inst_kpts[:, 2] != -1
+                    if valid.any():
+                        inst_kpts[valid, 0] += pad_x
+                        inst_kpts[valid, 1] += pad_y
+
             # meta info for this frame
             masks_row_per_instance      = self.masks_meta[view].get(origin_frame_number, [])
             crops_row_per_instance      = self.cropped_meta[view].get(origin_frame_number, [])
@@ -295,12 +311,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                 full_mask = self._load_grayscale_image(view, full_masks_row['file_loc'])
 
                 # pad the image to match the maximum image size and also adjust the bbox coordinates accordingly
-                orig_img_size = (self.index_json['image_sizes'][view][0],self.index_json['image_sizes'][view][1])
-                if orig_img_size != self.uniform_img_size:
-                    w, h = orig_img_size
-                    max_w, max_h = self.uniform_img_size
-                    pad_x = (max_w - w) / 2.0
-                    pad_y = (max_h - h) / 2.0
+                if needs_padding:
                     # bbox is specified in x1, y1, x2, y2 format
                     bbox = [bbox[0]+pad_x, bbox[1]+pad_y, bbox[2]+pad_x, bbox[3]+pad_y]
                     full_mask = np.pad(full_mask, ((pad_y, pad_y), (pad_x, pad_x)))
