@@ -6,7 +6,6 @@ import torch
 
 from .geometry import perspective_projection
 from .constants_edit import CV_2_BLENDERWORLD, PYTORCH3D_2_BLENDERWORLD
-from .parse_cams_json import _adjust_intrinsics_for_padding
 
 
 @dataclass
@@ -146,10 +145,16 @@ class CameraGroup:
             target_uniform_image_size=None,
         ).to(device=self.K.device, dtype=self.K.dtype)
     
-    @property
     def with_intrinsics_adjusted_for_uniform_image_size(self) -> "CameraGroup":
         """Return a CameraGroup with adjusted intrinsics for the target uniform image size."""
         return self.get_cg_for_new_image_size()
+    
+    def is_uniform_image_size(self) -> bool:
+        """Return True if all cameras have the same image size."""
+        if self.original_image_size_wh is None:
+            return False
+        first_size = self.original_image_size_wh[0]
+        return torch.all(self.original_image_size_wh == first_size).item()
 
     def projection_matrices(self, blender: bool = False) -> torch.Tensor:
         """Return projection matrices. If ``blender`` is True they expect Blender-world points."""

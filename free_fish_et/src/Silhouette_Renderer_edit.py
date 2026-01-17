@@ -21,12 +21,13 @@ class Silhouette_Renderer:
     def __init__(self, device: str, camera_group: CameraGroup):
         self.device = torch.device(device)
 
-        self.orig_cg = camera_group.to(self.device)
-        if self.orig_cg.original_image_size_wh is None:
+        self.uniform_cg = camera_group.to(self.device)
+        if self.uniform_cg.original_image_size_wh is None:
             raise ValueError("CameraGroup.image_size_wh is required for rendering silhouettes")
         
         # Use camera group with uniform image size for rendering
-        self.uniform_cg = self.orig_cg.with_intrinsics_adjusted_for_uniform_image_size
+        if not self.uniform_cg.is_uniform_image_size():
+            raise ValueError("Silhouette_Renderer requires a CameraGroup with uniform image size")
 
         dtype = self.uniform_cg.R.dtype
         self.n_batches = self.uniform_cg.batch_size

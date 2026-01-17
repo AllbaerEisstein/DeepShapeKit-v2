@@ -629,8 +629,8 @@ def reconstruct(
     print("Device:", device)
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
-    camera_group_cpu = dataset.cams.get_camera_group()
-    camera_group_device = camera_group_cpu.to(device)
+    camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
+    camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
 
     fish = fish_model(mesh_json_path=mesh_path)
     optimizer = OptimizeMV(
@@ -643,7 +643,7 @@ def reconstruct(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer = Silhouette_Renderer(device, camera_group_device)
+    renderer = Silhouette_Renderer(device, camera_group_uniform_size_device)
 
     # --------------------------
     # load cache, if available
@@ -758,7 +758,7 @@ def reconstruct(
         result = multiview.fit_mesh(
             fish,
             optimizer,
-            camera_group_device,
+            camera_group_uniform_size_device,
             keypoints,
             masks,
             renderer,
@@ -803,7 +803,7 @@ def reconstruct(
             outdir=outdir,
             renderer=renderer,
             instance_number=instance_number,
-            cameras=camera_group_device,
+            cameras=camera_group_uniform_size_device,
             reconstructed_keypoints_local=reconstructed_keypoints_local,
             reconstructed_vertices_local=reconstructed_vertices_local,
             faces_from_vert_indices=fish.faces.unsqueeze(0).to(device),
