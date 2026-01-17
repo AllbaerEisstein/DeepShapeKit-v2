@@ -248,8 +248,8 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             if needs_padding:
                 w, h = orig_img_size
                 max_w, max_h = self.uniform_img_size
-                pad_x = (max_w - w) / 2.0
-                pad_y = (max_h - h) / 2.0
+                pad_x = int((max_w - w) / 2.0)
+                pad_y = int((max_h - h) / 2.0)
                 for inst_kpts in kpt_list:
                     valid = inst_kpts[:, 2] != -1
                     if valid.any():
