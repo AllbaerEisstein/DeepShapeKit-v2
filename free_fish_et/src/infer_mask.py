@@ -47,43 +47,6 @@ def inference(model: YOLO, image_path: Path) -> tuple[list, list, list]:
             return [[]], [[[]]], [0.0] # None detection to be filtered out by confidence
 
     return bboxes, masks_xy, confs
-        
-
-def run_infer_mask(
-    model: YOLO,
-    input_path: Path,
-    frame_indices: list[int] | None = None,
-    frame_number_by_name: dict[str, int] | None = None
-) -> dict[str, dict[str, list]]:
-    """
-    Run mask inference for all images in a folder, optionally filtering by frame index.
-    """
-    img_path2result = {}
-    frame_indices_set = set(frame_indices) if frame_indices is not None else None
-    for img in Path(input_path).iterdir():
-        if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-            if frame_indices_set is not None:
-                frame_number = None
-                if frame_number_by_name is not None:
-                    frame_number = frame_number_by_name.get(img.name)
-                else:
-                    try:
-                        frame_number = int(img.stem.split('_')[-1])
-                    except ValueError:
-                        frame_number = None
-                if frame_number is None or frame_number not in frame_indices_set:
-                    continue
-            img_path2result[str(img)] = {
-                "bboxes": [],
-                "masks_xy": [],
-                "confs": []
-            }
-            bboxes, masks_xy, confs = inference(model, img)
-            img_path2result[str(img)]["bboxes"] = bboxes
-            img_path2result[str(img)]["masks_xy"] = masks_xy
-            img_path2result[str(img)]["confs"] = confs
-    return img_path2result
-
 
 
 def img2bbx(img_path: Path, bbox, out_dir: Path, padding, out_filename: None | str = None):

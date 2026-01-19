@@ -463,11 +463,6 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8,
                     frame_number = None
                     if frame_number_by_name is not None:
                         frame_number = frame_number_by_name.get(img.name)
-                    else:
-                        try:
-                            frame_number = int(img.stem.split('_')[-1])
-                        except ValueError:
-                            frame_number = None
                     if frame_number is None or frame_number not in frame_indices_set:
                         continue
                 img_path2result[str(img)] = {
