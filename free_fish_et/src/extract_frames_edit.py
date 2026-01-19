@@ -23,6 +23,14 @@ from src.parse_cams_json import (
 from src.types import *
 
 
+def dynamic_print(msg):
+    length = len(dynamic_print.last_msg) if hasattr(dynamic_print, 'last_msg') else 0
+    print(' ' * length, end='\r')  # Clear the line
+    print(msg, end='\r')
+    dynamic_print.last_msg = msg  # Save for next overwrite
+
+
+
 def extract_from_video(
         videos: list[Path], 
         cam_matrices_json_path: Path, 
@@ -230,7 +238,7 @@ def extract_from_video(
                     image_count += 1
 
                     frame_number += 1
-                    print(f'frame out: {frame_number}, total image: {image_count}', end='\r')
+                    dynamic_print(f'frame out: {frame_number}, total image: {image_count}')
 
                 print(f'total image: {image_count}, done')
 
@@ -531,7 +539,7 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8,
             #           |   └──> entry per instance
             #           └──> list of instances 
             for instance_number, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
-                print(f"      processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
+                dynamic_print(f"      processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
                 if conf > conf_threshold:
                     bbox_masked_image_fname = f"image_{frame_number}_{instance_number}_bbox-masked.png"
                     infer_mask.img2bbx(
@@ -680,16 +688,16 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
                 
                 # TODO: If keypoint detection detected multiple instances, get the instance with the best criteria, e.g. most keypoints detected. The other instance is considered a wrong detection.
                 kpts = instances[0]
-                print(f"   processing instance {instance_number} in frame {frame_number_str} ({Path(img).name})")
+                dynamic_print(f"   processing instance {instance_number} in frame {frame_number_str} ({Path(img).name})")
                 if len(kpts) == 0:
                     # we know there is an instance in the image because of the instance segmentation step,
                     # but keypoint detection missed it.
-                    print("      keypoint-detection missed this instance")
+                    dynamic_print("      keypoint-detection missed this instance")
                     frame2prediction[frame_number_str][str(instance_number)] = make_no_instance_detected_dict()
                 else:
                     frame2prediction[frame_number_str][str(instance_number)] = make_zero_dict()
                     for index, (x, y, c) in enumerate(kpts):
-                        print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
+                        dynamic_print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
                         frame2prediction[frame_number_str][str(instance_number)][kpt_names_dict[index]] = [
                             x, y, (c if (x > 0 or y > 0) else 0.0) # undetected keypoints indicated by x=y=0 -> also conf=0.0
                         ]
