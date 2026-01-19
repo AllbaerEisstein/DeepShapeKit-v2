@@ -29,7 +29,7 @@ def extract_from_video(
         out_dir: Path, dataset_folder_name: str = 'dataset', 
         also_create_frame2video_csv: bool = False, 
         undistort: bool = False, 
-        frames: Optional[List[int]] = None
+        frame_indices: Optional[List[int]] = None
     ):
     """
     📂 Expected/Assumed Directory Structure Before Execution:
@@ -64,7 +64,7 @@ def extract_from_video(
 
     destination = out_dir / dataset_folder_name
     destination.mkdir(exist_ok=True)
-    max_frame_number = max(frames) if frames is not None else -1
+    max_frame_number = max(frame_indices) if frame_indices is not None else -1
 
     json_out_path = destination / 'index.json'
     json_index = {
@@ -206,10 +206,10 @@ def extract_from_video(
                     success, frame = capture.read()
                     if not success:
                         break
-                    if frames is not None:
+                    if frame_indices is not None:
                         if frame_number > max_frame_number:
                             break
-                        if frame_number not in frames:
+                        if frame_number not in frame_indices:
                             frame_number += 1
                             continue
                     if undistort and needs_undistortion:
@@ -241,12 +241,14 @@ def extract_from_video(
                 capture.release()
     
         if also_create_frame2video_csv:
+            # create a mapping 1:1 from original frame numbers to new frame numbers 
+            # NOTE: this is a stub in case frame selection is implemented later
             frame2video_csv_path = video_folder / 'frame2video_1.csv'
             with frame2video_csv_path.open('w', newline='') as csv_out_file:
                 csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
                 csvwriter.writerow(['origin_frame', 'new_frame'])
 
-                for i in range(image_count):
+                for i in range(frame_indices[-1] + 1 if frame_indices is not None else image_count):
                     csvwriter.writerow([i, i])
 
     json_index['camera_matrices'] = cam_matrices
@@ -447,10 +449,27 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8,
             )
             Image.fromarray(full_mask).save(full_mask_path)
 
-    def run_infer_mask(model, input_path: Path) -> dict[str, dict[str, list]]:
+    def run_infer_mask(
+            model,
+            input_path: Path,
+            frame_indices: Optional[List[int]] = None,
+            frame_number_by_name: Optional[dict[str, int]] = None
+        ) -> dict[str, dict[str, list]]:
+        frame_indices_set = set(frame_indices) if frame_indices is not None else None
         img_path2result = {}
         for img in Path(input_path).iterdir():
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                if frame_indices_set is not None:
+                    frame_number = None
+                    if frame_number_by_name is not None:
+                        frame_number = frame_number_by_name.get(img.name)
+                    else:
+                        try:
+                            frame_number = int(img.stem.split('_')[-1])
+                        except ValueError:
+                            frame_number = None
+                    if frame_number is None or frame_number not in frame_indices_set:
+                        continue
                 img_path2result[str(img)] = {
                     "bboxes": [],
                     "masks_xy": [],
@@ -480,14 +499,35 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8,
 
         csv_rows = []  # <-- Collect rows here instead of writing immediately
 
-        img_path2prediction: dict[str, dict[str, list]] = run_infer_mask(model=model, input_path=dataset_path / folder / "origin")
         files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
+        frame_number_by_name = {
+            Path(row["file_loc"]).name: int(row["frame"])
+            for row in files_csv_rows
+        }
+        available_frames = sorted(frame_number_by_name.values())
+        frame_indices_set = set(frame_indices) if frame_indices is not None else None
+        target_frames = (
+            [frame for frame in available_frames if frame in frame_indices_set]
+            if frame_indices_set is not None
+            else available_frames
+        )
+        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else "no-frames"
+        img_path2prediction: dict[str, dict[str, list]] = run_infer_mask(
+            model=model,
+            input_path=dataset_path / folder / "origin",
+            frame_indices=frame_indices,
+            frame_number_by_name=frame_number_by_name
+        )
 
-        for img_path, prediction in tqdm(sorted(img_path2prediction.items())):
-            frame_number = get_frame_number(img_path=Path(img_path), files_csv_rows=files_csv_rows)
-            if frame_indices is not None and frame_number not in frame_indices:
-                print(f"      skipping extracted frame {frame_number} as it's not in the specified frame indices.")
-                continue
+        pbar = tqdm(
+            total=len(target_frames),
+            desc=f"      processing frames in {folder} [{frame_range_label}]"
+        )
+        for img_path, prediction in sorted(
+            img_path2prediction.items(),
+            key=lambda item: frame_number_by_name.get(Path(item[0]).name, -1)
+        ):
+            frame_number = frame_number_by_name.get(Path(img_path).name, -1)
             img_name = Path(img_path).name
 
             bboxes:   list[list[int]]         = prediction["bboxes"]
@@ -522,6 +562,8 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8,
                     csv_rows.append([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
 
                     max_n_instances = max(max_n_instances, instance_number + 1)
+            pbar.update(1)
+        pbar.close()
 
         csv_rows.sort(key=lambda row: row[0])
 
@@ -595,15 +637,34 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
         frame2prediction: dict[str, InstancesKeypointsDict] = defaultdict(InstancesKeypointsDict)
         input_path = dataset_path / view / 'bbox-masked_image'
 
+        frame_number_by_name = {
+            Path(row["file_loc"]).name: int(row["frame"])
+            for row in files_crop_csv_rows
+        }
+        frame_indices_set = set(frame_indices) if frame_indices is not None else None
+        frame_to_images: dict[int, list[Path]] = defaultdict(list)
         for img in sorted(input_path.iterdir()):
-            frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
-            if frame_indices is not None and int(frame_number) not in frame_indices:
-                print(f"      skipping extracted frame {frame_number} as it's not in the specified frame indices.")
+            if img.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
                 continue
-            instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
-            if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                if frame_number not in frame2prediction:
-                    frame2prediction[frame_number] = InstancesKeypointsDict()
+            frame_number = frame_number_by_name.get(img.name)
+            if frame_number is None:
+                continue
+            if frame_indices_set is not None and frame_number not in frame_indices_set:
+                continue
+            frame_to_images[frame_number].append(img)
+
+        target_frames = sorted(frame_to_images.keys())
+        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else "no-frames"
+        pbar = tqdm(
+            total=len(target_frames),
+            desc=f"      processing frames in {view} [{frame_range_label}]"
+        )
+        for frame_number in target_frames:
+            frame_number_str = str(frame_number)
+            for img in sorted(frame_to_images[frame_number], key=lambda p: p.stem):
+                instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
+                if frame_number_str not in frame2prediction:
+                    frame2prediction[frame_number_str] = InstancesKeypointsDict()
                 _, instances = infer_keypoints.inference(model, img)
 
                 if len(instances) != 1:
@@ -618,31 +679,33 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
                         so this is a false positive.
                     In both cases, we indicate that with a -1 instance number and all -1 coordinate and conf values.
                     """
-                    print(f"   keypoint-detection missed all instances in frame {frame_number} ({Path(img).name})")
-                    frame2prediction[frame_number]['-1'] = make_no_instance_detected_dict()
+                    print(f"   keypoint-detection missed all instances in frame {frame_number_str} ({Path(img).name})")
+                    frame2prediction[frame_number_str]['-1'] = make_no_instance_detected_dict()
                     continue       
                 
                 # TODO: If keypoint detection detected multiple instances, get the instance with the best criteria, e.g. most keypoints detected. The other instance is considered a wrong detection.
                 kpts = instances[0]
-                print(f"   processing instance {instance_number} in frame {frame_number} ({Path(img).name})")
+                print(f"   processing instance {instance_number} in frame {frame_number_str} ({Path(img).name})")
                 if len(kpts) == 0:
                     # we know there is an instance in the image because of the instance segmentation step,
                     # but keypoint detection missed it.
                     print("      keypoint-detection missed this instance")
-                    frame2prediction[frame_number][str(instance_number)] = make_no_instance_detected_dict()
+                    frame2prediction[frame_number_str][str(instance_number)] = make_no_instance_detected_dict()
                 else:
-                    frame2prediction[frame_number][str(instance_number)] = make_zero_dict()
+                    frame2prediction[frame_number_str][str(instance_number)] = make_zero_dict()
                     for index, (x, y, c) in enumerate(kpts):
                         print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
-                        frame2prediction[frame_number][str(instance_number)][kpt_names_dict[index]] = [
+                        frame2prediction[frame_number_str][str(instance_number)][kpt_names_dict[index]] = [
                             x, y, (c if (x > 0 or y > 0) else 0.0) # undetected keypoints indicated by x=y=0 -> also conf=0.0
                         ]
 
                     draw_kpts_on_img(
-                        frame2prediction[frame_number][str(instance_number)],
+                        frame2prediction[frame_number_str][str(instance_number)],
                         img,
-                        dataset_path / view / 'keypoints_results' / f'keypoints_{frame_number}_{instance_number}.png'
+                        dataset_path / view / 'keypoints_results' / f'keypoints_{frame_number_str}_{instance_number}.png'
                     )
+            pbar.update(1)
+        pbar.close()
 
         # low-confidence fish detections are already filtered out by mask detection!            
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
