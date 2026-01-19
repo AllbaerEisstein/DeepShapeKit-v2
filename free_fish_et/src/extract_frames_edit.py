@@ -433,7 +433,7 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) 
 
 
 # TODO: Instance tracking across views
-def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8):
+def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8, frame_indices=None):
     """
     Use a pre-trained YOLO11n-seg model (model_path) to infer the segmentation masks of the dataset.
     This step is responsible for instance identification! 
@@ -604,6 +604,9 @@ def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8)
 
         for img_path, prediction in tqdm(sorted(img_path2prediction.items())):
             frame_number = get_frame_number(img_path=Path(img_path), files_csv_rows=files_csv_rows)
+            if frame_indices is not None and frame_number not in frame_indices:
+                print(f"      skipping extracted frame {frame_number} as it's not in the specified frame indices.")
+                continue
             img_name = Path(img_path).name
 
             bboxes:   list[list[int]]         = prediction["bboxes"]
@@ -679,7 +682,7 @@ def draw_kpts_on_img(kpt2xyc: Dict[str, list], img_path: Path, out_path: Path, t
     cv2.imwrite(filename=str(out_path), img=img)
 
 
-def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str]):
+def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str], frame_indices=None):
     """
     └── keypoint_results/
         └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
@@ -713,6 +716,9 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
 
         for img in sorted(input_path.iterdir()):
             frame_number: str = str(get_frame_number(img_path=img, files_csv_rows=files_crop_csv_rows))
+            if frame_indices is not None and int(frame_number) not in frame_indices:
+                print(f"      skipping extracted frame {frame_number} as it's not in the specified frame indices.")
+                continue
             instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
             if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
                 if frame_number not in frame2prediction:

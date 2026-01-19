@@ -180,6 +180,7 @@ def run_pipeline(
             dataset_path=dataset_folder_path,
             model_path=Path(config.segmentation_model_path),
             conf_threshold=config.conf_threshold,
+            frame_indices=parse_frame_selection(config.frame_range) if config.frame_range else None
         )
 
     if "keypoints" in steps:
@@ -187,6 +188,7 @@ def run_pipeline(
             dataset_path=dataset_folder_path,
             model_path=Path(config.pose_model_path),
             kpt_names_dict=kpt_name_dict,
+            frame_indices=parse_frame_selection(config.frame_range) if config.frame_range else None
         )
 
     if "render_time_series" in steps:
