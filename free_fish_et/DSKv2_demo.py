@@ -209,6 +209,7 @@ def run_pipeline(
             deform=config.pose_time_series_deform,
             frame_range=parse_frame_selection(config.frame_range) if config.frame_range else None,
             offset_by_frame_range_start=config.pose_time_series_offset_by_range_start,
+            center_origin_on_camera_mean=config.center_origin_on_camera_mean,
         )
 
     if "reconstruct" in steps:
