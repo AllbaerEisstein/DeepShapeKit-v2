@@ -622,6 +622,7 @@ def reconstruct(
     save_models: bool = False,
     video_names: Optional[List[str]] = None,
     pause_event: Optional[Any] = None,
+    center_origin_on_camera_mean: bool = False,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
@@ -638,6 +639,14 @@ def reconstruct(
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
     camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
+    if center_origin_on_camera_mean:
+        camera_centers_custom = camera_group_uniform_size_cpu.camera_centers
+        from_bl_inv = camera_group_uniform_size_cpu.from_blenderworld.transpose(1, 2)
+        camera_centers_bl = torch.matmul(from_bl_inv, camera_centers_custom.unsqueeze(-1)).squeeze(-1)
+        mean_center_bl = camera_centers_bl.mean(dim=0)
+        transform = torch.eye(4, dtype=camera_group_uniform_size_cpu.K.dtype)
+        transform[:3, 3] = -mean_center_bl
+        camera_group_uniform_size_cpu = camera_group_uniform_size_cpu.transform_blenderworld(transform)
     camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
 
     fish = fish_model(mesh_json_path=mesh_path)

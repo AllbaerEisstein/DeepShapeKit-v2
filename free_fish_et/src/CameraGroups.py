@@ -150,7 +150,7 @@ class CameraGroup:
     def with_intrinsics_adjusted_for_uniform_image_size(self) -> "CameraGroup":
         """Return a CameraGroup with adjusted intrinsics for the target uniform image size."""
         return self.get_cg_for_new_image_size()
-    
+
     def is_uniform_image_size(self) -> bool:
         """Return True if all cameras have the same image size."""
         if self.original_image_size_wh is None:
@@ -165,6 +165,38 @@ class CameraGroup:
         R_blender = torch.matmul(self.R, self.from_blenderworld)
         Rt = torch.cat([R_blender, self.t.unsqueeze(-1)], dim=2)
         return torch.matmul(self.K, Rt)
+
+    def transform_blenderworld(self, transforms: torch.Tensor) -> "CameraGroup":
+        """Return a new CameraGroup after applying per-camera Blender-world transforms."""
+        T = torch.as_tensor(transforms, dtype=self.K.dtype, device=self.K.device)
+        if T.ndim == 2:
+            T = T.unsqueeze(0)
+        if T.shape[0] == 1:
+            T = T.expand(self.batch_size, -1, -1)
+        elif T.shape[0] != self.batch_size:
+            raise ValueError("transforms batch dimension must be 1 or equal to number of cameras")
+        if T.shape[-2:] != (4, 4):
+            raise ValueError("transforms must have shape (4, 4) or (batch_size, 4, 4)")
+
+        T_inv = torch.inverse(T)
+        A = T_inv[:, :3, :3]
+        b = T_inv[:, :3, 3]
+
+        #F_new = torch.matmul(self.from_blenderworld, A)
+        RF = torch.matmul(self.R, self.from_blenderworld)
+        t_new = self.t + torch.einsum("bij,bj->bi", RF, b)
+        Rt_new = torch.cat([self.R, t_new.unsqueeze(-1)], dim=2)
+        P_new = torch.matmul(self.K, Rt_new)
+
+        return CameraGroup(
+            P=P_new,
+            K=self.K,
+            R=self.R,
+            t=t_new,
+            from_blenderworld=self.from_blenderworld,
+            original_image_size_wh=self.original_image_size_wh,
+            target_uniform_image_size=self.target_uniform_image_size,
+        )
 
     def _expand_points(self, points: torch.Tensor) -> tuple[torch.Tensor, bool]:
         squeeze = False

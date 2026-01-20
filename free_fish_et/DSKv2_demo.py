@@ -54,6 +54,7 @@ class PipelineConfig:
     pose_time_series_path: Optional[str] = "src/DSKv2/pose_time_series_Bluegill_Body.json"
     pose_time_series_deform: bool = False
     pose_time_series_offset_by_range_start: bool = False
+    center_origin_on_camera_mean: bool = False
     dataset_folder_name: str = "dataset"
     seed: int = 700
     save_models: bool = True
@@ -225,6 +226,7 @@ def run_pipeline(
             save_models=config.save_models,
             video_names=selected_views,
             pause_event=reconstruct_pause_event,
+            center_origin_on_camera_mean=config.center_origin_on_camera_mean,
         )
 
 
@@ -494,6 +496,7 @@ class PipelineGUI:
         self.pose_time_series_offset_var = tk.BooleanVar(
             value=self.config.pose_time_series_offset_by_range_start
         )
+        self.center_origin_var = tk.BooleanVar(value=self.config.center_origin_on_camera_mean)
         self.advanced_visible = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Idle.")
@@ -605,12 +608,18 @@ class PipelineGUI:
             variable=self.pose_time_series_offset_var,
         )
         offset_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        center_origin_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Set 3D origin to mean camera position",
+            variable=self.center_origin_var,
+        )
+        center_origin_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
         render_button = ttk.Button(
             self.advanced_frame,
             text="render_pose_time_series",
             command=lambda: self.run_step("render_time_series"),
         )
-        render_button.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        render_button.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
         self.advanced_frame.grid_remove()
         row += 1
@@ -751,6 +760,7 @@ class PipelineGUI:
         config.pose_time_series_path = pose_time_series or None
         config.pose_time_series_deform = bool(self.pose_time_series_deform_var.get())
         config.pose_time_series_offset_by_range_start = bool(self.pose_time_series_offset_var.get())
+        config.center_origin_on_camera_mean = bool(self.center_origin_var.get())
 
         return config
 
@@ -807,6 +817,7 @@ class PipelineGUI:
         self.pose_time_series_var.set(config.pose_time_series_path or "")
         self.pose_time_series_deform_var.set(bool(config.pose_time_series_deform))
         self.pose_time_series_offset_var.set(bool(config.pose_time_series_offset_by_range_start))
+        self.center_origin_var.set(bool(config.center_origin_on_camera_mean))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
