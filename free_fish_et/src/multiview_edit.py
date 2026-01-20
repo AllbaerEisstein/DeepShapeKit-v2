@@ -51,6 +51,7 @@ def fit_geometry(
     # Triangulation with LBFGS
     camera_group = cameras.to(keypoints.device)
     observed_kpts_3d = mutils.get_gt_3d(keypoints, camera_group, LBFGS=True)
+    print(f"Triangulated 3D keypoints: {observed_kpts_3d}")
 
     # Filter keypoints for confidence > 0
     valid_kpts_3d_boolmask = observed_kpts_3d[:, -1] > 0

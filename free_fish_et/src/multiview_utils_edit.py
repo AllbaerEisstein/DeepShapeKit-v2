@@ -139,6 +139,7 @@ def get_gt_3d(
         if valid_views.sum() < 2:
             continue
         obs = keypoints[valid_views, k, :2]
+        print(f"Triangulating keypoint {obs}.")
         image_size = None
         if camera_group.original_image_size_wh is not None:
             img_size = camera_group.original_image_size_wh
@@ -162,6 +163,7 @@ def get_gt_3d(
 
         kpts_3d[k, :3] = X
         kpts_3d[k, -1] = 1
+        print(f"Triangulated keypoint {k}: {X}")
 
     return kpts_3d
 
