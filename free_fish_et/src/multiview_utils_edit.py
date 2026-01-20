@@ -49,18 +49,20 @@ def triangulation_LBFGS(
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
     from_bl_inv = camera_group.from_blenderworld.transpose(1, 2)
 
-    Xs = []
-    for i in range(vn):
-        P = camera_group.P[i]
-        print(f"Triangulation LBFGS - View {i}, points_h: {points_h[i]}")
-        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
-        X_custom_coord_conv = (X_h[:3] / X_h[3]).squeeze()
-        print(f"Triangulation LBFGS - View {i}, X_custom_coord_conv: {X_custom_coord_conv}")
-        X_bl = torch.matmul(from_bl_inv[i], X_custom_coord_conv)
-        print(f"Triangulation LBFGS - View {i}, X_bl: {X_bl}")
+    # NOTE: the lstsquare and backprojection approach fails for a camera that is at the origin because of devision by 0.
+    # Xs = []
+    # for i in range(vn):
+    #     P = camera_group.P[i]
+    #     X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
+    #     X_custom_coord_conv = (X_h[:3] / X_h[3]).squeeze()
+    #     X_bl = torch.matmul(from_bl_inv[i], X_custom_coord_conv)
+    #     Xs.append(X_bl)
+    # X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
 
-        Xs.append(X_bl)
-    X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
+    # Initialize at the mean camera center
+    camera_centers = camera_group.camera_centers
+    camera_centers_bl = torch.matmul(from_bl_inv, camera_centers.unsqueeze(-1)).squeeze(-1)
+    X_init = camera_centers_bl.mean(dim=0, keepdim=True).unsqueeze(0)
 
     X = X_init.clone().detach().requires_grad_()
 
@@ -98,14 +100,20 @@ def triangulation(
     points_h = torch.cat([points, torch.ones(vn, 1, device=points.device)], dim=1)
     from_bl_inv = camera_group.from_blenderworld.transpose(1, 2)
 
-    Xs = []
-    for i in range(vn):
-        P = camera_group.P[i]
-        X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
-        X_cv = (X_h[:3] / X_h[3]).squeeze()
-        X_bl = torch.matmul(from_bl_inv[i], X_cv)
-        Xs.append(X_bl)
-    X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
+    # NOTE: the lstsquare and backprojection approach fails for a camera that is at the origin because of devision by 0.
+    # Xs = []
+    # for i in range(vn):
+    #     P = camera_group.P[i]
+    #     X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
+    #     X_cv = (X_h[:3] / X_h[3]).squeeze()
+    #     X_bl = torch.matmul(from_bl_inv[i], X_cv)
+    #     Xs.append(X_bl)
+    # X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
+
+    # Initialize at the mean camera center
+    camera_centers = camera_group.camera_centers
+    camera_centers_bl = torch.matmul(from_bl_inv, camera_centers.unsqueeze(-1)).squeeze(-1)
+    X_init = camera_centers_bl.mean(dim=0, keepdim=True).unsqueeze(0)
 
     X = X_init.clone().detach().requires_grad_()
 
