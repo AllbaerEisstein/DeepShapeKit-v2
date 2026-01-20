@@ -485,6 +485,8 @@ class PipelineGUI:
         self.frame_range_var = tk.StringVar(value=self.config.frame_range or "")
         self.instance_var = tk.StringVar(value=str(self.config.instance_number))
         self.undistort_var = tk.BooleanVar(value=self.config.undistort)
+        self.pose_time_series_var = tk.StringVar(value=self.config.pose_time_series_path or "")
+        self.advanced_visible = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Idle.")
         self.action_buttons: List[tk.Widget] = []
@@ -566,6 +568,31 @@ class PipelineGUI:
         ttk.Label(main, text="Instance number").grid(row=row, column=0, sticky="w", pady=2)
         instance_entry = ttk.Entry(main, textvariable=self.instance_var)
         instance_entry.grid(row=row, column=1, sticky="ew", pady=2)
+        row += 1
+
+        self.advanced_toggle = ttk.Button(main, text="Advanced ▸", command=self._toggle_advanced)
+        self.advanced_toggle.grid(row=row, column=0, sticky="w", pady=(6, 2))
+        row += 1
+
+        self.advanced_frame = ttk.Frame(main)
+        self.advanced_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self.advanced_frame.columnconfigure(1, weight=1)
+
+        self._add_path_row(
+            self.advanced_frame,
+            0,
+            "Pose time series",
+            self.pose_time_series_var,
+            self.browse_pose_time_series,
+        )
+        render_button = ttk.Button(
+            self.advanced_frame,
+            text="render_pose_time_series",
+            command=lambda: self.run_step("render_time_series"),
+        )
+        render_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self.action_buttons.append(render_button)
+        self.advanced_frame.grid_remove()
         row += 1
 
         control_frame = ttk.Frame(main)
@@ -660,6 +687,9 @@ class PipelineGUI:
     def browse_cam_matrices(self) -> None:
         self._browse_file(self.cam_var, "Select camera matrices file")
 
+    def browse_pose_time_series(self) -> None:
+        self._browse_file(self.pose_time_series_var, "Select pose time series file")
+
     def browse_out_path(self) -> None:
         self._browse_directory(self.out_path_var, "Select output directory")
 
@@ -697,6 +727,8 @@ class PipelineGUI:
         else:
             config.instance_number = 0
         config.undistort = bool(self.undistort_var.get())
+        pose_time_series = self.pose_time_series_var.get().strip()
+        config.pose_time_series_path = pose_time_series or None
 
         return config
 
@@ -750,7 +782,18 @@ class PipelineGUI:
         self.frame_range_var.set(config.frame_range or "")
         self.instance_var.set(str(config.instance_number))
         self.undistort_var.set(bool(config.undistort))
+        self.pose_time_series_var.set(config.pose_time_series_path or "")
         self._refresh_video_listbox()
+
+    def _toggle_advanced(self) -> None:
+        if self.advanced_visible.get():
+            self.advanced_visible.set(False)
+            self.advanced_frame.grid_remove()
+            self.advanced_toggle.configure(text="Advanced ▸")
+        else:
+            self.advanced_visible.set(True)
+            self.advanced_frame.grid()
+            self.advanced_toggle.configure(text="Advanced ▾")
 
     def run_step(self, step: str) -> None:
         if self.worker_thread and self.worker_thread.is_alive():

@@ -895,7 +895,7 @@ def render_pose_time_series(
     fish.to_device(device)
 
     dataset = Multiview_Dataset(root=dataset_dir)
-    camera_group_cpu = dataset.cams.get_camera_group()
+    camera_group_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
     camera_group_device = camera_group_cpu.to(device)
 
     renderer = Silhouette_Renderer(device, camera_group_device)
