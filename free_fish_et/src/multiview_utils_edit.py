@@ -196,8 +196,7 @@ def Procrustes(X: torch.Tensor, Y: torch.Tensor):
     # Procrustes only works on cpu
     X = X.cpu()
     Y = Y.cpu()
-    print(f"Procrustes X: {X}"
-          f"\nProcrustes Y: {Y}")
+    
     # remove translation
     A = (Y - Y.mean(dim=0, keepdim=True))
     B = (X - X.mean(dim=0, keepdim=True))

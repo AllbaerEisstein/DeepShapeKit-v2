@@ -177,7 +177,6 @@ def extract_from_video(
                 for aliases, key_name in [
                     (KEY_ALIASES['R'], 'R'),
                     (KEY_ALIASES['T'], 't'),
-                    (KEY_ALIASES['P'], 'P'),
                 ]:
                     val = _find_any(original_entry, aliases)
                     if val is not None:
@@ -188,6 +187,15 @@ def extract_from_video(
                     if fb_key in original_entry:
                         updated_entry["FROM_BLENDERWORLD"] = original_entry[fb_key]
                         break
+                # Recompute projection matrix to keep P consistent with new intrinsics.
+                try:
+                    R_np = np.array(updated_entry["R"], dtype=float)
+                    t_np = np.array(updated_entry["t"], dtype=float).reshape(3, 1)
+                    Rt_np = np.concatenate([R_np, t_np], axis=1)
+                    P_np = np.array(updated_entry["K"], dtype=float) @ Rt_np
+                    updated_entry["P"] = P_np.tolist()
+                except Exception as exc:
+                    print(f"Warning: could not recompute projection matrix for view {video_name}: {exc}")
                 print(f"Updated camera matrix for undistorted video {video_name}: {updated_entry}")
                 cam_matrices[video_name] = updated_entry
                 needs_undistortion = True

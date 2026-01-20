@@ -243,18 +243,19 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             # pad the image to match the maximum image size and also adjust keypoint coordinates accordingly
             orig_img_size = (self.index_json['image_sizes'][view][0], self.index_json['image_sizes'][view][1])
             needs_padding = orig_img_size != self.uniform_img_size
-            pad_x = 0.0
-            pad_y = 0.0
+            pad_left = pad_right = pad_top = pad_bottom = 0
             if needs_padding:
                 w, h = orig_img_size
                 max_w, max_h = self.uniform_img_size
-                pad_x = int((max_w - w) / 2.0)
-                pad_y = int((max_h - h) / 2.0)
+                pad_left   = int((max_w - w) // 2)
+                pad_right  = int(max_w - w - pad_left)
+                pad_top    = int((max_h - h) // 2)
+                pad_bottom = int(max_h - h - pad_top)
                 for inst_kpts in kpt_list:
                     valid = inst_kpts[:, 2] != -1
                     if valid.any():
-                        inst_kpts[valid, 0] += pad_x
-                        inst_kpts[valid, 1] += pad_y
+                        inst_kpts[valid, 0] += pad_left
+                        inst_kpts[valid, 1] += pad_top
 
             # meta info for this frame
             masks_row_per_instance      = self.masks_meta[view].get(origin_frame_number, [])
@@ -313,8 +314,13 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                 # pad the image to match the maximum image size and also adjust the bbox coordinates accordingly
                 if needs_padding:
                     # bbox is specified in x1, y1, x2, y2 format
-                    bbox = [bbox[0]+pad_x, bbox[1]+pad_y, bbox[2]+pad_x, bbox[3]+pad_y]
-                    full_mask = np.pad(full_mask, ((pad_y, pad_y), (pad_x, pad_x)))
+                    bbox = [
+                        bbox[0] + pad_left,
+                        bbox[1] + pad_top,
+                        bbox[2] + pad_left,
+                        bbox[3] + pad_top,
+                    ]
+                    full_mask = np.pad(full_mask, ((pad_top, pad_bottom), (pad_left, pad_right)))
                     
                 bboxes.append(bbox)
                 crops.append(crop)

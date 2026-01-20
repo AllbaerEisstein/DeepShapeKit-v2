@@ -127,12 +127,14 @@ class CameraGroup:
         w, h = self.original_image_size_wh[:,0], self.original_image_size_wh[:,1]
         target_w, target_h = target_size_wh[:,0], target_size_wh[:,1]
 
-        pad_x = (target_w - w) / 2.0
-        pad_y = (target_h - h) / 2.0
+        pad_left   = (target_w - w) // 2
+        pad_right  = target_w - w - pad_left
+        pad_top    = (target_h - h) // 2
+        pad_bottom = target_h - h - pad_top
 
         K_new = self.K.clone().detach()
-        K_new[:,0,2] += pad_x
-        K_new[:,1,2] += pad_y
+        K_new[:,0,2] += pad_left
+        K_new[:,1,2] += pad_top
         P_new = K_new @ self.Rt
 
         return CameraGroup(
