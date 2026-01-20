@@ -52,9 +52,13 @@ def triangulation_LBFGS(
     Xs = []
     for i in range(vn):
         P = camera_group.P[i]
+        print(f"Triangulation LBFGS - View {i}, points_h: {points_h[i]}")
         X_h = torch.linalg.lstsq(P, points_h[i].unsqueeze(1)).solution
         X_custom_coord_conv = (X_h[:3] / X_h[3]).squeeze()
+        print(f"Triangulation LBFGS - View {i}, X_custom_coord_conv: {X_custom_coord_conv}")
         X_bl = torch.matmul(from_bl_inv[i], X_custom_coord_conv)
+        print(f"Triangulation LBFGS - View {i}, X_bl: {X_bl}")
+
         Xs.append(X_bl)
     X_init = torch.stack(Xs).mean(dim=0, keepdim=True).unsqueeze(0)
 
