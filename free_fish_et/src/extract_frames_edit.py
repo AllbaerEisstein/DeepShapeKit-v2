@@ -109,7 +109,7 @@ def extract_from_video(
         K = None
         distortions = None
         newK = None
-        new_focal_mm = None
+        #new_focal_mm = None
         undistort_coeffs = None
         if undistort:
             matrices_json = cam_matrices.get(base_video_name, None)
@@ -188,6 +188,7 @@ def extract_from_video(
                     if fb_key in original_entry:
                         updated_entry["FROM_BLENDERWORLD"] = original_entry[fb_key]
                         break
+                print(f"Updated camera matrix for undistorted video {video_name}: {updated_entry}")
                 cam_matrices[video_name] = updated_entry
                 needs_undistortion = True
 

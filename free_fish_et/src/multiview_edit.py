@@ -114,6 +114,9 @@ def fit_mesh(
     assert keypoints.shape[0] == Ps.shape[0], "camera batch size must match keypoints"
     assert fish.device_active, "fish model must be on target device"
 
+    print(f"masks: {masks}")
+    print(f"keypoints: {keypoints}")
+
     if (
         init_global_ori != None
         or init_t != None
