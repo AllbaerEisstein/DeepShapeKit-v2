@@ -887,7 +887,9 @@ def render_pose_time_series(
     dataset_dir: str,
     pose_time_series_file_path: str,
     outdir: str,
-    deform: bool = False
+    deform: bool = False,
+    frame_range: Optional[List[int]] = None,
+    offset_by_frame_range_start: bool = False,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -906,8 +908,25 @@ def render_pose_time_series(
         pose_time_series_json = json.load(jf)
     frames = pose_time_series_json["frames"]
 
-    for index, frame in enumerate(frames):
-        sample = dataset.__getitem__(index)
+    frame_range_list = frame_range or []
+    range_start = min(frame_range_list) if frame_range_list else 0
+    range_end = max(frame_range_list) if frame_range_list else None
+    offset = range_start if (offset_by_frame_range_start and frame_range_list) else 0
+
+    if frame_range_list:
+        frame_set = set(frame_range_list)
+        pose_end = max((int(frame.get("frame", 0)) for frame in frames), default=-1) + offset
+        effective_end = min(range_end, pose_end) if range_end is not None else pose_end
+        frames = [
+            frame
+            for frame in frames
+            if (int(frame.get("frame", 0)) + offset) in frame_set
+            and (int(frame.get("frame", 0)) + offset) <= effective_end
+        ]
+
+    for frame in frames:
+        frame_id = int(frame.get("frame", 0)) + offset
+        sample = dataset.__getitem__(frame_id)
 
         global_t = torch.tensor(frame["global_t"], device=device)
         global_ori = torch.tensor(frame["global_ori"], device=device)

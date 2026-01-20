@@ -52,6 +52,8 @@ class PipelineConfig:
     frame_range: Optional[str] = "65-89"
     instance_number: int = 0
     pose_time_series_path: Optional[str] = "src/DSKv2/pose_time_series_Bluegill_Body.json"
+    pose_time_series_deform: bool = False
+    pose_time_series_offset_by_range_start: bool = False
     dataset_folder_name: str = "dataset"
     seed: int = 700
     save_models: bool = True
@@ -203,7 +205,9 @@ def run_pipeline(
             dataset_dir=str(dataset_folder_path),
             pose_time_series_file_path=config.pose_time_series_path,
             outdir=str(final_output_folder),
-            deform=False,
+            deform=config.pose_time_series_deform,
+            frame_range=parse_frame_selection(config.frame_range) if config.frame_range else None,
+            offset_by_frame_range_start=config.pose_time_series_offset_by_range_start,
         )
 
     if "reconstruct" in steps:
@@ -486,6 +490,10 @@ class PipelineGUI:
         self.instance_var = tk.StringVar(value=str(self.config.instance_number))
         self.undistort_var = tk.BooleanVar(value=self.config.undistort)
         self.pose_time_series_var = tk.StringVar(value=self.config.pose_time_series_path or "")
+        self.pose_time_series_deform_var = tk.BooleanVar(value=self.config.pose_time_series_deform)
+        self.pose_time_series_offset_var = tk.BooleanVar(
+            value=self.config.pose_time_series_offset_by_range_start
+        )
         self.advanced_visible = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Idle.")
@@ -585,12 +593,24 @@ class PipelineGUI:
             self.pose_time_series_var,
             self.browse_pose_time_series,
         )
+        deform_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Deform mesh when rendering time series",
+            variable=self.pose_time_series_deform_var,
+        )
+        deform_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        offset_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Pose time series start is frame range start",
+            variable=self.pose_time_series_offset_var,
+        )
+        offset_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
         render_button = ttk.Button(
             self.advanced_frame,
             text="render_pose_time_series",
             command=lambda: self.run_step("render_time_series"),
         )
-        render_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        render_button.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
         self.advanced_frame.grid_remove()
         row += 1
@@ -729,6 +749,8 @@ class PipelineGUI:
         config.undistort = bool(self.undistort_var.get())
         pose_time_series = self.pose_time_series_var.get().strip()
         config.pose_time_series_path = pose_time_series or None
+        config.pose_time_series_deform = bool(self.pose_time_series_deform_var.get())
+        config.pose_time_series_offset_by_range_start = bool(self.pose_time_series_offset_var.get())
 
         return config
 
@@ -783,6 +805,8 @@ class PipelineGUI:
         self.instance_var.set(str(config.instance_number))
         self.undistort_var.set(bool(config.undistort))
         self.pose_time_series_var.set(config.pose_time_series_path or "")
+        self.pose_time_series_deform_var.set(bool(config.pose_time_series_deform))
+        self.pose_time_series_offset_var.set(bool(config.pose_time_series_offset_by_range_start))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
