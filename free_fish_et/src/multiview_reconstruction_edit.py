@@ -274,8 +274,12 @@ def _save_reconstruction_images(
         # Draw keypoints:
         for kp_idx, name in enumerate(keypoint_names):
             # u,v are pixel coords in the same coordinate system as the silhouette (W,H)
-            ui = int(round(keypoints_proj[view_idx, kp_idx, 0].item()))
-            vi = int(round(keypoints_proj[view_idx, kp_idx, 1].item()))
+            kp_u = keypoints_proj[view_idx, kp_idx, 0]
+            kp_v = keypoints_proj[view_idx, kp_idx, 1]
+            if not (torch.isfinite(kp_u) and torch.isfinite(kp_v)):
+                continue
+            ui = int(round(kp_u.item()))
+            vi = int(round(kp_v.item()))
             if 0 <= ui < W and 0 <= vi < H:
                 draw_circle(blended, (ui, vi), radius=5, color=(255, 150, 0))
                 draw_text(blended, name, (ui, vi + 15), color=(255, 150, 0))
@@ -289,8 +293,12 @@ def _save_reconstruction_images(
                         color=(255, 255, 255),
                     )
             if keypoint_predictions is not None:
-                ui_pred = int(round(keypoint_predictions[view_idx, kp_idx, 0].item()))
-                vi_pred = int(round(keypoint_predictions[view_idx, kp_idx, 1].item()))
+                pred_u = keypoint_predictions[view_idx, kp_idx, 0]
+                pred_v = keypoint_predictions[view_idx, kp_idx, 1]
+                if not (torch.isfinite(pred_u) and torch.isfinite(pred_v)):
+                    continue
+                ui_pred = int(round(pred_u.item()))
+                vi_pred = int(round(pred_v.item()))
                 ci_pred = keypoint_predictions[view_idx, kp_idx, 2].item()
                 if ci_pred > 0:
                     conf_scaled_annot_radius = int(ci_pred*10)//2
