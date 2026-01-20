@@ -484,6 +484,7 @@ class PipelineGUI:
         self.final_output_var = tk.StringVar(value=self.config.final_output_folder)
         self.frame_range_var = tk.StringVar(value=self.config.frame_range or "")
         self.instance_var = tk.StringVar(value=str(self.config.instance_number))
+        self.undistort_var = tk.BooleanVar(value=self.config.undistort)
 
         self.status_var = tk.StringVar(value="Idle.")
         self.action_buttons: List[tk.Widget] = []
@@ -546,6 +547,14 @@ class PipelineGUI:
         self._add_directory_row(
             main, row, "Final output folder", self.final_output_var, self.browse_final_output
         )
+        row += 1
+
+        undistort_check = ttk.Checkbutton(
+            main,
+            text="Undistort videos during extraction",
+            variable=self.undistort_var,
+        )
+        undistort_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
         row += 1
 
         ttk.Label(main, text="Frame range").grid(row=row, column=0, sticky="w", pady=2)
@@ -687,6 +696,7 @@ class PipelineGUI:
                 raise ConfigError("Instance number must be an integer.") from exc
         else:
             config.instance_number = 0
+        config.undistort = bool(self.undistort_var.get())
 
         return config
 
@@ -739,6 +749,7 @@ class PipelineGUI:
         self.final_output_var.set(config.final_output_folder)
         self.frame_range_var.set(config.frame_range or "")
         self.instance_var.set(str(config.instance_number))
+        self.undistort_var.set(bool(config.undistort))
         self._refresh_video_listbox()
 
     def run_step(self, step: str) -> None:

@@ -175,7 +175,6 @@ def get_gt_3d(
 
         kpts_3d[k, :3] = X
         kpts_3d[k, -1] = 1
-        print(f"Triangulated keypoint {k}: {X}")
 
     return kpts_3d
 
@@ -196,7 +195,7 @@ def Procrustes(X: torch.Tensor, Y: torch.Tensor):
     # Procrustes only works on cpu
     X = X.cpu()
     Y = Y.cpu()
-    
+
     # remove translation
     A = (Y - Y.mean(dim=0, keepdim=True))
     B = (X - X.mean(dim=0, keepdim=True))
