@@ -83,11 +83,13 @@ def _save_reconstruction_images(
     draw_coordinate_axes: bool = False,
     annotate_global_t: bool = True,
     annotate_keypoints_with_coords: bool = False,
+    pad_to_see_full_reprojection: bool = False,
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
-    overlay silhouette in red with given blend_factor, draw keypoints (blue), optionally
-    project the world coordinate axes, and annotate projected world-space locations.
+    optionally extend the canvas to show out-of-frame reprojections, overlay silhouette in
+    red with given blend_factor, draw keypoints (blue), optionally project the world
+    coordinate axes, and annotate projected world-space locations.
     This function returns quality metrics of the 
     """
 
@@ -211,6 +213,8 @@ def _save_reconstruction_images(
         axes_projection_np = axes_projection.detach().cpu().numpy()
     
 
+    max_canvas_size = 10000
+
     for view_idx in range(n_views):
         # Read original image (BGR)
         orig_bgr = cv2.imread(str(orig_image_paths[view_idx]), cv2.IMREAD_COLOR)
@@ -231,16 +235,77 @@ def _save_reconstruction_images(
             top=pad_top, bottom=pad_bottom, left=pad_left, right=pad_right,
             borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0)
         )
+
+        extra_pad_left = 0
+        extra_pad_right = 0
+        extra_pad_top = 0
+        extra_pad_bottom = 0
+        offset_x = 0
+        offset_y = 0
+
+        if pad_to_see_full_reprojection:
+            coords_parts = [
+                keypoints_proj[view_idx, :, :2],
+                verts_proj[view_idx, :, :2],
+            ]
+            coords = torch.cat(coords_parts, dim=0)
+            finite_mask = torch.isfinite(coords).all(dim=1)
+            if torch.any(finite_mask):
+                coords = torch.round(coords[finite_mask])
+                min_xy = coords.min(dim=0).values
+                max_xy = coords.max(dim=0).values
+                min_x, min_y = int(min_xy[0].item()), int(min_xy[1].item())
+                max_x, max_y = int(max_xy[0].item()), int(max_xy[1].item())
+
+                extra_pad_left = max(0, -min_x)
+                extra_pad_top = max(0, -min_y)
+                extra_pad_right = max(0, max_x - (W - 1))
+                extra_pad_bottom = max(0, max_y - (H - 1))
+
+                max_extra_w = max(0, max_canvas_size - W)
+                max_extra_h = max(0, max_canvas_size - H)
+                required_extra_w = extra_pad_left + extra_pad_right
+                required_extra_h = extra_pad_top + extra_pad_bottom
+
+                if required_extra_w > max_extra_w and required_extra_w > 0:
+                    scale = max_extra_w / required_extra_w
+                    extra_pad_left = int(math.floor(extra_pad_left * scale))
+                    extra_pad_right = max_extra_w - extra_pad_left
+
+                if required_extra_h > max_extra_h and required_extra_h > 0:
+                    scale = max_extra_h / required_extra_h
+                    extra_pad_top = int(math.floor(extra_pad_top * scale))
+                    extra_pad_bottom = max_extra_h - extra_pad_top
+
+            if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+                padded = cv2.copyMakeBorder(
+                    padded,
+                    top=extra_pad_top,
+                    bottom=extra_pad_bottom,
+                    left=extra_pad_left,
+                    right=extra_pad_right,
+                    borderType=cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
+                offset_x = extra_pad_left
+                offset_y = extra_pad_top
+
         padded_gray = cv2.cvtColor(padded, cv2.COLOR_BGR2GRAY)
-        _, padded_binary = cv2.threshold(padded_gray,0,1,cv2.THRESH_BINARY)
+        _, padded_binary = cv2.threshold(padded_gray, 0, 1, cv2.THRESH_BINARY)
 
         a = np.clip(alpha[view_idx], 0.0, 1.0)  # (H,W), float
         # threshold tiny values
         a[a < silhouette_threshold] = 0.0
+        if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+            a = np.pad(
+                a,
+                ((extra_pad_top, extra_pad_bottom), (extra_pad_left, extra_pad_right)),
+                mode="constant",
+            )
 
         # calculate IoUs
         device="cuda" if torch.cuda.is_available() else "cpu"
-        reprojection_mask_binary = torch.tensor(cv2.threshold(a,0,1,cv2.THRESH_BINARY)[1], device=device)
+        reprojection_mask_binary = torch.tensor(cv2.threshold(a, 0, 1, cv2.THRESH_BINARY)[1], device=device)
         metric = BinaryJaccardIndex().to(device=device)
 
         orig_iou = metric(
@@ -248,12 +313,18 @@ def _save_reconstruction_images(
             reprojection_mask_binary
         )
         if mask_predictions is not None:
+            mask_pred_view = mask_predictions[view_idx].to(device=device)
+            if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+                mask_pred_view = torch.nn.functional.pad(
+                    mask_pred_view,
+                    (extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom),
+                )
             mask_detection_iou = metric(
                 torch.tensor(padded_binary, device=device),
-                mask_predictions[view_idx].to(device=device)
+                mask_pred_view
             ) # to evaluate the quality of yolo mask detection, given we are working with synthetic data
             mask_iou = metric(
-                mask_predictions[view_idx].to(device=device),
+                mask_pred_view,
                 reprojection_mask_binary
             )
             metrics["mask_detection_IoU"][view_names[view_idx]] = mask_detection_iou.item()
@@ -271,6 +342,8 @@ def _save_reconstruction_images(
                    red_img.astype(np.float32) * (blend_factor * a_exp))
         blended = np.clip(blended, 0, 255).astype(np.uint8)
 
+        blended_h, blended_w = blended.shape[:2]
+
         # Draw keypoints:
         for kp_idx, name in enumerate(keypoint_names):
             # u,v are pixel coords in the same coordinate system as the silhouette (W,H)
@@ -278,9 +351,9 @@ def _save_reconstruction_images(
             kp_v = keypoints_proj[view_idx, kp_idx, 1]
             if not (torch.isfinite(kp_u) and torch.isfinite(kp_v)):
                 continue
-            ui = int(round(kp_u.item()))
-            vi = int(round(kp_v.item()))
-            if 0 <= ui < W and 0 <= vi < H:
+            ui = int(round(kp_u.item())) + offset_x
+            vi = int(round(kp_v.item())) + offset_y
+            if 0 <= ui < blended_w and 0 <= vi < blended_h:
                 draw_circle(blended, (ui, vi), radius=5, color=(255, 150, 0))
                 draw_text(blended, name, (ui, vi + 15), color=(255, 150, 0))
                 if annotate_keypoints_with_coords:
@@ -297,8 +370,8 @@ def _save_reconstruction_images(
                 pred_v = keypoint_predictions[view_idx, kp_idx, 1]
                 if not (torch.isfinite(pred_u) and torch.isfinite(pred_v)):
                     continue
-                ui_pred = int(round(pred_u.item()))
-                vi_pred = int(round(pred_v.item()))
+                ui_pred = int(round(pred_u.item())) + offset_x
+                vi_pred = int(round(pred_v.item())) + offset_y
                 ci_pred = keypoint_predictions[view_idx, kp_idx, 2].item()
                 if ci_pred > 0:
                     conf_scaled_annot_radius = int(ci_pred*10)//2
@@ -323,17 +396,17 @@ def _save_reconstruction_images(
 
         if draw_verts:
             for vert_idx in range(verts_proj.size(1)):
-                ui = int(round(verts_proj[view_idx, vert_idx, 0].item()))
-                vi = int(round(verts_proj[view_idx, vert_idx, 1].item()))
-                if 0 <= ui < W and 0 <= vi < H:
+                ui = int(round(verts_proj[view_idx, vert_idx, 0].item())) + offset_x
+                vi = int(round(verts_proj[view_idx, vert_idx, 1].item())) + offset_y
+                if 0 <= ui < blended_w and 0 <= vi < blended_h:
                     draw_circle(blended, (ui, vi), radius=2, color=(0, 255, 0))
 
         if annotate_global_t:
             gt_pt = global_t_proj_np[view_idx, 0]
             if np.all(np.isfinite(gt_pt)):
-                ui_gt = int(round(float(gt_pt[0])))
-                vi_gt = int(round(float(gt_pt[1])))
-                if 0 <= ui_gt < W and 0 <= vi_gt < H:
+                ui_gt = int(round(float(gt_pt[0]))) + offset_x
+                vi_gt = int(round(float(gt_pt[1]))) + offset_y
+                if 0 <= ui_gt < blended_w and 0 <= vi_gt < blended_h:
                     draw_circle(
                         blended,
                         (ui_gt, vi_gt),
@@ -359,6 +432,8 @@ def _save_reconstruction_images(
             origin_idx = axes_metadata["origin_idx"]
             origin_pt = axes_projection_np[view_idx, origin_idx]
             if np.all(np.isfinite(origin_pt)):
+                offset_vec = np.array([offset_x, offset_y], dtype=np.float32)
+                origin_pt = origin_pt + offset_vec
                 overlay = blended.copy()
                 axis_length_world = axes_metadata["axis_length"]
 
@@ -367,6 +442,7 @@ def _save_reconstruction_images(
                         end_pt = axes_projection_np[view_idx, direction_meta["end_idx"]]
                         if not np.all(np.isfinite(end_pt)):
                             continue
+                        end_pt = end_pt + offset_vec
 
                         p0 = origin_pt.astype(np.float32)
                         p1 = end_pt.astype(np.float32)
@@ -393,8 +469,7 @@ def _save_reconstruction_images(
                             tick_pt = axes_projection_np[view_idx, tick_idx]
                             if not np.all(np.isfinite(tick_pt)):
                                 continue
-
-                            tick_center = tick_pt.astype(np.float32)
+                            tick_center = (tick_pt + offset_vec).astype(np.float32)
                             offset = perp_dir_unit * (tick_length_px * 0.5)
                             tick_start = tick_center - offset
                             tick_end = tick_center + offset
@@ -989,7 +1064,8 @@ def render_pose_time_series(
             global_t=global_t,
             keypoint_names=dataset.index_json["keypoint_list"],
             view_names=dataset.views,
-            draw_verts=True
+            draw_verts=True,
+            pad_to_see_full_reprojection=True
         )
         
 

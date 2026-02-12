@@ -210,7 +210,7 @@ class CameraGroup:
         return points, squeeze
 
     def points_from_blworld(self, points: torch.Tensor) -> torch.Tensor:
-        """Convert Blender-world points to CV world coordinates."""
+        """Convert Blender-world points to custom world coordinates."""
         points, squeeze = self._expand_points(points)
         F_T = self.from_blenderworld.transpose(1, 2)
         converted = torch.matmul(points, F_T)
