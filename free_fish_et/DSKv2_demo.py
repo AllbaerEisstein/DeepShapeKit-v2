@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import multiprocessing as mp
 import re
@@ -46,6 +47,7 @@ class PipelineConfig:
     segmentation_model_path: str = "src/DSKv2/cygill_seg.pt"
     pose_model_path: str = "src/DSKv2/cygill_pose.pt"
     mesh_path: str = "src/DSKv2/Bluegill_Body_mesh.json"
+    pose_time_series_mesh_path: Optional[str] = None
     cam_matrices_path: str = "src/DSKv2/cam_matrices.json"
     out_path: str = "src/results/cygill"
     final_output_folder: str = "src/results/output/"
@@ -54,7 +56,6 @@ class PipelineConfig:
     pose_time_series_path: Optional[str] = "src/DSKv2/pose_time_series_Bluegill_Body.json"
     pose_time_series_deform: bool = False
     pose_time_series_offset_by_range_start: bool = False
-    center_origin_on_camera_mean: bool = False
     dataset_folder_name: str = "dataset"
     seed: int = 700
     save_models: bool = True
@@ -121,6 +122,40 @@ def parse_frame_selection(frame_selection: Optional[str]) -> List[int]:
     return indices
 
 
+def _is_all_frames_selection(frame_selection: Optional[str]) -> bool:
+    return frame_selection is not None and frame_selection.strip() == "*"
+
+
+def _resolve_dataset_frame_indices(dataset_folder_path: Path) -> List[int]:
+    index_path = dataset_folder_path / "index.json"
+    if not index_path.exists():
+        raise ConfigError(f"Dataset index file not found at {index_path}.")
+
+    with index_path.open() as fp:
+        index_data = json.load(fp)
+
+    frame_folders = index_data.get("frame_folders", [])
+    if not frame_folders:
+        raise ConfigError("Dataset index does not list any frame folders.")
+
+    first_view = frame_folders[0]
+    files_csv_path = dataset_folder_path / first_view / "files.csv"
+    if not files_csv_path.exists():
+        raise ConfigError(f"Could not resolve all frames: missing file {files_csv_path}.")
+
+    with files_csv_path.open() as fp:
+        frame_indices = sorted(
+            {
+                int(row["frame"])
+                for row in csv.DictReader(fp)
+                if "frame" in row and str(row["frame"]).strip() != ""
+            }
+        )
+    if not frame_indices:
+        raise ConfigError(f"No frames found in {files_csv_path}.")
+    return frame_indices
+
+
 def read_keypoint_list(mesh_path: Path) -> List[str]:
     with mesh_path.open() as fp:
         mesh_data = json.load(fp)
@@ -159,13 +194,26 @@ def run_pipeline(
     final_output_folder.mkdir(parents=True, exist_ok=True)
 
     mesh_path: Optional[Path] = None
+    pose_time_series_mesh_path: Optional[Path] = None
     keypoint_list: Optional[List[str]] = None
     kpt_name_dict: Dict[int, str] = {}
 
-    if any(step in steps for step in ("keypoints", "reconstruct", "render_time_series")):
+    if any(step in steps for step in ("keypoints", "reconstruct")):
         mesh_path = Path(config.mesh_path)
         keypoint_list = read_keypoint_list(mesh_path)
         kpt_name_dict = {index: name for index, name in enumerate(keypoint_list)}
+    if "render_time_series" in steps:
+        pose_time_series_mesh_path = Path(
+            config.pose_time_series_mesh_path
+            if config.pose_time_series_mesh_path
+            else config.mesh_path
+        )
+
+    frame_indices: Optional[List[int]]
+    if _is_all_frames_selection(config.frame_range):
+        frame_indices = None
+    else:
+        frame_indices = parse_frame_selection(config.frame_range) if config.frame_range else None
 
     if "extract" in steps:
         extract_from_video(
@@ -175,15 +223,20 @@ def run_pipeline(
             dataset_folder_name=config.dataset_folder_name,
             also_create_frame2video_csv=config.also_create_frame2video_csv,
             undistort=config.undistort,
-            frame_indices=parse_frame_selection(config.frame_range) if config.frame_range else None
+            frame_indices=frame_indices,
         )
+
+    if _is_all_frames_selection(config.frame_range):
+        frame_indices = _resolve_dataset_frame_indices(dataset_folder_path)
+        if frame_indices:
+            config.frame_range = f"{frame_indices[0]}-{frame_indices[-1]}"
 
     if "masks" in steps:
         predict_masks_yolo(
             dataset_path=dataset_folder_path,
             model_path=Path(config.segmentation_model_path),
             conf_threshold=config.conf_threshold,
-            frame_indices=parse_frame_selection(config.frame_range) if config.frame_range else None
+            frame_indices=frame_indices,
         )
 
     if "keypoints" in steps:
@@ -191,7 +244,7 @@ def run_pipeline(
             dataset_path=dataset_folder_path,
             model_path=Path(config.pose_model_path),
             kpt_names_dict=kpt_name_dict,
-            frame_indices=parse_frame_selection(config.frame_range) if config.frame_range else None
+            frame_indices=frame_indices,
         )
 
     if "render_time_series" in steps:
@@ -199,21 +252,21 @@ def run_pipeline(
             raise ConfigError(
                 "pose_time_series_path must be provided to render the time series."
             )
-        if mesh_path is None:
-            raise ConfigError("mesh_path must be provided to render the time series.")
+        if pose_time_series_mesh_path is None:
+            raise ConfigError("pose_time_series_mesh_path or mesh_path must be provided to render the time series.")
         render_pose_time_series(
-            mesh_path=str(mesh_path),
+            mesh_path=str(pose_time_series_mesh_path),
             dataset_dir=str(dataset_folder_path),
             pose_time_series_file_path=config.pose_time_series_path,
             outdir=str(final_output_folder),
             deform=config.pose_time_series_deform,
-            frame_range=parse_frame_selection(config.frame_range) if config.frame_range else None,
+            frame_range=frame_indices,
             offset_by_frame_range_start=config.pose_time_series_offset_by_range_start,
-            center_origin_on_camera_mean=config.center_origin_on_camera_mean,
         )
 
     if "reconstruct" in steps:
-        frame_indices = parse_frame_selection(config.frame_range)
+        if frame_indices is None:
+            raise ConfigError("Frame range is required for reconstruction.")
         if mesh_path is None:
             raise ConfigError("mesh_path must be provided for reconstruction.")
         selected_views = resolve_dataset_views(dataset_folder_path, videos)
@@ -227,7 +280,6 @@ def run_pipeline(
             save_models=config.save_models,
             video_names=selected_views,
             pause_event=reconstruct_pause_event,
-            center_origin_on_camera_mean=config.center_origin_on_camera_mean,
         )
 
 
@@ -486,6 +538,9 @@ class PipelineGUI:
         self.segmentation_model_var = tk.StringVar(value=self.config.segmentation_model_path)
         self.pose_model_var = tk.StringVar(value=self.config.pose_model_path)
         self.mesh_var = tk.StringVar(value=self.config.mesh_path)
+        self.pose_time_series_mesh_var = tk.StringVar(
+            value=self.config.pose_time_series_mesh_path or ""
+        )
         self.cam_var = tk.StringVar(value=self.config.cam_matrices_path)
         self.out_path_var = tk.StringVar(value=self.config.out_path)
         self.final_output_var = tk.StringVar(value=self.config.final_output_folder)
@@ -497,7 +552,6 @@ class PipelineGUI:
         self.pose_time_series_offset_var = tk.BooleanVar(
             value=self.config.pose_time_series_offset_by_range_start
         )
-        self.center_origin_var = tk.BooleanVar(value=self.config.center_origin_on_camera_mean)
         self.advanced_visible = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Idle.")
@@ -574,7 +628,7 @@ class PipelineGUI:
         ttk.Label(main, text="Frame range").grid(row=row, column=0, sticky="w", pady=2)
         frame_entry = ttk.Entry(main, textvariable=self.frame_range_var)
         frame_entry.grid(row=row, column=1, sticky="ew", pady=2)
-        ttk.Label(main, text="e.g. 10-23", foreground="#777").grid(row=row, column=2, sticky="w", pady=2)
+        ttk.Label(main, text="e.g. 10-23 or *", foreground="#777").grid(row=row, column=2, sticky="w", pady=2)
         row += 1
 
         ttk.Label(main, text="Instance number").grid(row=row, column=0, sticky="w", pady=2)
@@ -597,24 +651,25 @@ class PipelineGUI:
             self.pose_time_series_var,
             self.browse_pose_time_series,
         )
+        self._add_path_row(
+            self.advanced_frame,
+            1,
+            "Pose time series mesh",
+            self.pose_time_series_mesh_var,
+            self.browse_pose_time_series_mesh,
+        )
         deform_check = ttk.Checkbutton(
             self.advanced_frame,
             text="Deform mesh when rendering time series",
             variable=self.pose_time_series_deform_var,
         )
-        deform_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        deform_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
         offset_check = ttk.Checkbutton(
             self.advanced_frame,
             text="Pose time series start is frame range start",
             variable=self.pose_time_series_offset_var,
         )
-        offset_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        center_origin_check = ttk.Checkbutton(
-            self.advanced_frame,
-            text="Set 3D origin to mean camera position",
-            variable=self.center_origin_var,
-        )
-        center_origin_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        offset_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
         render_button = ttk.Button(
             self.advanced_frame,
             text="render_pose_time_series",
@@ -720,6 +775,9 @@ class PipelineGUI:
     def browse_pose_time_series(self) -> None:
         self._browse_file(self.pose_time_series_var, "Select pose time series file")
 
+    def browse_pose_time_series_mesh(self) -> None:
+        self._browse_file(self.pose_time_series_mesh_var, "Select pose time series mesh file")
+
     def browse_out_path(self) -> None:
         self._browse_directory(self.out_path_var, "Select output directory")
 
@@ -759,9 +817,10 @@ class PipelineGUI:
         config.undistort = bool(self.undistort_var.get())
         pose_time_series = self.pose_time_series_var.get().strip()
         config.pose_time_series_path = pose_time_series or None
+        pose_time_series_mesh = self.pose_time_series_mesh_var.get().strip()
+        config.pose_time_series_mesh_path = pose_time_series_mesh or None
         config.pose_time_series_deform = bool(self.pose_time_series_deform_var.get())
         config.pose_time_series_offset_by_range_start = bool(self.pose_time_series_offset_var.get())
-        config.center_origin_on_camera_mean = bool(self.center_origin_var.get())
 
         return config
 
@@ -816,9 +875,9 @@ class PipelineGUI:
         self.instance_var.set(str(config.instance_number))
         self.undistort_var.set(bool(config.undistort))
         self.pose_time_series_var.set(config.pose_time_series_path or "")
+        self.pose_time_series_mesh_var.set(config.pose_time_series_mesh_path or "")
         self.pose_time_series_deform_var.set(bool(config.pose_time_series_deform))
         self.pose_time_series_offset_var.set(bool(config.pose_time_series_offset_by_range_start))
-        self.center_origin_var.set(bool(config.center_origin_on_camera_mean))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
@@ -1071,6 +1130,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a pose time series JSON for rendering silhouettes.",
     )
     parser.add_argument(
+        "--pose-time-series-mesh",
+        dest="pose_time_series_mesh_path",
+        help="Path to a mesh JSON used only for pose time series rendering.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         dest="seed",
@@ -1119,6 +1183,8 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.instance_number = args.instance_number
     if args.pose_time_series_path:
         config.pose_time_series_path = args.pose_time_series_path
+    if getattr(args, "pose_time_series_mesh_path", None):
+        config.pose_time_series_mesh_path = args.pose_time_series_mesh_path
     if args.seed is not None:
         config.seed = args.seed
     if args.conf_threshold is not None:
