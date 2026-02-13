@@ -553,6 +553,13 @@ class PipelineGUI:
             value=self.config.pose_time_series_offset_by_range_start
         )
         self.advanced_visible = tk.BooleanVar(value=False)
+        self.step_vars: Dict[str, "tk.BooleanVar"] = {
+            "extract": tk.BooleanVar(value="extract" in self.steps),
+            "masks": tk.BooleanVar(value="masks" in self.steps),
+            "keypoints": tk.BooleanVar(value="keypoints" in self.steps),
+            "reconstruct": tk.BooleanVar(value="reconstruct" in self.steps),
+            "render_time_series": tk.BooleanVar(value="render_time_series" in self.steps),
+        }
 
         self.status_var = tk.StringVar(value="Idle.")
         self.action_buttons: List[tk.Widget] = []
@@ -574,8 +581,7 @@ class PipelineGUI:
         main = ttk.Frame(self.root, padding=12)
         main.grid(row=0, column=0, sticky="nsew")
         for col in range(3):
-            weight = 1 if col == 1 else 0
-            main.columnconfigure(col, weight=weight)
+            main.columnconfigure(col, weight=1 if col == 1 else 0)
         main.rowconfigure(0, weight=1)
 
         ttk.Label(main, text="Videos").grid(row=0, column=0, sticky="nw")
@@ -593,7 +599,7 @@ class PipelineGUI:
 
         video_buttons = ttk.Frame(video_frame)
         video_buttons.grid(row=0, column=2, padx=(8, 0), sticky="ns")
-        add_button = ttk.Button(video_buttons, text="Add…", command=self.add_videos)
+        add_button = ttk.Button(video_buttons, text="Add...", command=self.add_videos)
         add_button.grid(row=0, column=0, sticky="ew")
         remove_button = ttk.Button(video_buttons, text="Remove", command=self.remove_selected_videos)
         remove_button.grid(row=1, column=0, sticky="ew", pady=4)
@@ -612,9 +618,7 @@ class PipelineGUI:
         row += 1
         self._add_directory_row(main, row, "Output path", self.out_path_var, self.browse_out_path)
         row += 1
-        self._add_directory_row(
-            main, row, "Final output folder", self.final_output_var, self.browse_final_output
-        )
+        self._add_directory_row(main, row, "Final output folder", self.final_output_var, self.browse_final_output)
         row += 1
 
         undistort_check = ttk.Checkbutton(
@@ -636,7 +640,17 @@ class PipelineGUI:
         instance_entry.grid(row=row, column=1, sticky="ew", pady=2)
         row += 1
 
-        self.advanced_toggle = ttk.Button(main, text="Advanced ▸", command=self._toggle_advanced)
+        steps_frame = ttk.LabelFrame(main, text="Run Steps")
+        steps_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+        for col in range(4):
+            steps_frame.columnconfigure(col, weight=1)
+        ttk.Checkbutton(steps_frame, text="extract_from_video", variable=self.step_vars["extract"]).grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(steps_frame, text="predict_masks_yolo", variable=self.step_vars["masks"]).grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(steps_frame, text="detect_keypoints_yolo", variable=self.step_vars["keypoints"]).grid(row=0, column=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(steps_frame, text="reconstruct", variable=self.step_vars["reconstruct"]).grid(row=0, column=3, sticky="w", padx=6, pady=2)
+        row += 1
+
+        self.advanced_toggle = ttk.Button(main, text="Advanced >", command=self._toggle_advanced)
         self.advanced_toggle.grid(row=row, column=0, sticky="w", pady=(6, 2))
         row += 1
 
@@ -644,20 +658,9 @@ class PipelineGUI:
         self.advanced_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         self.advanced_frame.columnconfigure(1, weight=1)
 
-        self._add_path_row(
-            self.advanced_frame,
-            0,
-            "Pose time series",
-            self.pose_time_series_var,
-            self.browse_pose_time_series,
-        )
-        self._add_path_row(
-            self.advanced_frame,
-            1,
-            "Pose time series mesh",
-            self.pose_time_series_mesh_var,
-            self.browse_pose_time_series_mesh,
-        )
+        self._add_path_row(self.advanced_frame, 0, "Pose time series", self.pose_time_series_var, self.browse_pose_time_series)
+        self._add_path_row(self.advanced_frame, 1, "Pose time series mesh", self.pose_time_series_mesh_var, self.browse_pose_time_series_mesh)
+
         deform_check = ttk.Checkbutton(
             self.advanced_frame,
             text="Deform mesh when rendering time series",
@@ -670,34 +673,40 @@ class PipelineGUI:
             variable=self.pose_time_series_offset_var,
         )
         offset_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        render_step_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Include render_pose_time_series in 'run all of the above'",
+            variable=self.step_vars["render_time_series"],
+        )
+        render_step_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
         render_button = ttk.Button(
             self.advanced_frame,
             text="render_pose_time_series",
             command=lambda: self.run_step("render_time_series"),
         )
-        render_button.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        render_button.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
         self.advanced_frame.grid_remove()
         row += 1
 
         control_frame = ttk.Frame(main)
         control_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
-        for col in range(8):
+        for col in range(9):
             control_frame.columnconfigure(col, weight=1)
 
-        self._add_action_button(control_frame, 0, "Save config…", self.save_config)
-        self._add_action_button(control_frame, 1, "Load config…", self.load_config)
+        self._add_action_button(control_frame, 0, "Save config...", self.save_config)
+        self._add_action_button(control_frame, 1, "Load config...", self.load_config)
         self._add_action_button(control_frame, 2, "extract_from_video", lambda: self.run_step("extract"))
         self._add_action_button(control_frame, 3, "predict_masks_yolo", lambda: self.run_step("masks"))
         self._add_action_button(control_frame, 4, "detect_keypoints_yolo", lambda: self.run_step("keypoints"))
         self._add_action_button(control_frame, 5, "reconstruct", lambda: self.run_step("reconstruct"))
         self._add_action_button(control_frame, 6, "Show metrics", self.show_metrics)
+        self._add_action_button(control_frame, 7, "run all of the above", self.run_selected_steps)
         self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_execution, state=tk.DISABLED)
-        self.pause_button.grid(row=0, column=7, padx=2, sticky="ew")
+        self.pause_button.grid(row=0, column=8, padx=2, sticky="ew")
 
         status_label = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status_label.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-
     def _add_path_row(
         self,
         parent: "tk.Widget",
@@ -884,13 +893,24 @@ class PipelineGUI:
         if self.advanced_visible.get():
             self.advanced_visible.set(False)
             self.advanced_frame.grid_remove()
-            self.advanced_toggle.configure(text="Advanced ▸")
+            self.advanced_toggle.configure(text="Advanced >")
         else:
             self.advanced_visible.set(True)
             self.advanced_frame.grid()
-            self.advanced_toggle.configure(text="Advanced ▾")
+            self.advanced_toggle.configure(text="Advanced v")
 
     def run_step(self, step: str) -> None:
+        self._run_steps([step])
+
+    def run_selected_steps(self) -> None:
+        ordered = ["extract", "masks", "keypoints", "reconstruct", "render_time_series"]
+        selected_steps = [step for step in ordered if self.step_vars[step].get()]
+        if not selected_steps:
+            messagebox.showerror("No steps selected", "Select at least one step to run.")
+            return
+        self._run_steps(selected_steps)
+
+    def _run_steps(self, steps: List[str]) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Busy", "A step is already running. Please wait.")
             return
@@ -902,21 +922,22 @@ class PipelineGUI:
             return
 
         self.config = config
-        self.set_status(f"Running {step}…")
+        run_label = " -> ".join(steps)
+        self.set_status(f"Running {run_label}...")
         self._set_buttons_state(tk.DISABLED)
 
         self.pause_button.configure(state=tk.NORMAL)
         self.pause_requested = False
-        self.current_step = step
+        self.current_step = run_label
 
-        pause_event = mp.Event() if step == "reconstruct" else None
+        pause_event = mp.Event() if "reconstruct" in steps else None
         self.worker_pause_event = pause_event
 
         def task() -> None:
             queue: mp.Queue = mp.Queue()
             process = mp.Process(
                 target=_run_pipeline_subprocess,
-                args=(config.to_dict(), [step], queue, pause_event),
+                args=(config.to_dict(), steps, queue, pause_event),
             )
             self.worker_process = process
             self.worker_queue = queue
@@ -939,11 +960,11 @@ class PipelineGUI:
             self.current_step = None
 
             if self.pause_requested:
-                self.root.after(0, lambda: self._on_step_paused(step))
+                self.root.after(0, lambda: self._on_step_paused(run_label))
                 return
 
             if exit_code == 0:
-                self.root.after(0, lambda: self._on_step_finished(step))
+                self.root.after(0, lambda: self._on_step_finished(run_label))
                 return
 
             if result and result[0] == "error":
@@ -954,7 +975,7 @@ class PipelineGUI:
                 exc = RuntimeError(f"Process exited with code {exit_code}")
                 trace = ""
 
-            self.root.after(0, lambda: self._on_step_failed(step, exc, trace))
+            self.root.after(0, lambda: self._on_step_failed(run_label, exc, trace))
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
@@ -972,7 +993,7 @@ class PipelineGUI:
             self.worker_pause_event.set()
             return
 
-        self.set_status("Pausing current step…")
+        self.set_status("Pausing current step...")
         self.worker_process.terminate()
 
     def _on_step_finished(self, step: str) -> None:
@@ -1217,3 +1238,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
