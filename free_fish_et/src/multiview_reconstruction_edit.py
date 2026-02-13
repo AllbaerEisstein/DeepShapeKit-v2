@@ -84,12 +84,14 @@ def _save_reconstruction_images(
     annotate_global_t: bool = True,
     annotate_keypoints_with_coords: bool = False,
     pad_to_see_full_reprojection: bool = False,
+    plot_other_cameras: bool = False,
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
     optionally extend the canvas to show out-of-frame reprojections, overlay silhouette in
     red with given blend_factor, draw keypoints (blue), optionally project the world
-    coordinate axes, and annotate projected world-space locations.
+    coordinate axes, optionally draw other camera poses as seen in each view, and annotate
+    projected world-space locations.
     This function returns quality metrics of the 
     """
 
@@ -211,7 +213,34 @@ def _save_reconstruction_images(
         axis_points_tensor = torch.stack(world_points, dim=0).unsqueeze(0)
         axes_projection = cameras.perspective_projection_from_blworld(axis_points_tensor)
         axes_projection_np = axes_projection.detach().cpu().numpy()
-    
+
+    other_camera_markers_proj = None
+    if plot_other_cameras:
+        from_bl_t = cameras.from_blenderworld.transpose(1, 2)
+        camera_centers_custom = cameras.camera_centers
+        camera_centers_bl = torch.matmul(from_bl_t, camera_centers_custom.unsqueeze(-1)).squeeze(-1)
+
+        axis_length_world = 1.0
+        if n_views > 1:
+            pairwise_dists = torch.cdist(camera_centers_bl, camera_centers_bl)
+            valid_dists = pairwise_dists[pairwise_dists > 1e-6]
+            if valid_dists.numel() > 0:
+                axis_length_world = float(torch.median(valid_dists).item() * 0.1)
+        axis_length_world = max(1e-3, min(axis_length_world, 1e3))
+
+        camera_axes_custom = cameras.R.transpose(1, 2)
+        camera_axes_bl = torch.matmul(from_bl_t, camera_axes_custom)
+        camera_axis_endpoints_bl = (
+            camera_centers_bl.unsqueeze(1) + camera_axes_bl.transpose(1, 2) * axis_length_world
+        )
+        # Marker order per source camera: center, +x, +y, +z.
+        marker_points_bl = torch.cat(
+            [camera_centers_bl.unsqueeze(1), camera_axis_endpoints_bl], dim=1
+        ).reshape(-1, 3)
+        marker_points_bl_for_views = marker_points_bl.unsqueeze(0).expand(n_views, -1, -1)
+        other_camera_markers_proj = cameras.perspective_projection_from_blworld(
+            marker_points_bl_for_views
+        ).detach().cpu()
 
     max_canvas_size = 10000
 
@@ -248,6 +277,13 @@ def _save_reconstruction_images(
                 keypoints_proj[view_idx, :, :2],
                 verts_proj[view_idx, :, :2],
             ]
+            if plot_other_cameras and other_camera_markers_proj is not None:
+                marker_coords = other_camera_markers_proj[view_idx, :, :2].reshape(n_views, 4, 2)
+                if n_views > 1:
+                    marker_coords_other_views = torch.cat(
+                        [marker_coords[:view_idx], marker_coords[view_idx + 1 :]], dim=0
+                    ).reshape(-1, 2)
+                    coords_parts.append(marker_coords_other_views)
             coords = torch.cat(coords_parts, dim=0)
             finite_mask = torch.isfinite(coords).all(dim=1)
             if torch.any(finite_mask):
@@ -426,6 +462,52 @@ def _save_reconstruction_images(
                         blended,
                         coord_text,
                         (ui_gt + 6, vi_gt + 10),
+                    )
+
+        if plot_other_cameras and other_camera_markers_proj is not None:
+            axis_labels = ["x", "y", "z"]
+            axis_colors = [(0, 0, 255), (0, 200, 0), (255, 0, 0)]  # BGR
+            for source_cam_idx in range(n_views):
+                if source_cam_idx == view_idx:
+                    continue
+                base_idx = source_cam_idx * 4
+                center_pt = other_camera_markers_proj[view_idx, base_idx]
+                if not torch.isfinite(center_pt).all():
+                    continue
+
+                center_ui = int(round(float(center_pt[0]))) + offset_x
+                center_vi = int(round(float(center_pt[1]))) + offset_y
+                square_half_size = 4
+                cv2.rectangle(
+                    blended,
+                    (center_ui - square_half_size, center_vi - square_half_size),
+                    (center_ui + square_half_size, center_vi + square_half_size),
+                    color=(0, 0, 255),
+                    thickness=1,
+                    lineType=cv2.LINE_AA,
+                )
+
+                for axis_idx, (axis_label, axis_color) in enumerate(zip(axis_labels, axis_colors)):
+                    axis_pt = other_camera_markers_proj[view_idx, base_idx + 1 + axis_idx]
+                    if not torch.isfinite(axis_pt).all():
+                        continue
+                    axis_ui = int(round(float(axis_pt[0]))) + offset_x
+                    axis_vi = int(round(float(axis_pt[1]))) + offset_y
+                    cv2.arrowedLine(
+                        blended,
+                        (center_ui, center_vi),
+                        (axis_ui, axis_vi),
+                        color=axis_color,
+                        thickness=1,
+                        line_type=cv2.LINE_AA,
+                        tipLength=0.35,
+                    )
+                    draw_text(
+                        blended,
+                        axis_label,
+                        (axis_ui + 2, axis_vi - 2),
+                        font_scale=0.35,
+                        color=axis_color,
                     )
 
         if draw_coordinate_axes and axes_projection_np is not None and axes_metadata is not None:
@@ -1065,7 +1147,8 @@ def render_pose_time_series(
             keypoint_names=dataset.index_json["keypoint_list"],
             view_names=dataset.views,
             draw_verts=True,
-            pad_to_see_full_reprojection=True
+            pad_to_see_full_reprojection=True,
+            plot_other_cameras=True,
         )
         
 
