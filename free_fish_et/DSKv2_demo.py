@@ -650,6 +650,27 @@ class PipelineGUI:
         ttk.Checkbutton(steps_frame, text="reconstruct", variable=self.step_vars["reconstruct"]).grid(row=0, column=3, sticky="w", padx=6, pady=2)
         row += 1
 
+        run_all_button = ttk.Button(main, text="run all of the above", command=self.run_selected_steps)
+        run_all_button.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 6))
+        self.action_buttons.append(run_all_button)
+        row += 1
+
+        control_frame = ttk.Frame(main)
+        control_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+        for col in range(8):
+            control_frame.columnconfigure(col, weight=1)
+
+        self._add_action_button(control_frame, 0, "Save config...", self.save_config)
+        self._add_action_button(control_frame, 1, "Load config...", self.load_config)
+        self._add_action_button(control_frame, 2, "extract_from_video", lambda: self.run_step("extract"))
+        self._add_action_button(control_frame, 3, "predict_masks_yolo", lambda: self.run_step("masks"))
+        self._add_action_button(control_frame, 4, "detect_keypoints_yolo", lambda: self.run_step("keypoints"))
+        self._add_action_button(control_frame, 5, "reconstruct", lambda: self.run_step("reconstruct"))
+        self._add_action_button(control_frame, 6, "Show metrics", self.show_metrics)
+        self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_execution, state=tk.DISABLED)
+        self.pause_button.grid(row=0, column=7, padx=2, sticky="ew")
+        row += 1
+
         self.advanced_toggle = ttk.Button(main, text="Advanced >", command=self._toggle_advanced)
         self.advanced_toggle.grid(row=row, column=0, sticky="w", pady=(6, 2))
         row += 1
@@ -689,24 +710,9 @@ class PipelineGUI:
         self.advanced_frame.grid_remove()
         row += 1
 
-        control_frame = ttk.Frame(main)
-        control_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
-        for col in range(9):
-            control_frame.columnconfigure(col, weight=1)
-
-        self._add_action_button(control_frame, 0, "Save config...", self.save_config)
-        self._add_action_button(control_frame, 1, "Load config...", self.load_config)
-        self._add_action_button(control_frame, 2, "extract_from_video", lambda: self.run_step("extract"))
-        self._add_action_button(control_frame, 3, "predict_masks_yolo", lambda: self.run_step("masks"))
-        self._add_action_button(control_frame, 4, "detect_keypoints_yolo", lambda: self.run_step("keypoints"))
-        self._add_action_button(control_frame, 5, "reconstruct", lambda: self.run_step("reconstruct"))
-        self._add_action_button(control_frame, 6, "Show metrics", self.show_metrics)
-        self._add_action_button(control_frame, 7, "run all of the above", self.run_selected_steps)
-        self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_execution, state=tk.DISABLED)
-        self.pause_button.grid(row=0, column=8, padx=2, sticky="ew")
-
         status_label = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status_label.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
     def _add_path_row(
         self,
         parent: "tk.Widget",
