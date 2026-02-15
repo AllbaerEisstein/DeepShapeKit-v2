@@ -569,6 +569,8 @@ class PipelineGUI:
         self.pause_requested: bool = False
         self.worker_pause_event: Optional[mp.Event] = None
         self.current_step: Optional[str] = None
+        self.sequence_steps_remaining: List[str] = []
+        self.sequence_steps_original: List[str] = []
 
         self._build_ui()
         self._refresh_video_listbox()
@@ -906,6 +908,8 @@ class PipelineGUI:
             self.advanced_toggle.configure(text="Advanced v")
 
     def run_step(self, step: str) -> None:
+        self.sequence_steps_remaining = []
+        self.sequence_steps_original = []
         self._run_steps([step])
 
     def run_selected_steps(self) -> None:
@@ -914,9 +918,26 @@ class PipelineGUI:
         if not selected_steps:
             messagebox.showerror("No steps selected", "Select at least one step to run.")
             return
-        self._run_steps(selected_steps)
+        self.sequence_steps_original = list(selected_steps)
+        self.sequence_steps_remaining = list(selected_steps)
+        self._run_next_sequence_step()
 
-    def _run_steps(self, steps: List[str]) -> None:
+    def _run_next_sequence_step(self) -> None:
+        if not self.sequence_steps_remaining:
+            completed_label = " -> ".join(self.sequence_steps_original)
+            self.sequence_steps_original = []
+            self._set_buttons_state(tk.NORMAL)
+            self.pause_button.configure(state=tk.DISABLED)
+            self.worker_thread = None
+            self.pause_requested = False
+            self.set_status(f"Finished {completed_label}.")
+            messagebox.showinfo("Success", f"Steps '{completed_label}' completed successfully.")
+            return
+
+        next_step = self.sequence_steps_remaining.pop(0)
+        self._run_steps([next_step], is_sequence=True)
+
+    def _run_steps(self, steps: List[str], is_sequence: bool = False) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Busy", "A step is already running. Please wait.")
             return
@@ -932,7 +953,7 @@ class PipelineGUI:
         self.set_status(f"Running {run_label}...")
         self._set_buttons_state(tk.DISABLED)
 
-        self.pause_button.configure(state=tk.NORMAL)
+        self.pause_button.configure(state=(tk.NORMAL if "reconstruct" in steps else tk.DISABLED))
         self.pause_requested = False
         self.current_step = run_label
 
@@ -966,11 +987,11 @@ class PipelineGUI:
             self.current_step = None
 
             if self.pause_requested:
-                self.root.after(0, lambda: self._on_step_paused(run_label))
+                self.root.after(0, lambda: self._on_step_paused(run_label, is_sequence=is_sequence))
                 return
 
             if exit_code == 0:
-                self.root.after(0, lambda: self._on_step_finished(run_label))
+                self.root.after(0, lambda: self._on_step_finished(run_label, is_sequence=is_sequence))
                 return
 
             if result and result[0] == "error":
@@ -981,7 +1002,7 @@ class PipelineGUI:
                 exc = RuntimeError(f"Process exited with code {exit_code}")
                 trace = ""
 
-            self.root.after(0, lambda: self._on_step_failed(run_label, exc, trace))
+            self.root.after(0, lambda: self._on_step_failed(run_label, exc, trace, is_sequence=is_sequence))
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
@@ -1002,15 +1023,31 @@ class PipelineGUI:
         self.set_status("Pausing current step...")
         self.worker_process.terminate()
 
-    def _on_step_finished(self, step: str) -> None:
+    def _on_step_finished(self, step: str, is_sequence: bool = False) -> None:
+        if is_sequence and self.sequence_steps_remaining:
+            self.worker_thread = None
+            self.pause_requested = False
+            self.pause_button.configure(state=tk.DISABLED)
+            self.set_status(f"Finished {step}. Running next step...")
+            self._run_next_sequence_step()
+            return
+
+        self.sequence_steps_remaining = []
         self._set_buttons_state(tk.NORMAL)
         self.set_status(f"Finished {step}.")
         self.pause_button.configure(state=tk.DISABLED)
         self.worker_thread = None
         self.pause_requested = False
-        messagebox.showinfo("Success", f"Step '{step}' completed successfully.")
+        if is_sequence:
+            completed_label = " -> ".join(self.sequence_steps_original)
+            self.sequence_steps_original = []
+            messagebox.showinfo("Success", f"Steps '{completed_label}' completed successfully.")
+        else:
+            messagebox.showinfo("Success", f"Step '{step}' completed successfully.")
 
-    def _on_step_failed(self, step: str, exc: Exception, trace: str) -> None:
+    def _on_step_failed(self, step: str, exc: Exception, trace: str, is_sequence: bool = False) -> None:
+        self.sequence_steps_remaining = []
+        self.sequence_steps_original = []
         self._set_buttons_state(tk.NORMAL)
         self.set_status(f"{step} failed: {exc}")
         self.pause_button.configure(state=tk.DISABLED)
@@ -1021,7 +1058,9 @@ class PipelineGUI:
             details += f"\n\nDetails:\n{trace}"
         messagebox.showerror("Step failed", details)
 
-    def _on_step_paused(self, step: str) -> None:
+    def _on_step_paused(self, step: str, is_sequence: bool = False) -> None:
+        self.sequence_steps_remaining = []
+        self.sequence_steps_original = []
         self._set_buttons_state(tk.NORMAL)
         self.pause_button.configure(state=tk.DISABLED)
         self.worker_thread = None

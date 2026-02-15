@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, List
 import cv2
 import csv
 import json
@@ -40,20 +40,20 @@ def extract_from_video(
         frame_indices: Optional[List[int]] = None
     ):
     """
-    📂 Expected/Assumed Directory Structure Before Execution:
+    ðŸ“‚ Expected/Assumed Directory Structure Before Execution:
         - out_dir exists. If not, the function raises an exception.
         - The videos exist at the paths listed in videos.
     
     Creates the following directory structure and contents:
         out_dir/
-        └── dataset/
-            ├── index.json  ← Summary file
-            └── <video_name_1>/
-                ├── origin/
-                │   ├── <video_name_1>_0.png
-                │   ├── ...
-                └── files.csv
-            └── <video_name_2>/
+        â””â”€â”€ dataset/
+            â”œâ”€â”€ index.json  â† Summary file
+            â””â”€â”€ <video_name_1>/
+                â”œâ”€â”€ origin/
+                â”‚   â”œâ”€â”€ <video_name_1>_0.png
+                â”‚   â”œâ”€â”€ ...
+                â””â”€â”€ files.csv
+            â””â”€â”€ <video_name_2>/
                 ...
 
     files.csv:
@@ -334,262 +334,214 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) 
 
 # TODO: Instance tracking across views
 def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8, frame_indices=None):
-    """
-    Use a pre-trained YOLO11n-seg model (model_path) to infer the segmentation masks of the dataset.
-    This step is responsible for instance identification! 
-    The subsequent steps rely on the correctness of the detected number of instances from this step.
+    """Infer segmentation masks for extracted frames and write files_crop.csv per view."""
 
-    Augments the dataset as follows:
+    def crop_and_pad(image: np.ndarray, mask: np.ndarray, bbox: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        xmin, ymin, xmax, ymax = bbox
+        crop_img = image[ymin:ymax, xmin:xmax]
+        crop_mask = mask[ymin:ymax, xmin:xmax]
 
-    <dataset_path>/
-    ├── index.json          # Summary file already created in extract_frames()
-    └── <frame_folder>/
-        ├── origin/         # unchanged: all raw .png frames
-        │   ├── ... N files of size HxWx3 (e.g., 2048x1040 RGB)
-        ├── cropped/        # N_fish x N frames
-        │   ├── image_0_0.png        # crop of fish #0 in frame 0, padded to square
-        │   ├── image_0_1.png        # fish #1 in frame 0
-        │   ├── image_1_0.png        # etc.
-        │   └── ... up to 2 crops per frame (bounding boxes squared and padded)
-        ├── mask/           # same count as `cropped/`
-        │   ├── image_0_0_mask.png   # tight binary mask crop aligned with image_0_0.png
-        │   ├── image_0_1_mask.png
-        │   └── ...
-        ├── mask_full/      # raw masks full-frame (optional: you could save them here)
-        │   └── ... one full-frame mask per detection, size HxW (2048x1040)
-        ├── bbox-masked_image/      # images at original size as but black everywhere
-        │   │                         except inside the bounding boxes, where the original content is kept.
-        |   ├── image_0_1_bbox-masked.png
-        │   └── ... one full-frame bbox-masked image per detection, size HxW
-        ├── files.csv       ← unchanged; already created in extract_frames()
-        └── files_crop.csv  # one CSV per folder
+        h, w = crop_img.shape[:2]
+        diff = abs(h - w)
 
-    files_crop.csv:
-        One row per saved crop or mask.
-        Columns:
-            - frame — original frame number
-            - file_loc — relative path to the saved file (cropped or mask)
-            - category — 'cropped', 'mask' or 'bbox-masked'
-            - sub_index — detection index (number of the instance detected)
-            - folder — the <frame_folder> name
-            - bbox — [xmin, ymin, xmax, ymax] from the mask
+        if h < w:
+            pad_top = diff // 2
+            pad_bottom = diff - pad_top
+            crop_img = np.pad(crop_img, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode='constant', constant_values=0)
+            crop_mask = np.pad(crop_mask, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=0)
+        elif w < h:
+            pad_left = diff // 2
+            pad_right = diff - pad_left
+            crop_img = np.pad(crop_img, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
+            crop_mask = np.pad(crop_mask, ((0, 0), (pad_left, pad_right)), mode='constant', constant_values=0)
 
-        Example files_crop.csv:
-            frame,file_loc,category,sub_index,folder,bbox
-            0,video1/cropped/image_0_0.png,cropped,0,video1,"[120, 200, 360, 450]"
-            0,video1/mask/image_0_0_mask.png,mask,0,video1,"[120, 200, 360, 450]"
-            0,video1/cropped/image_0_1.png,cropped,1,video1,"[500, 100, 760, 420]"
-            0,video1/mask/image_0_1_mask.png,mask,1,video1,"[500, 100, 760, 420]"
-            1,video1/cropped/image_1_0.png,cropped,0,video1,"[130, 210, 370, 460]"
-            ...
-    """
-    def crop_and_pad(
-            image: np.ndarray,
-            mask: np.ndarray,
-            bbox: list[int]
-        ) -> tuple[np.ndarray, np.ndarray]:
-            """
-            1) Crops `image` and `mask` to the rectangle defined by `bbox`.
-            2) Pads the shorter side so that the result is square.
-
-            Args:
-            image: HxWx3 RGB array.
-            mask:  HxW binary mask array (0/1 or 0/255).
-            bbox:  [xmin, ymin, xmax, ymax]
-
-            Returns:
-            (cropped_image, cropped_mask), both as square numpy arrays.
-            """
-            xmin, ymin, xmax, ymax = bbox
-            # 1) crop
-            crop_img  = image[      ymin:ymax,      xmin:xmax     ]
-            crop_mask = mask[      ymin:ymax,      xmin:xmax     ]
-
-            h, w = crop_img.shape[:2]
-            diff = abs(h - w)
-
-            # 2) pad to square
-            if h < w:
-                pad_top    = diff // 2
-                pad_bottom = diff - pad_top
-                crop_img  = np.pad(crop_img,
-                                ((pad_top, pad_bottom), (0, 0), (0, 0)),
-                                mode='constant', constant_values=0)
-                crop_mask = np.pad(crop_mask,
-                                ((pad_top, pad_bottom), (0, 0)),
-                                mode='constant', constant_values=0)
-            elif w < h:
-                pad_left  = diff // 2
-                pad_right = diff - pad_left
-                crop_img  = np.pad(crop_img,
-                                ((0, 0), (pad_left, pad_right), (0, 0)),
-                                mode='constant', constant_values=0)
-                crop_mask = np.pad(crop_mask,
-                                ((0, 0), (pad_left, pad_right)),
-                                mode='constant', constant_values=0)
-
-            return crop_img, crop_mask
+        return crop_img, crop_mask
 
     def save_crops(
-            dataset_path: Path,
-            folder: str,
-            frame_counter: int,
-            det_idx: int,
-            cropped_img: np.ndarray,
-            cropped_mask: np.ndarray,
-            full_mask_np: np.ndarray
-        ) -> None:
-            """
-            Saves:
-            - the squared crop image,
-            - the tight binary mask crop,
-            - the full-frame mask.
-            """
-            base = dataset_path / folder
+        dataset_path: Path,
+        folder: str,
+        frame_counter: int,
+        det_idx: int,
+        cropped_img: np.ndarray,
+        cropped_mask: np.ndarray,
+        full_mask_np: np.ndarray,
+    ) -> None:
+        base = dataset_path / folder
 
-            # 1) crop image
-            crop_path = os.path.join(
-                base, 'cropped', f'image_{frame_counter}_{det_idx}.png'
-            )
-            Image.fromarray(cropped_img.astype(np.uint8)).save(crop_path)
+        crop_path = os.path.join(base, 'cropped', f'image_{frame_counter}_{det_idx}.png')
+        Image.fromarray(cropped_img.astype(np.uint8)).save(crop_path)
 
-            # 2) tight mask crop
-            mask_path = os.path.join(
-                base, 'mask', f'image_{frame_counter}_{det_idx}_mask.png'
-            )
-            Image.fromarray((cropped_mask * 255).astype(np.uint8)).save(mask_path)
+        mask_path = os.path.join(base, 'mask', f'image_{frame_counter}_{det_idx}_mask.png')
+        Image.fromarray((cropped_mask * 255).astype(np.uint8)).save(mask_path)
 
-            # 3) full-frame mask
-            full_mask = (full_mask_np * 255).astype(np.uint8)
-            full_mask_path = os.path.join(
-                base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask_full.png'
-            )
-            Image.fromarray(full_mask).save(full_mask_path)
+        full_mask = (full_mask_np * 255).astype(np.uint8)
+        full_mask_path = os.path.join(base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask_full.png')
+        Image.fromarray(full_mask).save(full_mask_path)
 
     def run_infer_mask(
-            model,
-            input_path: Path,
-            frame_indices: Optional[List[int]] = None,
-            frame_number_by_name: Optional[dict[str, int]] = None
-        ) -> dict[str, dict[str, list]]:
+        model,
+        input_path: Path,
+        frame_indices: Optional[List[int]] = None,
+        frame_number_by_name: Optional[dict[str, int]] = None,
+    ) -> dict[str, dict[str, list]]:
         frame_indices_set = set(frame_indices) if frame_indices is not None else None
-        img_path2result = {}
-        for img in Path(input_path).iterdir():
-            if img.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                if frame_indices_set is not None:
-                    frame_number = None
-                    if frame_number_by_name is not None:
-                        frame_number = frame_number_by_name.get(img.name)
-                    if frame_number is None or frame_number not in frame_indices_set:
-                        continue
-                img_path2result[str(img)] = {
-                    "bboxes": [],
-                    "masks_xy": [],
-                    "confs": []
-                }
-                bboxes, masks_xy, confs = infer_mask.inference(model, img)
-                img_path2result[str(img)]["bboxes"]   = bboxes
-                img_path2result[str(img)]["masks_xy"] = masks_xy
-                img_path2result[str(img)]["confs"]    = confs
+        img_path2result: dict[str, dict[str, list]] = {}
+
+        for img in sorted(Path(input_path).iterdir()):
+            if img.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
+                continue
+            if frame_indices_set is not None:
+                frame_number = frame_number_by_name.get(img.name) if frame_number_by_name is not None else None
+                if frame_number is None or frame_number not in frame_indices_set:
+                    continue
+
+            bboxes, masks_xy, confs = infer_mask.inference(model, img)
+            img_path2result[str(img)] = {
+                "bboxes": bboxes,
+                "masks_xy": masks_xy,
+                "confs": confs,
+            }
+
         return img_path2result
 
-    
-    # Read index.json
     with open(dataset_path / 'index.json') as jf:
         idx_json = json.load(jf)
-    image_folders   = idx_json['frame_folders']
-    max_n_instances = 0
 
+    image_folders = idx_json['frame_folders']
+    max_n_instances = 0
     model = infer_mask.load_model(Path(model_path))
 
     for folder in image_folders:
-        print(f"   processing frames for video {folder}...")
-        image_size      = idx_json['image_sizes'][folder]
+        image_size = idx_json['image_sizes'][folder]
         for new_dir in ['cropped', 'mask', 'mask_full', 'bbox-masked_image']:
-            if not os.path.exists(dataset_path / folder / new_dir):
-                os.mkdir(dataset_path / folder / new_dir)
+            os.makedirs(dataset_path / folder / new_dir, exist_ok=True)
 
-        csv_rows = []  # <-- Collect rows here instead of writing immediately
+        csv_rows = []
 
-        files_csv_rows = list(csv.DictReader(open(dataset_path / folder / "files.csv")))
+        files_csv_rows = list(csv.DictReader(open(dataset_path / folder / 'files.csv')))
         frame_number_by_name = {
-            Path(row["file_loc"]).name: int(row["frame"])
+            Path(row['file_loc']).name: int(row['frame'])
             for row in files_csv_rows
         }
+
         available_frames = sorted(frame_number_by_name.values())
         frame_indices_set = set(frame_indices) if frame_indices is not None else None
-        target_frames = (
-            [frame for frame in available_frames if frame in frame_indices_set]
-            if frame_indices_set is not None
-            else available_frames
-        )
-        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else "no-frames"
-        img_path2prediction: dict[str, dict[str, list]] = run_infer_mask(
+        target_frames = [frame for frame in available_frames if frame in frame_indices_set] if frame_indices_set is not None else available_frames
+
+        print(f"   processing {len(target_frames)} frames for video {folder}...")
+
+        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else 'no-frames'
+        img_path2prediction = run_infer_mask(
             model=model,
-            input_path=dataset_path / folder / "origin",
+            input_path=dataset_path / folder / 'origin',
             frame_indices=frame_indices,
-            frame_number_by_name=frame_number_by_name
+            frame_number_by_name=frame_number_by_name,
         )
+
+        frame2prediction: dict[int, tuple[str, dict[str, list]]] = {}
+        for img_path, prediction in img_path2prediction.items():
+            frame_number = frame_number_by_name.get(Path(img_path).name)
+            if frame_number is not None:
+                frame2prediction[frame_number] = (img_path, prediction)
+
+        detection_frames = 0
+        missed_frames = 0
+        conf_sum = 0.0
+        conf_count = 0
 
         pbar = tqdm(
             total=len(target_frames),
-            desc=f"      processing frames in {folder} [{frame_range_label}]"
+            desc=f"mask for frame - of video {folder} [{frame_range_label}]",
+            dynamic_ncols=True,
         )
-        for img_path, prediction in sorted(
-            img_path2prediction.items(),
-            key=lambda item: frame_number_by_name.get(Path(item[0]).name, -1)
-        ):
-            frame_number = frame_number_by_name.get(Path(img_path).name, -1)
+        info_bar = tqdm(total=0, bar_format='{desc}', position=1, leave=False)
+
+        for frame_number in target_frames:
+            frame_data = frame2prediction.get(frame_number)
+            if frame_data is None:
+                missed_frames += 1
+                pbar.set_description_str(f"mask for frame {frame_number} of video {folder} [{frame_range_label}]")
+                info_bar.set_description_str('last frame confs: none')
+                tqdm.write(f"   mask-detection missed all instances in frame {frame_number} (no prediction entry)")
+                pbar.update(1)
+                continue
+
+            img_path, prediction = frame_data
             img_name = Path(img_path).name
 
-            bboxes:   list[list[int]]         = prediction["bboxes"]
-            masks_xy: list[list[list[float]]] = prediction["masks_xy"]
-            confs:    list[float]             = prediction["confs"]
-            #           |   └──> entry per instance
-            #           └──> list of instances 
-            for instance_number, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
-                dynamic_print(f"      processing instance {instance_number} in frame {frame_number} ({img_name}) with confidence {conf}")
-                if conf > conf_threshold:
-                    bbox_masked_image_fname = f"image_{frame_number}_{instance_number}_bbox-masked.png"
-                    infer_mask.img2bbx(
-                        img_path     = dataset_path / folder / "origin" / img_name, 
-                        bbox         = bbox,
-                        padding      = 20, 
-                        out_dir      = dataset_path / folder / "bbox-masked_image",
-                        out_filename = bbox_masked_image_fname
-                    )
-                    mask_img_np = polygon_to_binary_mask(mask_xy, image_size=image_size)
-                    crop_img, crop_mask = crop_and_pad(get_image_np_from_path(str(img_path)), mask_img_np, bbox)
-                    # Save outputs
-                    save_crops(dataset_path, folder, frame_number, instance_number,
-                            crop_img, crop_mask, mask_img_np)
-                    # Collect CSV entries
-                    rel_crop       = f"{folder}/cropped/image_{frame_number}_{instance_number}.png"
-                    rel_mask       = f"{folder}/mask/image_{frame_number}_{instance_number}_mask.png"
-                    rel_mask_full  = f"{folder}/mask_full/image_{frame_number}_{instance_number}_mask_full.png"
-                    rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
-                    csv_rows.append([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
-                    csv_rows.append([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
-                    csv_rows.append([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
-                    csv_rows.append([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
+            bboxes: list[list[int]] = prediction['bboxes']
+            masks_xy: list[list[list[float]]] = prediction['masks_xy']
+            confs: list[float] = prediction['confs']
 
-                    max_n_instances = max(max_n_instances, instance_number + 1)
+            accepted_confs: list[float] = []
+            for instance_number, (bbox, mask_xy, conf) in enumerate(zip(bboxes, masks_xy, confs)):
+                if conf <= conf_threshold:
+                    continue
+
+                accepted_confs.append(float(conf))
+                bbox_masked_image_fname = f"image_{frame_number}_{instance_number}_bbox-masked.png"
+                infer_mask.img2bbx(
+                    img_path=dataset_path / folder / 'origin' / img_name,
+                    bbox=bbox,
+                    padding=20,
+                    out_dir=dataset_path / folder / 'bbox-masked_image',
+                    out_filename=bbox_masked_image_fname,
+                )
+
+                mask_img_np = polygon_to_binary_mask(mask_xy, image_size=image_size)
+                crop_img, crop_mask = crop_and_pad(get_image_np_from_path(str(img_path)), mask_img_np, bbox)
+
+                save_crops(dataset_path, folder, frame_number, instance_number, crop_img, crop_mask, mask_img_np)
+
+                rel_crop = f"{folder}/cropped/image_{frame_number}_{instance_number}.png"
+                rel_mask = f"{folder}/mask/image_{frame_number}_{instance_number}_mask.png"
+                rel_mask_full = f"{folder}/mask_full/image_{frame_number}_{instance_number}_mask_full.png"
+                rel_bbx_masked = f"{folder}/bbox-masked_image/{bbox_masked_image_fname}"
+
+                csv_rows.append([frame_number, rel_crop, 'cropped', instance_number, folder, bbox])
+                csv_rows.append([frame_number, rel_mask, 'mask', instance_number, folder, bbox])
+                csv_rows.append([frame_number, rel_mask_full, 'mask_full', instance_number, folder, bbox])
+                csv_rows.append([frame_number, rel_bbx_masked, 'bbox-masked', instance_number, folder, bbox])
+
+                max_n_instances = max(max_n_instances, instance_number + 1)
+
+            if accepted_confs:
+                detection_frames += 1
+                conf_sum += float(sum(accepted_confs))
+                conf_count += len(accepted_confs)
+                conf_text = ', '.join(f"{c:.2f}" for c in accepted_confs)
+                info_bar.set_description_str(f"last frame confs: [{conf_text}]")
+            else:
+                missed_frames += 1
+                info_bar.set_description_str('last frame confs: none')
+                tqdm.write(f"   mask-detection missed all instances in frame {frame_number} ({img_name})")
+
+            pbar.set_description_str(f"mask for frame {frame_number} of video {folder} [{frame_range_label}]")
             pbar.update(1)
+
+        info_bar.close()
         pbar.close()
+
+        total_frames = len(target_frames)
+        detection_percentage = (100.0 * detection_frames / total_frames) if total_frames else 0.0
+        average_conf = (conf_sum / conf_count) if conf_count else 0.0
+
+        print('******* mask complete ****')
+        print(f"  {folder} - Percentage of frames with mask detections: {detection_percentage:.2f}%")
+        print(f"  {folder} - Number of frames without detection: {missed_frames}")
+        print(f"  {folder} - Average confidence: {average_conf:.4f}")
 
         csv_rows.sort(key=lambda row: row[0])
 
-        # Write to CSV
         with open(dataset_path / folder / 'files_crop.csv', 'w', newline='') as csv_out_file:
             csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
             csvwriter.writerow(['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox'])
             csvwriter.writerows(csv_rows)
-        
+
         idx_json['status'] = 'masks_detected'
         idx_json['max_n_instances'] = max_n_instances
         with open(dataset_path / 'index.json', 'w') as jf:
             json.dump(idx_json, jf, indent=2)
-
 
 def get_frame_number(files_csv_rows:list, img_path:Path) -> int:
     img_name = str(Path(img_path).name)
@@ -618,45 +570,41 @@ def draw_kpts_on_img(kpt2xyc: Dict[str, list], img_path: Path, out_path: Path, t
 
 
 def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str], frame_indices=None):
-    """
-    └── keypoint_results/
-        └── keypoints_confs.pickle # expected to contain a dict with keypoints and confs indexed by frame number
-    """
+    """Infer keypoints for bbox-masked crops and store per-frame keypoint dictionaries."""
 
     model = infer_mask.load_model(model_path)
 
     with open(dataset_path / 'index.json', 'r') as jf:
         index_json = json.load(jf)
 
+    ordered_kpt_names = [kpt_names_dict[i] for i in sorted(kpt_names_dict.keys())]
+
     def make_zero_dict() -> dict[str, list[float]]:
-        return {
-            kpt_name: [0.0, 0.0, 0.0]
-            for kpt_name in kpt_names_dict.values()
-        }
+        return {kpt_name: [0.0, 0.0, 0.0] for kpt_name in ordered_kpt_names}
 
     def make_no_instance_detected_dict() -> dict[str, list[float]]:
-        return {
-            kpt_name: [-1.0, -1.0, -1.0]
-            for kpt_name in kpt_names_dict.values()
-        }
+        return {kpt_name: [-1.0, -1.0, -1.0] for kpt_name in ordered_kpt_names}
 
-    views = index_json["frame_folders"]
+    views = index_json['frame_folders']
 
     for view in views:
         print(f"processing frames for video {view}...")
-        files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / "files_crop.csv")))
+
+        files_crop_csv_rows = list(csv.DictReader(open(dataset_path / view / 'files_crop.csv')))
         os.makedirs(dataset_path / view / 'keypoints_results', exist_ok=True)
+
         frame2prediction: dict[str, InstancesKeypointsDict] = defaultdict(InstancesKeypointsDict)
         input_path = dataset_path / view / 'bbox-masked_image'
 
         frame_number_by_name = {
-            Path(row["file_loc"]).name: int(row["frame"])
+            Path(row['file_loc']).name: int(row['frame'])
             for row in files_crop_csv_rows
         }
+
         frame_indices_set = set(frame_indices) if frame_indices is not None else None
         frame_to_images: dict[int, list[Path]] = defaultdict(list)
         for img in sorted(input_path.iterdir()):
-            if img.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
+            if img.suffix.lower() not in ['.jpg', '.jpeg', '.png']:
                 continue
             frame_number = frame_number_by_name.get(img.name)
             if frame_number is None:
@@ -666,64 +614,124 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
             frame_to_images[frame_number].append(img)
 
         target_frames = sorted(frame_to_images.keys())
-        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else "no-frames"
+        frame_range_label = f"{target_frames[0]}-{target_frames[-1]}" if target_frames else 'no-frames'
+
+        frames_with_all_keypoints = 0
+        missed_instance_frames = 0
+        conf_sum = 0.0
+        conf_count = 0
+
         pbar = tqdm(
             total=len(target_frames),
-            desc=f"      processing frames in {view} [{frame_range_label}]"
+            desc=f"keypoint for frame - of video {view} [{frame_range_label}]",
+            dynamic_ncols=True,
         )
+        info_bars = [
+            tqdm(total=0, bar_format='{desc}', position=i + 1, leave=False)
+            for i in range(max(1, len(ordered_kpt_names)))
+        ]
+
         for frame_number in target_frames:
             frame_number_str = str(frame_number)
+            if frame_number_str not in frame2prediction:
+                frame2prediction[frame_number_str] = InstancesKeypointsDict()
+
+            best_instance_prediction: Optional[dict[str, list[float]]] = None
+            best_detected_count = -1
+
             for img in sorted(frame_to_images[frame_number], key=lambda p: p.stem):
-                instance_number: str = img.stem.split('_')[-2] # image_{frame}_{instance}_bbox-masked.png
-                if frame_number_str not in frame2prediction:
-                    frame2prediction[frame_number_str] = InstancesKeypointsDict()
+                instance_number: str = img.stem.split('_')[-2]
                 _, instances = infer_keypoints.inference(model, img)
 
                 if len(instances) != 1:
-                    """
-                    this means either:
-                        no instance was detected - however, 
-                        we know that there is an instance in the image because all images used here 
-                        are pre-filtered for containing instances by the instance segmentation step.
-                    or:
-                        multiple instances were detected - however,
-                        we get a separate image per instance from the instance segmentation step,
-                        so this is a false positive.
-                    In both cases, we indicate that with a -1 instance number and all -1 coordinate and conf values.
-                    """
-                    print(f"   keypoint-detection missed all instances in frame {frame_number_str} ({Path(img).name})")
-                    frame2prediction[frame_number_str]['-1'] = make_no_instance_detected_dict()
-                    continue       
-                
-                # TODO: If keypoint detection detected multiple instances, get the instance with the best criteria, e.g. most keypoints detected. The other instance is considered a wrong detection.
-                kpts = instances[0]
-                dynamic_print(f"   processing instance {instance_number} in frame {frame_number_str} ({Path(img).name})")
-                if len(kpts) == 0:
-                    # we know there is an instance in the image because of the instance segmentation step,
-                    # but keypoint detection missed it.
-                    dynamic_print("      keypoint-detection missed this instance")
-                    frame2prediction[frame_number_str][str(instance_number)] = make_no_instance_detected_dict()
-                else:
-                    frame2prediction[frame_number_str][str(instance_number)] = make_zero_dict()
-                    for index, (x, y, c) in enumerate(kpts):
-                        dynamic_print(f"      keypoint {kpt_names_dict[index]} at ({x}, {y}) with confidence {c}")
-                        frame2prediction[frame_number_str][str(instance_number)][kpt_names_dict[index]] = [
-                            x, y, (c if (x > 0 or y > 0) else 0.0) # undetected keypoints indicated by x=y=0 -> also conf=0.0
-                        ]
-
-                    draw_kpts_on_img(
-                        frame2prediction[frame_number_str][str(instance_number)],
-                        img,
-                        dataset_path / view / 'keypoints_results' / f'keypoints_{frame_number_str}_{instance_number}.png'
+                    tqdm.write(
+                        f"   keypoint-detection missed all instances in frame {frame_number_str} ({Path(img).name})"
                     )
+                    frame2prediction[frame_number_str]['-1'] = make_no_instance_detected_dict()
+                    continue
+
+                kpts = instances[0]
+                if len(kpts) == 0:
+                    tqdm.write(
+                        f"   keypoint-detection missed this instance in frame {frame_number_str} ({Path(img).name})"
+                    )
+                    frame2prediction[frame_number_str][str(instance_number)] = make_no_instance_detected_dict()
+                    continue
+
+                pred_dict = make_zero_dict()
+                missing_kpt_names: list[str] = []
+                for index, (x, y, c) in enumerate(kpts):
+                    if index >= len(ordered_kpt_names):
+                        continue
+                    kpt_name = ordered_kpt_names[index]
+                    conf = float(c) if (x > 0 or y > 0) else 0.0
+                    pred_dict[kpt_name] = [float(x), float(y), conf]
+                    if conf > 0.0:
+                        conf_sum += conf
+                        conf_count += 1
+                    else:
+                        missing_kpt_names.append(kpt_name)
+
+                if missing_kpt_names:
+                    tqdm.write(
+                        f"   keypoint-detection missed keypoints in frame {frame_number_str}, instance {instance_number}: "
+                        + ', '.join(missing_kpt_names)
+                    )
+
+                frame2prediction[frame_number_str][str(instance_number)] = pred_dict
+
+                draw_kpts_on_img(
+                    pred_dict,
+                    img,
+                    dataset_path / view / 'keypoints_results' / f'keypoints_{frame_number_str}_{instance_number}.png',
+                )
+
+                detected_count = sum(1 for _, _, conf in pred_dict.values() if conf > 0.0)
+                if detected_count > best_detected_count:
+                    best_detected_count = detected_count
+                    best_instance_prediction = pred_dict
+
+            if best_instance_prediction is None:
+                missed_instance_frames += 1
+                best_instance_prediction = make_no_instance_detected_dict()
+            elif all(kpt_data[2] > 0.0 for kpt_data in best_instance_prediction.values()):
+                frames_with_all_keypoints += 1
+
+            pbar.set_description_str(f"keypoint for frame {frame_number} of video {view} [{frame_range_label}]")
+
+            if ordered_kpt_names:
+                for info_bar, kpt_name in zip(info_bars, ordered_kpt_names):
+                    x, y, conf = best_instance_prediction.get(kpt_name, [-1.0, -1.0, -1.0])
+                    if conf < 0.0:
+                        info_bar.set_description_str(f"last frame {frame_number} - {kpt_name}: missed instance")
+                    elif conf == 0.0:
+                        info_bar.set_description_str(f"last frame {frame_number} - {kpt_name}: missing")
+                    else:
+                        info_bar.set_description_str(
+                            f"last frame {frame_number} - {kpt_name}: ({x:.2f}, {y:.2f}), conf={conf:.2f}"
+                        )
+            else:
+                info_bars[0].set_description_str(f"last frame {frame_number} - no keypoints configured")
+
             pbar.update(1)
+
+        for info_bar in info_bars:
+            info_bar.close()
         pbar.close()
 
-        # low-confidence fish detections are already filtered out by mask detection!            
+        total_frames = len(target_frames)
+        detected_all_percentage = (100.0 * frames_with_all_keypoints / total_frames) if total_frames else 0.0
+        average_keypoint_conf = (conf_sum / conf_count) if conf_count else 0.0
+
+        print('******* keypoints complete ****')
+        print(f"  {view} - Percentage of frames with all keypoints detected: {detected_all_percentage:.2f}%")
+        print(f"  {view} - Number of frames where keypoint detection missed the instance: {missed_instance_frames}")
+        print(f"  {view} - Average keypoint confidence: {average_keypoint_conf:.4f}")
+
         with open(dataset_path / view / 'keypoints_results' / 'keypoints_confs.pickle', 'wb') as handle:
             pickle.dump(frame2prediction, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        index_json['keypoint_list'] = list(kpt_names_dict.values())
+
+        index_json['keypoint_list'] = ordered_kpt_names
         index_json['status'] = 'keypoints_detected'
         with open(dataset_path / 'index.json', 'w') as jf:
             json.dump(index_json, jf, indent=2)
