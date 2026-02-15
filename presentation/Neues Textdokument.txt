@@ -1,0 +1,41 @@
+motivation:
+
+- story: real story.
+
+1. show video (bluegill or more interesting?): 
+	- this is a bluegill
+	- bluegill attacks
+	- specific behavior - why?
+	- triggered by visuals? What did the bluegill see?
+2. Show idea of 3D model with eye -> need to reconstrcuct eye orientation, so body.
+
+Part 1: DeepShapeKit
+1. Ruiheng and Liang solved that problem for a specific situation.
+2. DSK method (intuition, simple)
+
+Related work:
+- DSK is part of template-based approaches
+	- explain intuition of template based approaches:
+		1. template finding
+		2. template fitting
+	- often, template-finding ends up trying to find a statistical template model (-> requires extensive datasets)
+	- mention scant?	
+- briefly mention other aproaches
+
+
+Part 2: DeepShapeKit v2
+- Observations about DSK:
+	- it is not too general and not too specific: It makes use of the information present in a lab experiment (uses the 3D-model of the species; expects camera calibration parameters)
+	- it restricts the experiment setup (two views only -> restricted fish behavior; sequential optimization -> restrictions in fish body shape)
+-> DSKv2: 
+	- Model finding: Blender-addon for the user-friendly customization of an available 3D-model
+	- Model fitting: Overhaul of DSK with improved useability, reconstruction for more than 2 views (explain why this softenes the the constraints imposed by 2 views) and an updated optimization procedure
+
+The Blender Addon:
+
+
+
+
+Diskussion:
+- scant shows...
+- DSKv2 was not concerned with optimizing the optimization procedure (error functions)
