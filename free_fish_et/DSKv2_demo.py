@@ -11,6 +11,7 @@ from pathlib import Path
 from queue import Empty
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Optional
+import cv2
 
 try:
     import tkinter as tk
@@ -512,6 +513,76 @@ def resolve_dataset_views(dataset_dir: Path, requested_videos: List[Path]) -> Li
     return resolved
 
 
+def _natural_sort_key(path_obj: Path) -> tuple:
+    parts = re.split(r"(\d+)", path_obj.stem)
+    return tuple(int(p) if p.isdigit() else p.lower() for p in parts)
+
+
+def create_videos_from_reconstruction_visualisations(
+    final_output_folder: Path,
+    fps: int = 10,
+) -> List[Path]:
+    if not final_output_folder.exists():
+        raise ConfigError(f"Final output folder does not exist: {final_output_folder}")
+
+    videos_dir = final_output_folder / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    written_videos: List[Path] = []
+    reconstruction_dirs = sorted(
+        [
+            d
+            for d in final_output_folder.iterdir()
+            if d.is_dir() and d.name.endswith("_reconstruction_images")
+        ],
+        key=lambda d: d.name.lower(),
+    )
+
+    for reconstruction_dir in reconstruction_dirs:
+        view_name = reconstruction_dir.name[: -len("_reconstruction_images")]
+        instance_dirs = sorted(
+            [d for d in reconstruction_dir.iterdir() if d.is_dir() and d.name.startswith("instance_")],
+            key=lambda d: d.name.lower(),
+        )
+        for instance_dir in instance_dirs:
+            frames = sorted(
+                [p for p in instance_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg"}],
+                key=_natural_sort_key,
+            )
+            if not frames:
+                continue
+
+            first_frame = cv2.imread(str(frames[0]), cv2.IMREAD_COLOR)
+            if first_frame is None:
+                continue
+            height, width = first_frame.shape[:2]
+
+            output_path = videos_dir / f"{view_name}_{instance_dir.name}.mp4"
+            writer = cv2.VideoWriter(
+                str(output_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                float(fps),
+                (width, height),
+            )
+            if not writer.isOpened():
+                continue
+
+            try:
+                for frame_path in frames:
+                    frame_bgr = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                    if frame_bgr is None:
+                        continue
+                    if frame_bgr.shape[0] != height or frame_bgr.shape[1] != width:
+                        frame_bgr = cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_AREA)
+                    writer.write(frame_bgr)
+            finally:
+                writer.release()
+
+            written_videos.append(output_path)
+
+    return written_videos
+
+
 def _run_pipeline_subprocess(
     config_dict: Dict[str, Any],
     steps: List[str],
@@ -659,7 +730,7 @@ class PipelineGUI:
 
         control_frame = ttk.Frame(main)
         control_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
-        for col in range(8):
+        for col in range(9):
             control_frame.columnconfigure(col, weight=1)
 
         self._add_action_button(control_frame, 0, "Save config...", self.save_config)
@@ -669,8 +740,14 @@ class PipelineGUI:
         self._add_action_button(control_frame, 4, "detect_keypoints_yolo", lambda: self.run_step("keypoints"))
         self._add_action_button(control_frame, 5, "reconstruct", lambda: self.run_step("reconstruct"))
         self._add_action_button(control_frame, 6, "Show metrics", self.show_metrics)
+        self._add_action_button(
+            control_frame,
+            7,
+            "create videos from reconstruction visualisations",
+            self.create_reconstruction_videos,
+        )
         self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_execution, state=tk.DISABLED)
-        self.pause_button.grid(row=0, column=7, padx=2, sticky="ew")
+        self.pause_button.grid(row=0, column=8, padx=2, sticky="ew")
         row += 1
 
         self.advanced_toggle = ttk.Button(main, text="Advanced >", command=self._toggle_advanced)
@@ -1074,6 +1151,38 @@ class PipelineGUI:
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def create_reconstruction_videos(self) -> None:
+        try:
+            config = self.gather_config()
+        except ConfigError as exc:
+            messagebox.showerror("Configuration error", str(exc))
+            return
+
+        output_dir = Path(config.final_output_folder)
+        try:
+            written = create_videos_from_reconstruction_visualisations(output_dir)
+        except Exception as exc:
+            messagebox.showerror("Video creation failed", str(exc))
+            return
+
+        if not written:
+            self.set_status("No reconstruction visualisations found to convert.")
+            messagebox.showinfo(
+                "No videos created",
+                (
+                    "No images were found in folders ending with '_reconstruction_images' "
+                    f"under {output_dir}."
+                ),
+            )
+            return
+
+        videos_dir = output_dir / "videos"
+        self.set_status(f"Created {len(written)} video(s) in {videos_dir}.")
+        messagebox.showinfo(
+            "Videos created",
+            f"Created {len(written)} video(s) in {videos_dir}.",
+        )
 
     def show_metrics(self) -> None:
         try:
