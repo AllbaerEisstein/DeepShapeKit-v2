@@ -779,6 +779,11 @@ def reconstruct(
     save_models: bool = False,
     video_names: Optional[List[str]] = None,
     pause_event: Optional[Any] = None,
+    num_iters: int = 100,
+    angle_constraint_weight: float = 200.0,
+    smooth_weight: float = 30.0,
+    bone_length_constraint_weight: float = 200.0,
+    mask_weight: float = 200.0,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
@@ -799,12 +804,11 @@ def reconstruct(
 
     fish = fish_model(mesh_json_path=mesh_path)
     optimizer = OptimizeMV(
-        num_iters=100,
-        lim_weight=200,
-        prior_weight=30,
-        bone_weight=200,
-        mask_weight=200,
-        smooth_weights=[100, 100, 20],
+        num_iters=num_iters,
+        angle_constraint_weight=angle_constraint_weight,
+        smooth_weight=smooth_weight,
+        bone_length_constraint_weight=bone_length_constraint_weight,
+        mask_weight=mask_weight,
         device=torch.device(device),
         fish_model_obj=fish,
     )
@@ -891,7 +895,10 @@ def reconstruct(
                 view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
                 if view_with_seg_mask == True
             ]) < 2:
-            print(f"Less than two views with segmentation masks in sample for frame {idx} -> skipping")
+            print(
+                f"Less than two views with segmentation masks in sample for frame {idx} -> skipping "
+                f"(presence={seg_mask_present_mask})"
+            )
             pbar.update()
             continue
         if len([

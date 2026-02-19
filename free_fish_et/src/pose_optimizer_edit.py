@@ -20,24 +20,22 @@ class OptimizeMV:
     def __init__(
         self,
         fish_model_obj: fish_model.fish_model,
-        lim_weight=1,
-        prior_weight=1,
-        bone_weight=1,
-        mask_weight=1,
-        smooth_weights=None,
-        step_size=1e-2,
-        num_iters=100,
+        angle_constraint_weight: float = 1.0,
+        smooth_weight: float = 1.0,
+        bone_length_constraint_weight: float = 1.0,
+        mask_weight: float = 1.0,
+        step_size: float = 1e-2,
+        num_iters: int = 100,
         device=torch.device("cpu"),
     ):
         # Store hyper-parameters
         self.device = device
         self.step_size = step_size
         self.num_iters = num_iters
-        self.angle_constraint_weight = lim_weight
-        self.prior_weight = prior_weight
-        self.bone_length_constraint_weight = bone_weight
+        self.angle_constraint_weight = angle_constraint_weight
+        self.smooth_weight = smooth_weight
+        self.bone_length_constraint_weight = bone_length_constraint_weight
         self.mask_weight = mask_weight
-        self.smooth_weights = smooth_weights or [1.0, 1.0, 1.0]
 
         # Load parametric fish mesh and faces
         self.fish = fish_model_obj
@@ -125,7 +123,7 @@ class OptimizeMV:
         # -----------------------------------
         # keypoint reprojection l2 distance * keypoint confidence², 
         # mask l1 distance, 
-        # global_t prior loss 
+        # global_t smooth loss (difference to init_t)
         # ===================================
 
         opt_global = torch.optim.Adam(
@@ -150,7 +148,7 @@ class OptimizeMV:
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             loss = (
                 keypoint_reprojection_loss_global(model_kpts, proj_m_from_blworld, kpts_2d, kpts_conf)
-                + self.prior_weight * (global_t - init_t).abs().sum()
+                + self.smooth_weight * (global_t - init_t).abs().sum()
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -177,7 +175,8 @@ class OptimizeMV:
         # --------------
         # loss: 
         # -----------------------------------
-        # (keypoint L2-distance * keypoint confidence²) of keypoints of bone group 0, 
+        # (keypoint L2-distance * keypoint confidence²) of keypoints of bone group 0,
+        # mask l1 distance, 
         # bone constraint loss (angle/length min and max)
         # ===================================
 
@@ -248,8 +247,15 @@ class OptimizeMV:
                 recombined_body_pose.flatten(1),
                 recombined_body_bone_length,
                 angle_constraint_weight=self.angle_constraint_weight,
-                prior_weight=self.prior_weight,
+                smooth_weight=self.smooth_weight,
                 bone_length_constraint_weight=self.bone_length_constraint_weight,
+            )
+            # Silhouette loss
+            silhouette_renders = silhouette_renderer(
+                out["vertices"], self.faces.unsqueeze(0), global_t
+            )
+            loss += mask_fitting_loss(
+                silhouette_renders, masks.float(), 0.1 * self.mask_weight
             )
             opt_body.zero_grad()
             loss.backward()
@@ -273,8 +279,9 @@ class OptimizeMV:
             # loss: 
             # -----------------------------------
             # (keypoint L2-distance * keypoint confidence²) of keypoints of that bone group, 
+            # mask l1 distance,
             # bone constraint loss (angle/length min and max)
-            # prior loss (! difference to stage 2 !)
+            # smooth loss compared to previous stage (-> L2 distance of bone orientation Rodriguez vectors and L2 distance of bone lengths) (! this loss is not present in stage 2 !)
             # ===================================
 
             for bg_idx, bone_group in enumerate(self.fish.bone_groups[1:]):
@@ -339,10 +346,17 @@ class OptimizeMV:
                         recombined_body_pose.flatten(1),
                         recombined_body_bone_length,
                         angle_constraint_weight=self.angle_constraint_weight,
-                        prior_weight=self.prior_weight,
+                        smooth_weight=self.smooth_weight,
                         bone_length_constraint_weight=self.bone_length_constraint_weight,
                         pose_init=init_bp.flatten(1),
                         bone_init=init_bl,
+                    )
+                    # Silhouette loss
+                    silhouette_renders = silhouette_renderer(
+                        out["vertices"], self.faces.unsqueeze(0), global_t
+                    )
+                    loss += mask_fitting_loss(
+                        silhouette_renders, masks.float(), 0.1 * self.mask_weight
                     )
                     opt_bone_group.zero_grad()
                     loss.backward()
