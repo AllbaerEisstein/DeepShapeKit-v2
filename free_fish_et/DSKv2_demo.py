@@ -63,6 +63,11 @@ class PipelineConfig:
     conf_threshold: float = 0.8
     also_create_frame2video_csv: bool = True
     undistort: bool = True
+    num_iters: int = 100
+    angle_constraint_weight: float = 200.0
+    smooth_weight: float = 30.0
+    bone_length_constraint_weight: float = 200.0
+    mask_weight: float = 200.0
 
     def dataset_folder(self) -> Path:
         return Path(self.out_path) / self.dataset_folder_name
@@ -281,6 +286,11 @@ def run_pipeline(
             save_models=config.save_models,
             video_names=selected_views,
             pause_event=reconstruct_pause_event,
+            num_iters=config.num_iters,
+            angle_constraint_weight=config.angle_constraint_weight,
+            smooth_weight=config.smooth_weight,
+            bone_length_constraint_weight=config.bone_length_constraint_weight,
+            mask_weight=config.mask_weight,
         )
 
 
@@ -623,6 +633,11 @@ class PipelineGUI:
         self.pose_time_series_offset_var = tk.BooleanVar(
             value=self.config.pose_time_series_offset_by_range_start
         )
+        self.num_iters_var = tk.StringVar(value=str(self.config.num_iters))
+        self.angle_constraint_weight_var = tk.StringVar(value=str(self.config.angle_constraint_weight))
+        self.smooth_weight_var = tk.StringVar(value=str(self.config.smooth_weight))
+        self.bone_length_constraint_weight_var = tk.StringVar(value=str(self.config.bone_length_constraint_weight))
+        self.mask_weight_var = tk.StringVar(value=str(self.config.mask_weight))
         self.advanced_visible = tk.BooleanVar(value=False)
         self.step_vars: Dict[str, "tk.BooleanVar"] = {
             "extract": tk.BooleanVar(value="extract" in self.steps),
@@ -786,6 +801,26 @@ class PipelineGUI:
         )
         render_button.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
+
+        optimization_frame = ttk.LabelFrame(self.advanced_frame, text="Optimization settings")
+        optimization_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        optimization_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(optimization_frame, text="num_iters").grid(row=0, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.num_iters_var).grid(row=0, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="angle_constraint_weight").grid(row=1, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.angle_constraint_weight_var).grid(row=1, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="smooth_weight").grid(row=2, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.smooth_weight_var).grid(row=2, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="bone_length_constraint_weight").grid(row=3, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.bone_length_constraint_weight_var).grid(row=3, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="mask_weight").grid(row=4, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.mask_weight_var).grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 6))
+
         self.advanced_frame.grid_remove()
         row += 1
 
@@ -916,6 +951,22 @@ class PipelineGUI:
         config.pose_time_series_deform = bool(self.pose_time_series_deform_var.get())
         config.pose_time_series_offset_by_range_start = bool(self.pose_time_series_offset_var.get())
 
+        num_iters_value = self.num_iters_var.get().strip()
+        try:
+            config.num_iters = int(num_iters_value)
+        except ValueError as exc:
+            raise ConfigError("num_iters must be an integer.") from exc
+        if config.num_iters <= 0:
+            raise ConfigError("num_iters must be > 0.")
+
+        try:
+            config.angle_constraint_weight = float(self.angle_constraint_weight_var.get().strip())
+            config.smooth_weight = float(self.smooth_weight_var.get().strip())
+            config.bone_length_constraint_weight = float(self.bone_length_constraint_weight_var.get().strip())
+            config.mask_weight = float(self.mask_weight_var.get().strip())
+        except ValueError as exc:
+            raise ConfigError("Optimization weights must be numeric.") from exc
+
         return config
 
     def save_config(self) -> None:
@@ -972,6 +1023,11 @@ class PipelineGUI:
         self.pose_time_series_mesh_var.set(config.pose_time_series_mesh_path or "")
         self.pose_time_series_deform_var.set(bool(config.pose_time_series_deform))
         self.pose_time_series_offset_var.set(bool(config.pose_time_series_offset_by_range_start))
+        self.num_iters_var.set(str(config.num_iters))
+        self.angle_constraint_weight_var.set(str(config.angle_constraint_weight))
+        self.smooth_weight_var.set(str(config.smooth_weight))
+        self.bone_length_constraint_weight_var.set(str(config.bone_length_constraint_weight))
+        self.mask_weight_var.set(str(config.mask_weight))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
@@ -1322,6 +1378,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confidence threshold for mask prediction.",
     )
     parser.add_argument(
+        "--num-iters",
+        type=int,
+        dest="num_iters",
+        help="Number of optimizer iterations per stage.",
+    )
+    parser.add_argument(
+        "--angle-constraint-weight",
+        type=float,
+        dest="angle_constraint_weight",
+        help="Angle constraint weight for optimization.",
+    )
+    parser.add_argument(
+        "--smooth-weight",
+        type=float,
+        dest="smooth_weight",
+        help="Smoothness weight for optimization.",
+    )
+    parser.add_argument(
+        "--bone-length-constraint-weight",
+        type=float,
+        dest="bone_length_constraint_weight",
+        help="Bone length constraint weight for optimization.",
+    )
+    parser.add_argument(
+        "--mask-weight",
+        type=float,
+        dest="mask_weight",
+        help="Mask fitting weight for optimization.",
+    )
+    parser.add_argument(
         "--no-save-models",
         action="store_false",
         dest="save_models",
@@ -1364,6 +1450,16 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.seed = args.seed
     if args.conf_threshold is not None:
         config.conf_threshold = args.conf_threshold
+    if getattr(args, "num_iters", None) is not None:
+        config.num_iters = args.num_iters
+    if getattr(args, "angle_constraint_weight", None) is not None:
+        config.angle_constraint_weight = args.angle_constraint_weight
+    if getattr(args, "smooth_weight", None) is not None:
+        config.smooth_weight = args.smooth_weight
+    if getattr(args, "bone_length_constraint_weight", None) is not None:
+        config.bone_length_constraint_weight = args.bone_length_constraint_weight
+    if getattr(args, "mask_weight", None) is not None:
+        config.mask_weight = args.mask_weight
     if hasattr(args, "save_models") and args.save_models is not None:
         config.save_models = args.save_models
     return config

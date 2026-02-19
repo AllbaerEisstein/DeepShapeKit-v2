@@ -1,6 +1,7 @@
 bluegill_data/videos/*.mp4
 bluegill_data/synthetic_data/*.png
 bluegill_data/synthetic_data/*.txt
+bluegill_data/reconstruction_data/*
 *.blend1
 .vscode
 *yolo11*.pt

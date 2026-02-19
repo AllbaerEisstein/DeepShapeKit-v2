@@ -63,9 +63,9 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     body_pose: torch.Tensor,
     bone_length: torch.Tensor,
     sigma=50,
-    angle_constraint_weight=1,
-    prior_weight=1,
-    bone_length_constraint_weight=1,
+    angle_constraint_weight: float = 1.0,
+    smooth_weight: float = 1.0,
+    bone_length_constraint_weight: float = 1.0,
     pose_init: Optional[torch.Tensor] = None,
     bone_init: Optional[torch.Tensor] = None,
 ):
@@ -88,12 +88,12 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
     if pose_init == None or bone_init == None:
         prior_loss = body_pose.abs()
-        prior_loss = prior_weight * prior_loss
+        prior_loss = smooth_weight * prior_loss
     else:
         prior_loss = (body_pose - pose_init).abs().sum() + (
             bone_length - bone_init
         ).abs().sum()
-        prior_loss = prior_weight * prior_loss
+        prior_loss = smooth_weight * prior_loss
 
     # Bone Length Limit Loss
     max_bone = bone_length_max.repeat(1, 1).to(device)

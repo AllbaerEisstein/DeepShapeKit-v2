@@ -210,8 +210,18 @@ class Multiview_Dataset(torch.utils.data.Dataset):
         #             raise IndexError # to be handled by the caller
     
         sample = {'frames': [], 'imgpaths': [], 'instances': None}
-        seg_mask_present_mask = [[False]*len(self.views)]*len(self.instance_indices)
-        kpt_present_mask = [[[False]*len(self.index_json['keypoint_list'])]*len(self.views)]*len(self.instance_indices)
+        # Use non-aliased lists; list-multiplication would make rows share the same object.
+        seg_mask_present_mask = [
+            [False for _ in range(len(self.views))]
+            for _ in self.instance_indices
+        ]
+        kpt_present_mask = [
+            [
+                [False for _ in range(len(self.index_json['keypoint_list']))]
+                for _ in range(len(self.views))
+            ]
+            for _ in self.instance_indices
+        ]
 
         view_data = {}
         for view_index, view in enumerate(self.views):
@@ -258,9 +268,10 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                         inst_kpts[valid, 1] += pad_top
 
             # meta info for this frame
-            masks_row_per_instance      = self.masks_meta[view].get(origin_frame_number, [])
-            crops_row_per_instance      = self.cropped_meta[view].get(origin_frame_number, [])
-            full_masks_row_per_instance = self.masks_full_meta[view].get(origin_frame_number, [])
+            # Work on copies to avoid mutating cached metadata while adding placeholders.
+            masks_row_per_instance      = list(self.masks_meta[view].get(origin_frame_number, []))
+            crops_row_per_instance      = list(self.cropped_meta[view].get(origin_frame_number, []))
+            full_masks_row_per_instance = list(self.masks_full_meta[view].get(origin_frame_number, []))
 
             # add placeholders for missing instances
             for inst in range(self.index_json['max_n_instances']):
