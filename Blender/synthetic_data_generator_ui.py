@@ -18,6 +18,7 @@ import json
 import shutil
 import re
 import glob
+import math
 from collections import defaultdict
 from mathutils import Vector, Matrix
 from bpy.props import (
@@ -61,6 +62,28 @@ class SYNTH_BoneGroupItem(PropertyGroup):
         description="For bones listed here: also add all descendants recursively",
         default=False
     )
+
+class SYNTH_CameraSelectionItem(PropertyGroup):
+    camera_name: StringProperty(
+        name="Camera Name",
+        default=""
+    )
+    enabled: BoolProperty(
+        name="Enabled",
+        default=True
+    )
+
+class SYNTH_BonePriorItem(PropertyGroup):
+    bone_name: StringProperty(
+        name="Bone Name",
+        default=""
+    )
+    z_angle_max: FloatProperty(name="Z Max", default=180.0)
+    z_angle_min: FloatProperty(name="Z Min", default=-180.0)
+    y_angle_max: FloatProperty(name="Y Max", default=180.0)
+    y_angle_min: FloatProperty(name="Y Min", default=-180.0)
+    x_angle_max: FloatProperty(name="X Max", default=180.0)
+    x_angle_min: FloatProperty(name="X Min", default=-180.0)
 
 class SYNTH_PropertyGroup(PropertyGroup):
     # Paths
@@ -136,6 +159,8 @@ class SYNTH_PropertyGroup(PropertyGroup):
 
     bone_groups: CollectionProperty(type=SYNTH_BoneGroupItem)
     bone_groups_index: IntProperty(default=-1)
+    camera_selections: CollectionProperty(type=SYNTH_CameraSelectionItem)
+    bone_priors_ui_item_collection: CollectionProperty(type=SYNTH_BonePriorItem)
 
     # Timers and rendering behaviour
     event_timer_interval: FloatProperty(
@@ -215,7 +240,79 @@ def resolve(path):
     return bpy.path.abspath(path)
 
 
-# ---- camera intrinsic helpers (from your original script) -----------------
+def get_scene_cameras_sorted():
+    cam_collection = bpy.data.collections.get('Cameras')
+    cam_objects = cam_collection.objects if cam_collection else bpy.data.objects
+    return sorted([cam for cam in cam_objects if getattr(cam, "type", None) == 'CAMERA'], key=lambda c: c.name)
+
+
+def sync_camera_selections(scene):
+    p = scene.synth_props
+    cam_objects = get_scene_cameras_sorted()
+    cam_names = {cam.name for cam in cam_objects}
+
+    for idx in reversed(range(len(p.camera_selections))):
+        if p.camera_selections[idx].camera_name not in cam_names:
+            p.camera_selections.remove(idx)
+
+    existing = {item.camera_name for item in p.camera_selections}
+    for cam in cam_objects:
+        if cam.name not in existing:
+            item = p.camera_selections.add()
+            item.camera_name = cam.name
+            item.enabled = True
+
+    return cam_objects
+
+
+def get_target_object(scene):
+    p = scene.synth_props
+    col = bpy.data.collections.get(p.collection_name)
+    if col is None:
+        return None
+    return col.objects.get(p.object_name)
+
+
+def find_target_armature(scene):
+    obj = get_target_object(scene)
+    if obj is None:
+        return None
+    for modifier in obj.modifiers:
+        if modifier.type == 'ARMATURE' and modifier.object:
+            return modifier.object
+    return None
+
+
+def get_target_armature_bone_names_sorted(scene):
+    arm_obj = find_target_armature(scene)
+    if arm_obj is None:
+        return None, []
+    return arm_obj, sorted([b.name for b in arm_obj.data.bones])
+
+
+def sync_bone_priors_ui_item_collection(scene):
+    """
+    Add an UI item for all existing bones in the armature.
+    Remove items for bones that no longer exist.
+    """
+    p = scene.synth_props
+    arm_obj, bone_names = get_target_armature_bone_names_sorted(scene)
+    bone_names_set = set(bone_names)
+
+    for idx in reversed(range(len(p.bone_priors_ui_item_collection))):
+        if p.bone_priors_ui_item_collection[idx].bone_name not in bone_names_set:
+            p.bone_priors_ui_item_collection.remove(idx)
+
+    existing = {item.bone_name for item in p.bone_priors_ui_item_collection}
+    for bone_name in bone_names:
+        if bone_name not in existing:
+            item = p.bone_priors_ui_item_collection.add()
+            item.bone_name = bone_name
+
+    return arm_obj, bone_names
+
+
+# ---- camera intrinsic helpers -----------------
 
 def get_sensor_size(sensor_fit, sensor_x, sensor_y):
     if sensor_fit == 'VERTICAL':
@@ -645,6 +742,11 @@ def get_mesh_json(context):
     }
 
     return out
+
+
+
+def get_angle_of_bone():
+    pass
 
 
 
@@ -1114,16 +1216,14 @@ using opencv's contour detection can create a silhouette annotation from the bin
         self.rendering = False
         self.render_queue = []
 
-        cam_collection = bpy.data.collections.get('Cameras')
-        # TODO: add filtering based on checkboxes or dropdown in ui
-        cam_objects = cam_collection.objects if cam_collection else bpy.data.objects
-        cam_objects = sorted(cam_objects, key=lambda c: c.name)
+        cam_objects = sync_camera_selections(scene)
+        enabled_camera_names = {item.camera_name for item in p.camera_selections if item.enabled}
 
         modes = ["regular"] + (["binary"] if p.render_binary else [])
 
         skipped_count = 0
         for cam in cam_objects:
-            if cam.type != 'CAMERA':
+            if cam.name not in enabled_camera_names:
                 continue
             for frame_index in range(scene.frame_start, scene.frame_end + 1):
                 for mode in modes:
@@ -1528,6 +1628,10 @@ class SYNTH_OT_apply_settings(Operator):
                 self.report({'WARNING'}, f"Could not create path {path_prop}: {e}")
         # invalidate camera matrix cache so K/R/T/P will be recomputed with new settings
         cam_name_2_matrix.clear()
+        try:
+            sync_bone_priors_ui_item_collection(scene)
+        except Exception:
+            pass
 
         # serialize bone groups (UI list) to a simple list of dicts
         bone_groups_cfg = [
@@ -1681,6 +1785,11 @@ class SYNTH_OT_load_config(Operator):
         except Exception:
             pass
 
+        try:
+            sync_bone_priors_ui_item_collection(scene)
+        except Exception:
+            pass
+
 
         # Load Bone Groups (if any)
         if 'BONE_GROUPS' in cfg and isinstance(cfg['BONE_GROUPS'], list):
@@ -1809,6 +1918,89 @@ class SYNTH_OT_bone_group_remove(Operator):
         if 0 <= idx < len(p.bone_groups):
             p.bone_groups.remove(idx)
             p.bone_groups_index = min(idx, len(p.bone_groups) - 1)
+        return {'FINISHED'}
+
+
+class SYNTH_OT_refresh_bone_priors_ui_item_collection(Operator):
+    bl_idname = "synth.refresh_bone_priors_ui_item_collection"
+    bl_label = "Refresh Priors"
+    bl_description = "Rebuild UI rows for the priors from bones of the armature attached to the selected object"
+
+    def execute(self, context):
+        arm_obj, bone_names = sync_bone_priors_ui_item_collection(context.scene)
+        if arm_obj is None:
+            self.report({'WARNING'}, "No armature found on selected object.")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Synced priors for {len(bone_names)} bones from armature '{arm_obj.name}'")
+        return {'FINISHED'}
+
+
+class SYNTH_OT_set_bone_prior_from_pose(Operator):
+    """
+    Button for setting an angle prior for either yaw, pitch, or roll angle of a single bone.
+    Association between button and corresponding text input field is achieved via syncing 
+    the two members bone_name and field_name to the corresponding members of the text field.
+    """
+    bl_idname = "synth.set_bone_prior_from_pose"
+    bl_label = "set"
+    bl_description = "set angle from the current armature deformation"
+
+    # these are set when instantiating the button
+    bone_name: StringProperty(name="Bone Name", default="")
+    field_name: StringProperty(name="Field Name", default="") # z_angle_min, z_angle_max, y_angle_min, y_angle_max, x_angle_min, x_angle_max
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        arm_obj, _ = sync_bone_priors_ui_item_collection(scene)
+        if arm_obj is None:
+            self.report({'ERROR'}, "No armature found on selected object.")
+            return {'CANCELLED'}
+
+        deps = context.evaluated_depsgraph_get()
+        deps.update()
+        arm_eval = arm_obj.evaluated_get(deps)
+        pb = arm_eval.pose.bones.get(self.bone_name)
+        if pb is None:
+            self.report({'ERROR'}, f"Bone '{self.bone_name}' not found in armature '{arm_obj.name}'")
+            return {'CANCELLED'}
+
+        if pb.parent is not None:
+            rel_mat = pb.parent.matrix.inverted() @ pb.matrix
+        else:
+            # root bone fallback: use armature-space orientation
+            rel_mat = pb.matrix.copy()
+
+        rel_euler = rel_mat.to_euler('XYZ')
+        axis_2_angle_deg = {
+            'x_angle': math.degrees(rel_euler.x),
+            'y_angle': math.degrees(rel_euler.y),
+            'z_angle': math.degrees(rel_euler.z),
+        }
+
+        axis_name = self.field_name.split('_', 1)[0] + '_angle'
+        if axis_name not in axis_2_angle_deg:
+            self.report({'ERROR'}, f"Unsupported field '{self.field_name}'")
+            return {'CANCELLED'}
+
+        prior_ui_item = None
+        # find corresponding set of text input fields for this button
+        for bone_prior_ui_item in p.bone_priors_ui_item_collection:
+            if bone_prior_ui_item.bone_name == self.bone_name:
+                prior_ui_item = bone_prior_ui_item
+                break
+        if prior_ui_item is None:
+            self.report({'ERROR'}, f"No prior row found for bone '{self.bone_name}'")
+            return {'CANCELLED'}
+
+        if not hasattr(prior_ui_item, self.field_name):
+            self.report({'ERROR'}, f"Unknown prior field '{self.field_name}'")
+            return {'CANCELLED'}
+
+        # set the text input field with the correct name to the calculated value
+        setattr(prior_ui_item, self.field_name, axis_2_angle_deg[axis_name])
+        self.report({'INFO'}, f"{self.field_name} of {prior_ui_item.bone_name} was set to {axis_2_angle_deg[axis_name]}")
         return {'FINISHED'}
 
 
@@ -2245,7 +2437,7 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
 
 
 
-# --------------------------- Pose Time Series to Animation OPerator --------------------------
+# --------------------------- Pose Time Series to Animation Operator --------------------------
 
 
 def _expmap_to_rotation_matrix_4x4(exp_map_vec):
@@ -2526,6 +2718,19 @@ class SYNTH_PT_main_panel(Panel):
         row.prop(p, 'image_width_px')
         row.prop(p, 'image_height_px')
         box = layout.box()
+        box.label(text="Cameras")
+        cam_objects = get_scene_cameras_sorted()
+        selection_by_name = {item.camera_name: item for item in p.camera_selections}
+        if not cam_objects:
+            box.label(text="No cameras found in scene.")
+        else:
+            for cam in cam_objects:
+                item = selection_by_name.get(cam.name)
+                if item is not None:
+                    box.prop(item, 'enabled', text=cam.name)
+                else:
+                    box.label(text=f"{cam.name} (will be added on render queue build)", icon='ERROR')
+        box = layout.box()
         box.label(text="Target Object & Keypoints")
         box.prop(p, 'collection_name')
         box.prop(p, 'object_name')
@@ -2546,6 +2751,75 @@ class SYNTH_PT_main_panel(Panel):
         col = row.column(align=True)
         col.operator("synth.bone_group_add", icon="ADD", text="")
         col.operator("synth.bone_group_remove", icon="REMOVE", text="")
+
+        box = layout.box()
+        header_row = box.row(align=True)
+        header_row.label(text="Template Priors (degrees, relative to parent)")
+        header_row.operator("synth.refresh_bone_priors_ui_item_collection", icon='FILE_REFRESH', text="Refresh")
+
+        arm_obj, bone_names = get_target_armature_bone_names_sorted(scene)
+        prior_ui_item_by_bone_name = {item.bone_name: item for item in p.bone_priors_ui_item_collection}
+        if arm_obj is None:
+            box.label(text="No armature found on selected object.", icon='ERROR')
+        elif not bone_names:
+            box.label(text="No bones found on armature.", icon='ERROR')
+        else:
+            box.label(text="Angle about bone local...")
+            row = box.row(align=True)
+            for angle_prior_name in ['', 'Z, max', 'Z, min', 'Y, max', 'Y, min', 'X, max', 'X, min']:
+                row.label(text=angle_prior_name)
+
+            box.label(text="Looking down a bone (with 0 roll!) from tail to head, this means...")
+            row = box.row(align=True)
+            for angle_prior_description in ['', 'up', 'down', 'roll, cw', 'roll, ccw', 'left', 'right']:
+                row.label(text=angle_prior_description)
+
+            for bone_name in bone_names:
+                # get corresponding ui item
+                bone_prior_ui_row = prior_ui_item_by_bone_name.get(bone_name)
+                if bone_prior_ui_row is None:
+                    box.label(text=f"{bone_name} (missing row; click Refresh)", icon='ERROR')
+                    continue
+
+                row = box.row(align=True)
+                row.label(text=bone_name)
+                
+                # create a property in the row for each of the prior angles
+                # from the documentation:
+                # bpy.types.UILayout.prop:
+                # Parameters:
+                #   data (AnyType, (never None)) – Data from which to take property
+                #   property (string, (never None)) – Identifier of property in data
+                #   text (string, (optional)) – Override automatic text of the item
+                row.prop(bone_prior_ui_row, 'z_angle_max', text="Z, max")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "z_angle_max"
+
+                row.prop(bone_prior_ui_row, 'z_angle_min', text="Z, min")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "z_angle_min"
+
+                row.prop(bone_prior_ui_row, 'y_angle_max', text="Y, max")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "y_angle_max"
+
+                row.prop(bone_prior_ui_row, 'y_angle_min', text="Y, min")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "y_angle_min"
+
+                row.prop(bone_prior_ui_row, 'x_angle_max', text="X, max")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "x_angle_max"
+
+                row.prop(bone_prior_ui_row, 'x_angle_min', text="X, min")
+                op = row.operator("synth.set_bone_prior_from_pose", text="set")
+                op.bone_name = bone_name
+                op.field_name = "x_angle_min"
 
         box = layout.box()
         box.label(text="Behaviour")
@@ -2595,6 +2869,8 @@ class SYNTH_OT_unregister_timed_render(Operator):
 
 classes = (
     SYNTH_BoneGroupItem,
+    SYNTH_CameraSelectionItem,
+    SYNTH_BonePriorItem,
     SYNTH_PropertyGroup,
     SYNTH_OT_apply_settings,
     SYNTH_OT_load_config,
@@ -2603,6 +2879,8 @@ classes = (
     SYNTH_UL_bone_groups,
     SYNTH_OT_bone_group_add,
     SYNTH_OT_bone_group_remove,
+    SYNTH_OT_refresh_bone_priors_ui_item_collection,
+    SYNTH_OT_set_bone_prior_from_pose,
     SYNTH_OT_unregister_timed_render,
     TimedRender,
     SYNTH_OT_export_camera_matrices,
@@ -2618,6 +2896,15 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.synth_props = PointerProperty(type=SYNTH_PropertyGroup)
+    for scene in bpy.data.scenes:
+        try:
+            sync_camera_selections(scene)
+        except Exception:
+            pass
+        try:
+            sync_bone_priors_ui_item_collection(scene)
+        except Exception:
+            pass
 
 
 def unregister():

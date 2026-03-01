@@ -19,6 +19,13 @@ pip install ultralytics
 # 5) install remaining required python packages
 pip install tqdm torchmetrics
 ```
+Then, download and decompress [Blender 4.5](/https://www.blender.org/download/lts/).
+Run the following commands in the Blender terminal:
+```
+>>> import pip
+>>> pip.main(['install','opencv-python'])
+```
+If `pip` is missing, see this [stackoverflow question](/https://blender.stackexchange.com/questions/56011/how-to-install-pip-for-blenders-bundled-python-and-use-it-to-install-packages]).
 
 ## Usage
 Activate the environment, navigate to the dir `free_fish_et` and run `python DSKv2_demo.py --gui`.
