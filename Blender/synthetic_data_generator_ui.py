@@ -718,6 +718,28 @@ def get_mesh_json(context):
     
     v2k = [list(keypoint) for keypoint in v2k]
 
+    # -- priors
+    # set default to "no restriction" (+/- 180) for every bone, including virtual bones
+    bone_name_2_prior = {
+        name: {
+            "z_angle_max": 180.0,
+            "z_angle_min": -180.0,
+            "y_angle_max": 180.0,
+            "y_angle_min": -180.0,
+            "x_angle_max": 180.0,
+            "x_angle_min": -180.0,
+        } for name in bone_names_ordered
+    }
+    if len(p.bone_priors_ui_item_collection) != len(bone_name_2_prior)-len(virtual_bone_names):
+        raise ValueError("Bone priors UI collection length does not match number of physical bones. This likely means that the UI collection is not properly synced with the armature bones.")
+    for bone_prior_ui_item in p.bone_priors_ui_item_collection:
+        if bone_prior_ui_item.bone_name not in bone_name_2_index:
+            raise ValueError(f"Bone prior item has unknown bone name '{bone_prior_ui_item.bone_name}'") 
+        for angle_prior_name in ["z_angle_max", "z_angle_min", "y_angle_max", "y_angle_min", "x_angle_max", "x_angle_min"]:
+            if not hasattr(bone_prior_ui_item, angle_prior_name):
+                raise ValueError(f"Bone prior item is missing expected attribute '{angle_prior_name}'")
+            bone_name_2_prior[bone_prior_ui_item.bone_name][angle_prior_name] = getattr(bone_prior_ui_item, angle_prior_name)
+
     out = {
         'V': verts,
         'F': faces,
@@ -739,6 +761,7 @@ def get_mesh_json(context):
         },                                       # a tree-dict of parents, children and joint indices of bones
         'virtual_bone_names': virtual_bone_names, # for identifying virtual bones
         'bone_groups': bone_groups_out,
+        'bone_priors': bone_name_2_prior,
     }
 
     return out
@@ -1641,6 +1664,18 @@ class SYNTH_OT_apply_settings(Operator):
             }
             for item in p.bone_groups
         ]
+        bone_priors_cfg = [
+            {
+                "bone_name": item.bone_name,
+                "z_angle_max": float(item.z_angle_max),
+                "z_angle_min": float(item.z_angle_min),
+                "y_angle_max": float(item.y_angle_max),
+                "y_angle_min": float(item.y_angle_min),
+                "x_angle_max": float(item.x_angle_max),
+                "x_angle_min": float(item.x_angle_min),
+            }
+            for item in p.bone_priors_ui_item_collection
+        ]
 
         cfg = {
             'RENDER_OUT_DIR_BL': p.render_out_dir,
@@ -1662,6 +1697,7 @@ class SYNTH_OT_apply_settings(Operator):
             'draw_lattice_for_kpt_annot': p.draw_lattice_for_kpt_annot,
             'create_yolo_datasets': p.create_yolo_datasets,
             'BONE_GROUPS': bone_groups_cfg,
+            'BONE_PRIORS': bone_priors_cfg,
         }
         try:
             cfg_path = os.path.join(resolve(p.annot_out_dir), 'synth_config.json')
@@ -1808,6 +1844,21 @@ class SYNTH_OT_load_config(Operator):
                 p.bone_groups_index = min(max(len(p.bone_groups) - 1, 0), len(p.bone_groups) - 1) if p.bone_groups else -1
             except Exception as e:
                 self.report({'WARNING'}, f"Could not load bone groups: {e}")
+
+        # Load Bone Priors (if any)
+        if 'BONE_PRIORS' in cfg and isinstance(cfg['BONE_PRIORS'], list):
+            try:
+                prior_by_bone_name = {item.bone_name: item for item in p.bone_priors_ui_item_collection}
+                for item in cfg['BONE_PRIORS']:
+                    bone_name = item.get('bone_name', '')
+                    if bone_name not in prior_by_bone_name:
+                        continue
+                    slot = prior_by_bone_name[bone_name]
+                    for key in ("z_angle_max", "z_angle_min", "y_angle_max", "y_angle_min", "x_angle_max", "x_angle_min"):
+                        if key in item:
+                            setattr(slot, key, float(item[key]))
+            except Exception as e:
+                self.report({'WARNING'}, f"Could not load bone priors: {e}")
 
 
         self.report({'INFO'}, f"Loaded config from {path}")
