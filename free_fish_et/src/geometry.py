@@ -11,12 +11,13 @@ https://github.com/marcbadger/avian-mesh
 
 import torch
 
-def batch_rodrigues(theta, dtype=torch.float32):
+def batch_rodrigues(theta, dtype=torch.float32, to_quats=False, to_rotmats=True):
     """Convert axis-angle representation to rotation matrix.
     Args:
         theta: size = [B, 3]
     Returns:
         Rotation matrix corresponding to the quaternion -- size = [B, 3, 3]
+        or   Quaternion corresponding to the axis-angle -- size = [B, 4] (w, x, y, z)
     """
 
     l1norm = torch.norm(theta + 1e-8, p = 2, dim = 1)
@@ -26,7 +27,13 @@ def batch_rodrigues(theta, dtype=torch.float32):
     v_cos = torch.cos(angle)
     v_sin = torch.sin(angle)
     quat = torch.cat([v_cos, v_sin * normalized], dim = 1)
-    return quat_to_rotmat(quat).float()
+    if to_quats and to_rotmats:
+        return quat_to_rotmat(quat).float(), quat.float()    
+    elif to_quats:
+        return quat.float()
+    elif to_rotmats:
+        return quat_to_rotmat(quat).float()
+    return quat_to_rotmat(quat).float(), quat.float()
 
 def quat_to_rotmat(quat):
     """Convert quaternion coefficients to rotation matrix.

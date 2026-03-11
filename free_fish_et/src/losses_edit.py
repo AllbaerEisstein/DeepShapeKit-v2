@@ -50,6 +50,9 @@ def keypoint_reprojection_loss_global(
     # -> views contribute equally
     return total_loss.sum() 
 
+def decompose_to_swing_twist(quats):
+    # quats: (BS, bn, 4) (w, x, y, z)
+    singular_quats_mask = quats[:, :, 0].abs() < 1e-6 and quats[:, :, 2].abs() < 1e-6 # if w and y are close to 0, we have a singularity in the swing-twist decomposition (twist axis is not well defined)
 
 def kpt_repr_plus_bone_pose_and_length_loss(
     model_keypoints: torch.Tensor,
@@ -61,6 +64,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
     body_pose: torch.Tensor,
+    joints_ori_parent_space: torch.Tensor,
     bone_length: torch.Tensor,
     sigma=50,
     angle_constraint_weight: float = 1.0,

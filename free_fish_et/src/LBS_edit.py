@@ -26,6 +26,15 @@ class LBS():
             J (BN, JN, 3): joint positions in local space for BN batches. JN should be the total joint number, so n_bones+1 (there is one more joint (head) than bones)
             parents (JN): list of indices of the parent of every joint (e.g. [-1,0,1,2,3,4]) for 6 joints
             weights (n_vertices, n_bones): 
+
+            !! 
+            Attention: The twist axes of the bones are defined by the rest position of the template joints. 
+            In mesh local space, the twist axis is always the vector from the parent joint to the child joint.
+                So, the first body bone's twist axis is defined by the vector from the head joint to the first body joint in the rest pose.
+                When creating the fish model in fish_model.py, the mesh local space y-axis is set to be the head-to-first-body-joint direction
+                in the rest pose in order to have a priori defined twist axes for the bones and in order to adhere with Blender's twist axis 
+                convention (twist axis is the y-axis).
+            !!
         """
         self.J = J
         # the head joint is just the origin of the mesh. it is excluded
@@ -56,9 +65,10 @@ class LBS():
         # parent (head joint) that needs to be scaled.
         body_joint_locs_rel_to_parents = (scale * self.body_joint_locs_rel_to_parents) * all_bone_length[:, :, None, None]
 
-        if to_rotmats:
-            global_ori_plus_body_pose = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3)) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to triplet format ([[[a,b,c],[a1,b1,c1],...]])
+        global_ori_plus_body_pose, global_ori_plus_body_pose_quats = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3), to_rotmats=True, to_quats=True) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to triplet format ([[[a,b,c],[a1,b1,c1],...]])
         global_ori_plus_body_pose = global_ori_plus_body_pose.view([batch_size, -1, 3, 3])
+        # also return the quaternions of the body pose for bone angle prior checking
+        body_pose_rel_to_parents_quats = global_ori_plus_body_pose_quats.view([batch_size, -1, 4])[:, 1:, :] # exclude global ori
 
         T_for_joints_rel_to_parent = torch.zeros([batch_size, self.n_body_joints, 4, 4]).float().to(device) # 4x4 all-0 matrices for every joint (excluding head joint)
         T_for_joints_rel_to_parent[:, :, -1, -1] = 1 # last-row last-column entry (bottom right) is 1 (homogeneous transform)
@@ -109,4 +119,5 @@ class LBS():
         R[:, :, -1, -1] = 1
         V_homog = R @ V_homog
 
-        return V_homog[:, :, :3, 0] / V_homog[:, :, [3], 0]
+        # return vertices in local space (relative to head joint) and the transformations of joints relative to their parent (for bone angle prior checking)
+        return V_homog[:, :, :3, 0] / V_homog[:, :, [3], 0], body_pose_rel_to_parents_quats
