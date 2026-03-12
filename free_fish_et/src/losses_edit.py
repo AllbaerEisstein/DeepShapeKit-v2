@@ -51,8 +51,33 @@ def keypoint_reprojection_loss_global(
     return total_loss.sum() 
 
 def decompose_to_swing_twist(quats):
-    # quats: (BS, bn, 4) (w, x, y, z)
-    singular_quats_mask = quats[:, :, 0].abs() < 1e-6 and quats[:, :, 2].abs() < 1e-6 # if w and y are close to 0, we have a singularity in the swing-twist decomposition (twist axis is not well defined)
+    """
+    Args:
+        quats: (BS, bn, 4) (w, x, y, z); y is the twist axis
+    Returns:
+        swing_twist: (BS, bn, 3) (swing_x, twist_y, swing_z)
+    """
+    device = quats.device
+    singular_quats_mask = (quats[:, :, 0].abs() < 1e-6 and quats[:, :, 2].abs() < 1e-6).to(device) # if w and y are close to 0, we have a singularity in the swing-twist decomposition (twist axis is not well defined)
+    twists = torch.zeros(quats.shape[0], quats.shape[1], 1, device=device) # (BS, bn, 1)
+    twists[~singular_quats_mask] = 2*torch.atan2(quats[~singular_quats_mask][:, :, 2], quats[~singular_quats_mask][:, :, 0]).unsqueeze(-1) # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
+    
+    beta = torch.atan2(torch.sqrt(quats[:, :, 1]**2 + quats[:, :, 3]**2), torch.sqrt(quats[:, :, 2]**2 + quats[:, :, 0]**2))
+    gamma = twists[:, :, 0] / 2
+    
+    mtx = torch.stack([
+        torch.stack([torch.cos(gamma), -torch.sin(gamma)], dim=-1),
+        torch.stack([torch.sin(gamma), torch.cos(gamma)], dim=-1)
+    ], dim=-2)
+
+    def sinc(x):
+        return torch.where(x.abs() < 1e-6, torch.ones_like(x), torch.sin(x) / x)
+    
+    swing_x_swing_z = (2/sinc(beta)).unsqueeze(-1).unsqueeze(-1) * mtx @ quats[:,:, [1, 3]].unsqueeze(-1) # (BS, bn, 2, 1)
+    swing_x = swing_x_swing_z[:, :, 0, 0]
+    swing_z = swing_x_swing_z[:, :, 1, 0]
+    return torch.stack([swing_x, twists[:, :, 0], swing_z], dim=-1) # (BS, bn, 3) swing_x, twist_y, swing_z
+
 
 def kpt_repr_plus_bone_pose_and_length_loss(
     model_keypoints: torch.Tensor,
@@ -64,7 +89,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
     body_pose: torch.Tensor,
-    joints_ori_parent_space: torch.Tensor,
+    body_bone_ori_rest_head_spaces: torch.Tensor,
     bone_length: torch.Tensor,
     sigma=50,
     angle_constraint_weight: float = 1.0,
@@ -82,11 +107,12 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1)
 
     # Joint angle limit loss
+    swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces).view(body_pose.shape) # (BS, bn, 3)
     angle_max_lim = bone_angle_max.repeat(1, 1).to(device)
     angle_min_lim = bone_angle_min.repeat(1, 1).to(device)
     # Add a loss if the angle is lower than min or higher than max
-    lim_loss =   (body_pose - angle_max_lim).clamp(0, float("Inf")) \
-               + (angle_min_lim - body_pose).clamp(0, float("Inf"))
+    lim_loss =   (swing_twist - angle_max_lim).clamp(0, float("Inf")) \
+               + (angle_min_lim - swing_twist).clamp(0, float("Inf"))
     lim_loss = angle_constraint_weight * lim_loss
 
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)

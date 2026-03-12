@@ -497,7 +497,7 @@ def get_mesh_json(context):
     def tail_pos(b): return b.tail_local.copy()
 
     # BFS traversal to preserve topology order
-    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot_world': []} for b in bone_list} # very inefficient way to store a tree
+    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot': []} for b in bone_list} # very inefficient way to store a tree
     ordered_bones = []
     queue = roots[:]
     while queue:
@@ -505,8 +505,9 @@ def get_mesh_json(context):
         ordered_bones.append(b)
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
         bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
-        rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
-        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
+        #rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
+        #bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
+        bone_names_tree[b.name]['rest_rot'] = b.matrix_local.to_3x3()  # 3x3 rotation matrix
         for ch in b.children:
             queue.append(ch)
             bone_names_tree[b.name]['c'].append(ch.name)
@@ -755,11 +756,12 @@ def get_mesh_json(context):
                 'p': data['p'],
                 'c': data['c'],
                 'joints': data['joints_idx'],
-                'rest_rot_world': [[float(c) for c in row] for row in data['rest_rot_world']]
+                'rest_rot': [[float(c) for c in row] for row in data['rest_rot']]
             }
             for bone_name, data in bone_names_tree.items()
         },                                       # a tree-dict of parents, children and joint indices of bones
         'virtual_bone_names': virtual_bone_names, # for identifying virtual bones
+        'virtual_bone_mask': [1 if name in virtual_bone_names else 0 for name in bone_names_ordered], # 1 for virtual bones, 0 for physical bones
         'bone_groups': bone_groups_out,
         'bone_priors': bone_name_2_prior,
     }

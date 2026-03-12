@@ -245,6 +245,7 @@ class OptimizeMV:
                 kpts_2d,
                 kpts_conf,
                 recombined_body_pose.flatten(1),
+                out["body_bone_poses_rest_bone_spaces"].to(self.device),
                 recombined_body_bone_length,
                 angle_constraint_weight=self.angle_constraint_weight,
                 smooth_weight=self.smooth_weight,
