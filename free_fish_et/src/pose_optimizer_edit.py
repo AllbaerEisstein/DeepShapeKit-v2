@@ -237,8 +237,7 @@ class OptimizeMV:
             m_kpts = m_kpts.expand(batch_size, -1, -1)
             loss = kpt_repr_plus_bone_pose_and_length_loss(
                 m_kpts,
-                self.fish.bone_angle_min,
-                self.fish.bone_angle_max,
+                self.fish.bone_angle_priors,
                 self.fish.bone_length_min,
                 self.fish.bone_length_max,
                 proj_m_from_blworld,
@@ -337,7 +336,7 @@ class OptimizeMV:
                     m_kpts = m_kpts.expand(batch_size, -1, -1)
                     loss = kpt_repr_plus_bone_pose_and_length_loss(
                         m_kpts,
-                        self.fish.bone_angle_min,
+                        self.fish.bone_angle_priors,
                         self.fish.bone_angle_max,
                         self.fish.bone_length_min,
                         self.fish.bone_length_max,

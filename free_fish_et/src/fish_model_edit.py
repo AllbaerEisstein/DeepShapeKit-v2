@@ -142,27 +142,21 @@ class fish_model:
 
         # Body_pose angle limit (import priors from fish template json)
         # angle limits are specified for each component in an exponential map (axis-angle where angle is specified as the length of the axis vector)
-        self.bone_angle_min = []
-        self.bone_angle_max = []
+        self.bone_angle_priors = []
         for bname in dd["bone_order"]:
             if bname not in dd["bone_priors"]:
                 raise ValueError(f"Bone {bname} does not have a corresponding prior in the json file. Please make sure that all bones have priors specified.")
             prior = dd["bone_priors"][bname]
-            self.bone_angle_min.extend(prior["x_angle_min"])
-            self.bone_angle_max.extend(prior["x_angle_max"])
-            self.bone_angle_min.extend(prior["y_angle_min"])
-            self.bone_angle_max.extend(prior["y_angle_max"])
-            self.bone_angle_min.extend(prior["z_angle_min"])
-            self.bone_angle_max.extend(prior["z_angle_max"])
-        self.bone_angle_min = torch.tensor(self.bone_angle_min)
-        self.bone_angle_max = torch.tensor(self.bone_angle_max)
+            self.bone_angle_priors.extend(prior["swing_x"])
+            self.bone_angle_priors.extend(prior["twist_y"])
+            self.bone_angle_priors.extend(prior["swing_z"])
+        self.bone_angle_priors = torch.tensor(self.bone_angle_priors).view(-1, 3) # (1, nb, 3) in exponential map representation (swing_x, twist_y, swing_z)
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
         self.bone_length_max = [1.5] * (self.n_body_bones)
 
-        self.bone_angle_max = torch.tensor(self.bone_angle_max)
-        self.bone_angle_min = torch.tensor(self.bone_angle_min)
+        self.bone_angle_priors = torch.tensor(self.bone_angle_priors)
         self.bone_length_min = torch.tensor(self.bone_length_min)
         self.bone_length_max = torch.tensor(self.bone_length_max)
 
@@ -181,8 +175,7 @@ class fish_model:
         self.vert2kpt = self.vert2kpt.to(self.device)
         self.J = self.J.to(self.device)
         self.V = self.V.to(self.device)
-        self.bone_angle_min = self.bone_angle_min.to(self.device)
-        self.bone_angle_max = self.bone_angle_max.to(self.device)
+        self.bone_angle_priors = self.bone_angle_priors.to(self.device)
         self.bone_length_min = self.bone_length_min.to(self.device)
         self.bone_length_max = self.bone_length_max.to(self.device)
         self.virtual_bone_mask = self.virtual_bone_mask.to(self.device)

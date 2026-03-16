@@ -36,6 +36,13 @@ import numpy as np
 # cache for camera matrices (per-camera)
 cam_name_2_matrix = {}
 
+# cache for priors UI convenience toggle
+armature_pose_toggle_cache = {
+    "is_rest_mode": False,
+    "armature_name": None,
+    "bone_mats": {},
+}
+
 # conversion matrices between conventions
 BLENDER_CAM_2_CV_CAM = Matrix((
     (1, 0, 0),
@@ -78,12 +85,9 @@ class SYNTH_BonePriorItem(PropertyGroup):
         name="Bone Name",
         default=""
     )
-    z_angle_max: FloatProperty(name="Z Max", default=180.0)
-    z_angle_min: FloatProperty(name="Z Min", default=-180.0)
-    y_angle_max: FloatProperty(name="Y Max", default=180.0)
-    y_angle_min: FloatProperty(name="Y Min", default=-180.0)
-    x_angle_max: FloatProperty(name="X Max", default=180.0)
-    x_angle_min: FloatProperty(name="X Min", default=-180.0)
+    swing_x: FloatProperty(name="Swing X", default=180.0)
+    twist_y: FloatProperty(name="Twist Y", default=360.0)
+    swing_z: FloatProperty(name="Swing Z", default=180.0)
 
 class SYNTH_PropertyGroup(PropertyGroup):
     # Paths
@@ -161,6 +165,10 @@ class SYNTH_PropertyGroup(PropertyGroup):
     bone_groups_index: IntProperty(default=-1)
     camera_selections: CollectionProperty(type=SYNTH_CameraSelectionItem)
     bone_priors_ui_item_collection: CollectionProperty(type=SYNTH_BonePriorItem)
+    show_priors_explanation: BoolProperty(
+        name="Show/Hide Explanation",
+        default=False
+    )
 
     # Timers and rendering behaviour
     event_timer_interval: FloatProperty(
@@ -720,26 +728,24 @@ def get_mesh_json(context):
     v2k = [list(keypoint) for keypoint in v2k]
 
     # -- priors
-    # set default to "no restriction" (+/- 180) for every bone, including virtual bones
+    # set default to "no restriction" (180 Swing; 360 Twist) for every bone, including virtual bones
     bone_name_2_prior = {
         name: {
-            "z_angle_max": 180.0,
-            "z_angle_min": -180.0,
-            "y_angle_max": 180.0,
-            "y_angle_min": -180.0,
-            "x_angle_max": 180.0,
-            "x_angle_min": -180.0,
+            "swing_x": 3.14159,
+            "swing_z": 3.14159,
+            "twist_y": 2*3.14159,
         } for name in bone_names_ordered
     }
+
     if len(p.bone_priors_ui_item_collection) != len(bone_name_2_prior)-len(virtual_bone_names):
         raise ValueError("Bone priors UI collection length does not match number of physical bones. This likely means that the UI collection is not properly synced with the armature bones.")
     for bone_prior_ui_item in p.bone_priors_ui_item_collection:
         if bone_prior_ui_item.bone_name not in bone_name_2_index:
             raise ValueError(f"Bone prior item has unknown bone name '{bone_prior_ui_item.bone_name}'") 
-        for angle_prior_name in ["z_angle_max", "z_angle_min", "y_angle_max", "y_angle_min", "x_angle_max", "x_angle_min"]:
+        for angle_prior_name in ["swing_x", "swing_z", "twist_y"]:
             if not hasattr(bone_prior_ui_item, angle_prior_name):
                 raise ValueError(f"Bone prior item is missing expected attribute '{angle_prior_name}'")
-            bone_name_2_prior[bone_prior_ui_item.bone_name][angle_prior_name] = getattr(bone_prior_ui_item, angle_prior_name)
+            bone_name_2_prior[bone_prior_ui_item.bone_name][angle_prior_name] = getattr(bone_prior_ui_item, angle_prior_name) / 180.0 * 3.14159
 
     out = {
         'V': verts,
@@ -756,7 +762,8 @@ def get_mesh_json(context):
                 'p': data['p'],
                 'c': data['c'],
                 'joints': data['joints_idx'],
-                'rest_rot': [[float(c) for c in row] for row in data['rest_rot']]
+                'rest_rot': [[float(c) for c in row] for row in data['rest_rot']],
+                'priors': bone_name_2_prior[bone_name] if bone_name in bone_name_2_prior else None,
             }
             for bone_name, data in bone_names_tree.items()
         },                                       # a tree-dict of parents, children and joint indices of bones
@@ -1669,12 +1676,9 @@ class SYNTH_OT_apply_settings(Operator):
         bone_priors_cfg = [
             {
                 "bone_name": item.bone_name,
-                "z_angle_max": float(item.z_angle_max),
-                "z_angle_min": float(item.z_angle_min),
-                "y_angle_max": float(item.y_angle_max),
-                "y_angle_min": float(item.y_angle_min),
-                "x_angle_max": float(item.x_angle_max),
-                "x_angle_min": float(item.x_angle_min),
+                "swing_z": float(item.swing_z),
+                "twist_y": float(item.twist_y),
+                "swing_x": float(item.swing_x),
             }
             for item in p.bone_priors_ui_item_collection
         ]
@@ -1856,7 +1860,7 @@ class SYNTH_OT_load_config(Operator):
                     if bone_name not in prior_by_bone_name:
                         continue
                     slot = prior_by_bone_name[bone_name]
-                    for key in ("z_angle_max", "z_angle_min", "y_angle_max", "y_angle_min", "x_angle_max", "x_angle_min"):
+                    for key in ("swing_z", "twist_y", "swing_x"):
                         if key in item:
                             setattr(slot, key, float(item[key]))
             except Exception as e:
@@ -1988,11 +1992,84 @@ class SYNTH_OT_refresh_bone_priors_ui_item_collection(Operator):
         return {'FINISHED'}
 
 
+class SYNTH_OT_toggle_rest_pose_articulated_pose(Operator):
+    bl_idname = "synth.toggle_rest_pose_articulated_pose"
+    bl_label = "Toggle Rest Pose / Articulated Pose"
+    bl_description = "Toggle target armature between rest pose and cached articulated pose"
+
+    def execute(self, context):
+        scene = context.scene
+        arm_obj = find_target_armature(scene)
+        if arm_obj is None:
+            self.report({'ERROR'}, "No armature found on selected object.")
+            return {'CANCELLED'}
+
+        global armature_pose_toggle_cache
+
+        # Enter rest-like pose: cache current articulated pose first
+        if not armature_pose_toggle_cache["is_rest_mode"]:
+            # Cache editable pose state from the ORIGINAL armature object
+            cached_basis_mats = {
+                pb.name: pb.matrix_basis.copy()
+                for pb in arm_obj.pose.bones
+            }
+
+            armature_pose_toggle_cache["is_rest_mode"] = True
+            armature_pose_toggle_cache["armature_name"] = arm_obj.name
+            armature_pose_toggle_cache["bone_mats"] = cached_basis_mats
+
+            # Reset pose input to identity relative to rest pose
+            for pb in arm_obj.pose.bones:
+                pb.matrix_basis = Matrix.Identity(4)
+
+            context.view_layer.update()
+
+            self.report(
+                {'INFO'},
+                f"Set armature '{arm_obj.name}' to rest pose and cached articulated pose."
+            )
+            return {'FINISHED'}
+
+        # Restore articulated pose from cache
+        if armature_pose_toggle_cache["armature_name"] != arm_obj.name:
+            self.report(
+                {'ERROR'},
+                "Cached articulated pose belongs to another armature. "
+                "Toggle back with the original armature selected."
+            )
+            return {'CANCELLED'}
+
+        cached_basis_mats = armature_pose_toggle_cache["bone_mats"]
+        if not cached_basis_mats:
+            self.report({'ERROR'}, "No cached articulated pose available to restore.")
+            return {'CANCELLED'}
+
+        for pb in arm_obj.pose.bones:
+            mat = cached_basis_mats.get(pb.name)
+            if mat is not None:
+                pb.matrix_basis = mat.copy()
+
+        context.view_layer.update()
+
+        armature_pose_toggle_cache["is_rest_mode"] = False
+        armature_pose_toggle_cache["armature_name"] = None
+        armature_pose_toggle_cache["bone_mats"] = {}
+
+        self.report(
+            {'INFO'},
+            f"Restored cached articulated pose for armature '{arm_obj.name}'."
+        )
+        return {'FINISHED'}
+
+
 class SYNTH_OT_set_bone_prior_from_pose(Operator):
     """
-    Button for setting an angle prior for either yaw, pitch, or roll angle of a single bone.
+    Button for setting an swing-twist prior for either swing_x, swing_z or twist angle of a single bone.
     Association between button and corresponding text input field is achieved via syncing 
     the two members bone_name and field_name to the corresponding members of the text field.
+    Attention:
+    1) The angle is computed from the current pose of the armature relative to the rest pose, so make sure the armature is in the desired pose before clicking the button.
+    2) The calculated angle is only accurate if the bone is rotated purely about the corresponding local axis (X for swing_x, Z for swing_z, Y for twist).
     """
     bl_idname = "synth.set_bone_prior_from_pose"
     bl_label = "set"
@@ -2000,7 +2077,7 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
 
     # these are set when instantiating the button
     bone_name: StringProperty(name="Bone Name", default="")
-    field_name: StringProperty(name="Field Name", default="") # z_angle_min, z_angle_max, y_angle_min, y_angle_max, x_angle_min, x_angle_max
+    field_name: StringProperty(name="Field Name", default="") # swing_x, swing_z, or twist_y
 
     def execute(self, context):
         scene = context.scene
@@ -2014,28 +2091,58 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
         deps = context.evaluated_depsgraph_get()
         deps.update()
         arm_eval = arm_obj.evaluated_get(deps)
+        arm_rest = arm_obj.data
         pb = arm_eval.pose.bones.get(self.bone_name)
-        if pb is None:
+        rb = arm_rest.bones.get(self.bone_name)
+        if pb is None or rb is None:
             self.report({'ERROR'}, f"Bone '{self.bone_name}' not found in armature '{arm_obj.name}'")
             return {'CANCELLED'}
 
-        if pb.parent is not None:
-            rel_mat = pb.parent.matrix.inverted() @ pb.matrix
+        if rb.parent is not None:
+            rest_mat = rb.parent.matrix.inverted() @ rb.matrix
+            pose_mat = pb.parent.matrix.inverted() @ pb.matrix
         else:
             # root bone fallback: use armature-space orientation
-            rel_mat = pb.matrix.copy()
+            rest_mat = rb.matrix
+            pose_mat = pb.matrix
+        rel_mat = rest_mat.inverted().to_3x3() @ pose_mat.to_3x3()
 
-        rel_euler = rel_mat.to_euler('XYZ')
-        axis_2_angle_deg = {
-            'x_angle': math.degrees(rel_euler.x),
-            'y_angle': math.degrees(rel_euler.y),
-            'z_angle': math.degrees(rel_euler.z),
+        # swing, twist = rel_mat.to_quaternion().to_swing_twist('Y')
+        # swing_axis_angle = swing.to_axis_angle()
+        # self.report({'INFO'}, f"Bone '{self.bone_name}' swing axis: ({swing_axis_angle[0][0]:.2f}, {swing_axis_angle[0][1]:.2f}, {swing_axis_angle[0][2]:.2f}), swing angle: {swing_axis_angle[1]/3.14159*180:.2f} deg, twist angle: {twist/3.14159*180:.2f} deg")
+        # swing_twist = {
+        #     'swing_x': swing_axis_angle[1]/3.14159*180 if abs(swing_axis_angle[0][0]) > 0.95 else 0, # only set swing_x if swing axis is mostly aligned with local X
+        #     'swing_z': swing_axis_angle[1]/3.14159*180 if abs(swing_axis_angle[0][2]) > 0.95 else 0, # only set swing_z if swing axis is mostly aligned with local Z
+        #     'twist_y': twist/3.14159*180
+        # }
+        euler_x = rel_mat.to_euler('XYZ')
+        euler_y = rel_mat.to_euler('YZX')
+        euler_z = rel_mat.to_euler('ZXY')
+        swing_twist = {
+            'swing_x': euler_x.x / 3.14159 * 180,
+            'swing_z': euler_z.z / 3.14159 * 180,
+            'twist_y': euler_y.y / 3.14159 * 180,
         }
+        self.report({'INFO'}, f"Bone '{self.bone_name}' {self.field_name}: x: {swing_twist['swing_x']:.2f} deg, z: {swing_twist['swing_z']:.2f} deg, y: {swing_twist['twist_y']:.2f} deg")
 
-        axis_name = self.field_name.split('_', 1)[0] + '_angle'
-        if axis_name not in axis_2_angle_deg:
-            self.report({'ERROR'}, f"Unsupported field '{self.field_name}'")
-            return {'CANCELLED'}
+        if self.field_name == "swing_x":
+            if np.isclose(swing_twist["swing_z"], 0) == False or np.isclose(swing_twist["twist_y"], 0) == False:
+                self.report({'ERROR'}, f"Bone '{self.bone_name}' has non-zero swing_z or twist_y, please rotate bone only about its local X axis for accurate swing_x prior")
+                return {'CANCELLED'}
+            if 170 < swing_twist["swing_x"] < 190:
+                self.report({'ERROR'}, f"Bone '{self.bone_name}' has a swing_x angle close to 180 degrees, which can be ambiguous for the swing-twist decomposition. Please rotate bone slightly away from 180 degrees for a more accurate swing_x prior")
+                return {'CANCELLED'}
+        if self.field_name == "swing_z":
+            if np.isclose(swing_twist["swing_x"], 0) == False or np.isclose(swing_twist["twist_y"], 0) == False:
+                self.report({'ERROR'}, f"Bone '{self.bone_name}' has non-zero swing_x or twist_y, please rotate bone only about its local Z axis for accurate swing_z prior")
+                return {'CANCELLED'}
+            if 170 < swing_twist["swing_z"] < 190:
+                self.report({'ERROR'}, f"Bone '{self.bone_name}' has a swing_z angle close to 180 degrees, which can be ambiguous for the swing-twist decomposition. Please rotate bone slightly away from 180 degrees for a more accurate swing_z prior")
+                return {'CANCELLED'}
+        if self.field_name == "twist_y":
+            if np.isclose(swing_twist["swing_x"], 0) == False or np.isclose(swing_twist["swing_z"], 0) == False:
+                self.report({'ERROR'}, f"Bone '{self.bone_name}' has non-zero swing_x or swing_z, please rotate bone only about its local Y axis for accurate twist_y prior")
+                return {'CANCELLED'}
 
         prior_ui_item = None
         # find corresponding set of text input fields for this button
@@ -2052,8 +2159,8 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
             return {'CANCELLED'}
 
         # set the text input field with the correct name to the calculated value
-        setattr(prior_ui_item, self.field_name, axis_2_angle_deg[axis_name])
-        self.report({'INFO'}, f"{self.field_name} of {prior_ui_item.bone_name} was set to {axis_2_angle_deg[axis_name]}")
+        setattr(prior_ui_item, self.field_name, swing_twist[self.field_name])
+        self.report({'INFO'}, f"{self.field_name} of {prior_ui_item.bone_name} was set to {swing_twist[self.field_name]:.2f} degrees based on current pose")
         return {'FINISHED'}
 
 
@@ -2061,7 +2168,7 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
 
 class SYNTH_OT_export_mesh(Operator):
     bl_idname = "synth.export_mesh"
-    bl_label = "Export Mesh"
+    bl_label = "Export Template Mesh JSON"
     bl_description = "Export mesh + armature weights & joints, and keypoints (all in local/model coordinates) to JSON"
 
     def execute(self, context):
@@ -2808,7 +2915,9 @@ class SYNTH_PT_main_panel(Panel):
         box = layout.box()
         header_row = box.row(align=True)
         header_row.label(text="Template Priors (degrees, relative to parent)")
-        header_row.operator("synth.refresh_bone_priors_ui_item_collection", icon='FILE_REFRESH', text="Refresh")
+        header_row.operator("synth.refresh_bone_priors_ui_item_collection", icon='FILE_REFRESH', text="Refresh bone list in GUI")
+        toggle_text = "Restore Articulated Pose" if armature_pose_toggle_cache["is_rest_mode"] else "Set Rest Pose"
+        header_row.operator("synth.toggle_rest_pose_articulated_pose", icon='ARMATURE_DATA', text=toggle_text)
 
         arm_obj, bone_names = get_target_armature_bone_names_sorted(scene)
         prior_ui_item_by_bone_name = {item.bone_name: item for item in p.bone_priors_ui_item_collection}
@@ -2817,16 +2926,39 @@ class SYNTH_PT_main_panel(Panel):
         elif not bone_names:
             box.label(text="No bones found on armature.", icon='ERROR')
         else:
+            if armature_pose_toggle_cache["is_rest_mode"]:
+                box.label(text="Rest pose mode active. Press toggle again to restore cached articulated pose.")
+            else:
+                box.label(text="Articulated pose mode active. Press toggle to cache the current pose and temporarily set the model to rest pose.")
+
+            box.label(text="")
+            explanation_row = box.row(align=False)
+            explanation_icon = 'TRIA_DOWN' if p.show_priors_explanation else 'TRIA_RIGHT'
+            explanation_row.prop(p, 'show_priors_explanation', text="Show/Hide Explanation", icon=explanation_icon, emboss=False)
+            if p.show_priors_explanation:
+                box.label(text="Explanation: Three values are required to set a bone prior: swing about local X, swing about local Z, and twist about local Y. The GUI allows you to set these values based on the current pose. For each bone, click the 'set' button next to a prior to set that prior to the angle of the current pose about the corresponding axis.", icon='INFO')
+                box.label(text="Note: the angles shown in the GUI are in degrees relative to the rest pose. (They will be converted to radians when exporting the template.)")
+                box.label(text="Attention: For setting a prior for a certain axis:", icon='INFO')
+                box.label(text="1) Set the model to rest pose via the toggle button (see above).")
+                box.label(text="2) Go to pose mode and select the bone in question.")
+                box.label(text="3) press 'R' and then press the name of the axis ('X', 'Y', or 'Z') *twice* in order to rotate about the bones local axis.")
+                box.label(text="4) Do not rotate about any other axis.")
+                box.label(text="4.5) Click the 'set' button next to the prior you want to set for that bone. (You can also type the angle manually without changing any bone pose. No need to press \"set\" then.)")
+                box.label(text="5) Repeat for the other axes.")
+                box.label(text="6) Restore the articulated pose by pressing the toggle button.")
+                box.label(text="")
             box.label(text="Angle about bone local...")
             row = box.row(align=True)
-            for angle_prior_name in ['', 'Z, max', 'Z, min', 'Y, max', 'Y, min', 'X, max', 'X, min']:
+            for angle_prior_name in ['', 'X', 'Z', 'Y']:
                 row.label(text=angle_prior_name)
 
-            box.label(text="Looking down a bone (with 0 roll!) from tail to head, this means...")
+            box.label(text="Which will be assigned to be the maximum of...")
             row = box.row(align=True)
-            for angle_prior_description in ['', 'up', 'down', 'roll, cw', 'roll, ccw', 'left', 'right']:
+            for angle_prior_description in ['', 'Swing X', 'Swing Z', 'Twist Y']:
                 row.label(text=angle_prior_description)
-
+            row = box.row(align=True)
+            for angle_prior_max_info in ['Maximum:', '180', '180', '360']:
+                row.label(text=angle_prior_max_info)
             for bone_name in bone_names:
                 # get corresponding ui item
                 bone_prior_ui_row = prior_ui_item_by_bone_name.get(bone_name)
@@ -2844,35 +2976,20 @@ class SYNTH_PT_main_panel(Panel):
                 #   data (AnyType, (never None)) – Data from which to take property
                 #   property (string, (never None)) – Identifier of property in data
                 #   text (string, (optional)) – Override automatic text of the item
-                row.prop(bone_prior_ui_row, 'z_angle_max', text="Z, max")
+                row.prop(bone_prior_ui_row, 'swing_x', text="Swing X")
                 op = row.operator("synth.set_bone_prior_from_pose", text="set")
                 op.bone_name = bone_name
-                op.field_name = "z_angle_max"
+                op.field_name = "swing_x"
 
-                row.prop(bone_prior_ui_row, 'z_angle_min', text="Z, min")
+                row.prop(bone_prior_ui_row, 'swing_z', text="Swing Z")
                 op = row.operator("synth.set_bone_prior_from_pose", text="set")
                 op.bone_name = bone_name
-                op.field_name = "z_angle_min"
+                op.field_name = "swing_z"
 
-                row.prop(bone_prior_ui_row, 'y_angle_max', text="Y, max")
+                row.prop(bone_prior_ui_row, 'twist_y', text="Twist Y")
                 op = row.operator("synth.set_bone_prior_from_pose", text="set")
                 op.bone_name = bone_name
-                op.field_name = "y_angle_max"
-
-                row.prop(bone_prior_ui_row, 'y_angle_min', text="Y, min")
-                op = row.operator("synth.set_bone_prior_from_pose", text="set")
-                op.bone_name = bone_name
-                op.field_name = "y_angle_min"
-
-                row.prop(bone_prior_ui_row, 'x_angle_max', text="X, max")
-                op = row.operator("synth.set_bone_prior_from_pose", text="set")
-                op.bone_name = bone_name
-                op.field_name = "x_angle_max"
-
-                row.prop(bone_prior_ui_row, 'x_angle_min', text="X, min")
-                op = row.operator("synth.set_bone_prior_from_pose", text="set")
-                op.bone_name = bone_name
-                op.field_name = "x_angle_min"
+                op.field_name = "twist_y"
 
         box = layout.box()
         box.label(text="Behaviour")
@@ -2933,6 +3050,7 @@ classes = (
     SYNTH_OT_bone_group_add,
     SYNTH_OT_bone_group_remove,
     SYNTH_OT_refresh_bone_priors_ui_item_collection,
+    SYNTH_OT_toggle_rest_pose_articulated_pose,
     SYNTH_OT_set_bone_prior_from_pose,
     SYNTH_OT_unregister_timed_render,
     TimedRender,

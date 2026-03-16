@@ -81,8 +81,7 @@ def decompose_to_swing_twist(quats):
 
 def kpt_repr_plus_bone_pose_and_length_loss(
     model_keypoints: torch.Tensor,
-    bone_angle_min: torch.Tensor,
-    bone_angle_max: torch.Tensor,
+    bone_angle_priors: torch.Tensor,
     bone_length_min: torch.Tensor,
     bone_length_max: torch.Tensor,
     proj_m: torch.Tensor,
@@ -108,36 +107,40 @@ def kpt_repr_plus_bone_pose_and_length_loss(
 
     # Joint angle limit loss
     swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces).view(body_pose.shape) # (BS, bn, 3)
-    angle_max_lim = bone_angle_max.repeat(1, 1).to(device)
-    angle_min_lim = bone_angle_min.repeat(1, 1).to(device)
-    # Add a loss if the angle is lower than min or higher than max
-    lim_loss =   (swing_twist - angle_max_lim).clamp(0, float("Inf")) \
-               + (angle_min_lim - swing_twist).clamp(0, float("Inf"))
-    lim_loss = angle_constraint_weight * lim_loss
+    bone_angle_priors_batch = bone_angle_priors.repeat(body_pose.shape[0], 1, 1).to(device) # (BS, bn, 3) repeat priors for each batch element
+    # Add a loss according to the amount of violation of the angle limits
+    # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
+    twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp(0, float("Inf")))**2 # (BS, bn)
+    # this function checks if the swing_x,swing_z is within an ellipse of bone_angle_priors_batch[:, :, 0] and bone_angle_priors_batch[:, :, 2] as the radii. 
+    # If outside, it adds a loss proportional to the squared distance outside the ellipse (in angle space, not cartesian!!).
+    swing_loss = ((swing_twist[:, :, 0]/bone_angle_priors_batch[:, :, 0])**2 + (swing_twist[:, :, 2]/bone_angle_priors_batch[:, :, 2])**2) - 1 # (BS,bn)
+    swing_loss = swing_loss.clamp(0, float("Inf")) # only penalize if outside the ellipse
+    bone_angle_prior_loss = angle_constraint_weight * (swing_loss + twist_loss).sum(dim=-1) # sum swing and twist loss, then sum over bones -> (BS,)
 
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
     if pose_init == None or bone_init == None:
-        prior_loss = body_pose.abs()
-        prior_loss = smooth_weight * prior_loss
+        init_prior_loss = body_pose.abs()
+        init_prior_loss = smooth_weight * init_prior_loss
     else:
-        prior_loss = (body_pose - pose_init).abs().sum() + (
+        init_prior_loss = (body_pose - pose_init).abs().sum() + (
             bone_length - bone_init
         ).abs().sum()
-        prior_loss = smooth_weight * prior_loss
+        init_prior_loss = smooth_weight * init_prior_loss
 
     # Bone Length Limit Loss
     max_bone = bone_length_max.repeat(1, 1).to(device)
     min_bone = bone_length_min.repeat(1, 1).to(device)
     # Add a loss if the length is lower than min or higher than max
-    bone_loss =   (bone_length - max_bone).clamp(0, float("Inf")) \
+    bone_length_prior_loss =   (bone_length - max_bone).clamp(0, float("Inf")) \
                 + (min_bone - bone_length).clamp(0, float("Inf"))
-    bone_loss = bone_length_constraint_weight * bone_loss
+    bone_length_prior_loss = bone_length_constraint_weight * bone_length_prior_loss
 
+    # sum over batches (views)
     total_loss = (
         reprojection_loss.sum(dim=-1)
-        + lim_loss.sum()
-        + prior_loss.sum()
-        + bone_loss.sum()
+        + bone_angle_prior_loss.sum()
+        + init_prior_loss.sum()
+        + bone_length_prior_loss.sum()
     )
 
     return total_loss.sum()
