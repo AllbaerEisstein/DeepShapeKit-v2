@@ -50,33 +50,61 @@ def keypoint_reprojection_loss_global(
     # -> views contribute equally
     return total_loss.sum() 
 
+
 def decompose_to_swing_twist(quats):
     """
     Args:
-        quats: (BS, bn, 4) (w, x, y, z); y is the twist axis
+        quats: (BS, bn, 4) quaternion order (w, x, y, z); y is the twist axis
     Returns:
-        swing_twist: (BS, bn, 3) (swing_x, twist_y, swing_z)
+        swing_twist: (BS, bn, 3) = (swing_x, twist_y, swing_z)
     """
-    device = quats.device
-    singular_quats_mask = (quats[:, :, 0].abs() < 1e-6 and quats[:, :, 2].abs() < 1e-6).to(device) # if w and y are close to 0, we have a singularity in the swing-twist decomposition (twist axis is not well defined)
-    twists = torch.zeros(quats.shape[0], quats.shape[1], 1, device=device) # (BS, bn, 1)
-    twists[~singular_quats_mask] = 2*torch.atan2(quats[~singular_quats_mask][:, :, 2], quats[~singular_quats_mask][:, :, 0]).unsqueeze(-1) # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
-    
-    beta = torch.atan2(torch.sqrt(quats[:, :, 1]**2 + quats[:, :, 3]**2), torch.sqrt(quats[:, :, 2]**2 + quats[:, :, 0]**2))
-    gamma = twists[:, :, 0] / 2
-    
+    # Extract quaternion components
+    w = quats[:, :, 0]  # (BS, bn)
+    x = quats[:, :, 1]  # (BS, bn)
+    y = quats[:, :, 2]  # (BS, bn)
+    z = quats[:, :, 3]  # (BS, bn)
+
+    # Singular when both w and y are ~0
+    singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
+
+    # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
+    twists = torch.where(
+        singular_quats_mask,
+        torch.zeros_like(w),
+        2 * torch.atan2(y, w)
+    )  # (BS, bn)
+
+    beta = torch.atan2(
+        torch.sqrt(x**2 + z**2),
+        torch.sqrt(y**2 + w**2)
+    )  # (BS, bn)
+
+    gamma = twists / 2  # (BS, bn)
+
+    # Rotation matrix of shape (BS, bn, 2, 2)
     mtx = torch.stack([
         torch.stack([torch.cos(gamma), -torch.sin(gamma)], dim=-1),
-        torch.stack([torch.sin(gamma), torch.cos(gamma)], dim=-1)
+        torch.stack([torch.sin(gamma),  torch.cos(gamma)], dim=-1)
     ], dim=-2)
 
     def sinc(x):
-        return torch.where(x.abs() < 1e-6, torch.ones_like(x), torch.sin(x) / x)
-    
-    swing_x_swing_z = (2/sinc(beta)).unsqueeze(-1).unsqueeze(-1) * mtx @ quats[:,:, [1, 3]].unsqueeze(-1) # (BS, bn, 2, 1)
-    swing_x = swing_x_swing_z[:, :, 0, 0]
-    swing_z = swing_x_swing_z[:, :, 1, 0]
-    return torch.stack([swing_x, twists[:, :, 0], swing_z], dim=-1) # (BS, bn, 3) swing_x, twist_y, swing_z
+        return torch.where(
+            x.abs() < 1e-6,
+            torch.ones_like(x),
+            torch.sin(x) / x
+        )
+
+    # shape: (BS, bn, 2, 1)
+    vec = quats[:, :, [1, 3]].unsqueeze(-1)
+
+    scale = (2 / sinc(beta)).unsqueeze(-1).unsqueeze(-1)  # (BS, bn, 1, 1)
+
+    swing_x_swing_z = scale * (mtx @ vec)  # (BS, bn, 2, 1)
+
+    swing_x = swing_x_swing_z[:, :, 0, 0]  # (BS, bn)
+    swing_z = swing_x_swing_z[:, :, 1, 0]  # (BS, bn)
+
+    return torch.stack([swing_x, twists, swing_z], dim=-1)  # (BS, bn, 3)
 
 
 def kpt_repr_plus_bone_pose_and_length_loss(
@@ -106,11 +134,14 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1)
 
     # Joint angle limit loss
-    swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces).view(body_pose.shape) # (BS, bn, 3)
-    bone_angle_priors_batch = bone_angle_priors.repeat(body_pose.shape[0], 1, 1).to(device) # (BS, bn, 3) repeat priors for each batch element
+    swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces) # (BS, bn, 3)
+    bone_angle_priors_batch = bone_angle_priors[:, 1:].repeat(body_pose.shape[0], 1, 1) # (BS, body_bones, 3) repeat priors for each batch element
+
     # Add a loss according to the amount of violation of the angle limits
+
     # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
     twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp(0, float("Inf")))**2 # (BS, bn)
+    
     # this function checks if the swing_x,swing_z is within an ellipse of bone_angle_priors_batch[:, :, 0] and bone_angle_priors_batch[:, :, 2] as the radii. 
     # If outside, it adds a loss proportional to the squared distance outside the ellipse (in angle space, not cartesian!!).
     swing_loss = ((swing_twist[:, :, 0]/bone_angle_priors_batch[:, :, 0])**2 + (swing_twist[:, :, 2]/bone_angle_priors_batch[:, :, 2])**2) - 1 # (BS,bn)

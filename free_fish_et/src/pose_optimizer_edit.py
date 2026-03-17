@@ -235,6 +235,13 @@ class OptimizeMV:
             )
             m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
+
+            bone_local_oris = out["body_bone_poses_rest_bone_spaces"].to(self.device)
+            bone_local_oris_bone_group = torch.where(
+                in_first_bone_group.unsqueeze(-1), 
+                bone_local_oris, 
+                torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4)
+            ) # (1, bn, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
             loss = kpt_repr_plus_bone_pose_and_length_loss(
                 m_kpts,
                 self.fish.bone_angle_priors,
@@ -244,7 +251,7 @@ class OptimizeMV:
                 kpts_2d,
                 kpts_conf,
                 recombined_body_pose.flatten(1),
-                out["body_bone_poses_rest_bone_spaces"].to(self.device),
+                bone_local_oris_bone_group,
                 recombined_body_bone_length,
                 angle_constraint_weight=self.angle_constraint_weight,
                 smooth_weight=self.smooth_weight,
@@ -334,16 +341,22 @@ class OptimizeMV:
                     )
                     m_kpts = out["keypoints"].to(self.device) + global_t
                     m_kpts = m_kpts.expand(batch_size, -1, -1)
+                    bone_local_oris = out["body_bone_poses_rest_bone_spaces"].to(self.device)
+                    bone_local_oris_bone_group = torch.where(
+                        in_bone_group.unsqueeze(-1), 
+                        bone_local_oris, 
+                        torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4)
+                    ) # (1, bn, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
                     loss = kpt_repr_plus_bone_pose_and_length_loss(
                         m_kpts,
                         self.fish.bone_angle_priors,
-                        self.fish.bone_angle_max,
                         self.fish.bone_length_min,
                         self.fish.bone_length_max,
                         proj_m_from_blworld,
                         kpts_2d,
                         kpts_conf,
                         recombined_body_pose.flatten(1),
+                        bone_local_oris_bone_group,
                         recombined_body_bone_length,
                         angle_constraint_weight=self.angle_constraint_weight,
                         smooth_weight=self.smooth_weight,

@@ -12,7 +12,7 @@ https://github.com/marcbadger/avian-mesh
 
 import os
 import json
-from free_fish_et.src.geometry import batch_rodrigues
+from src.geometry import batch_rodrigues
 import torch
 from .LBS_edit import LBS
 from pytorch3d.transforms import matrix_to_quaternion
@@ -84,7 +84,7 @@ class fish_model:
         self.weights = torch.tensor(dd["weights"])
         self.vert2kpt = torch.tensor(dd["vert2kpt"])
 
-        self.J = torch.tensor(dd["J"]).unsqueeze(0) # (1,J,3)
+        self.J = torch.tensor(dd["J"], dtype=torch.float32).unsqueeze(0) # (1,J,3)
         self.virtual_bone_mask = torch.tensor(dd["virtual_bone_mask"]) # (n_bones) binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1)
         # set the mesh local space positive y-axis to be the head-to-first-body-joint direction in the rest pose 
         # in order to have a priori defined twist axes for the bones and in order to adhere with Blender's 
@@ -92,24 +92,24 @@ class fish_model:
         # TODO: currently, we assume 0 twist in rest pose for each bone. The fish template json has a field rest_rot 
         # for each bone that we could use to read the rest pose twist angle but considering this would make the 
         # transformation of principal axes more complicated.
-        first_bone_twist_axis = self.J[0, 0, 1] - self.J[0, 0, 0]
+        first_bone_twist_axis = self.J[0, 1] - self.J[0, 0]
 
         def get_rot_matrix_for_y_axis_rotation(new_y_axis):
             """
             This function calculates the rotation matrix that rotates the positive y-axis to the new y-axis (bone twist axis).
             """
             # take care of the cases in that y-axis is parallel to the head-to-first-body-joint direction
-            if torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, -1, 0])).all():
-                rot_matrix_passive = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]])
-            elif not torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, 1, 0])).all():
-                rot_angle = torch.acos(torch.dot(new_y_axis, torch.tensor([0, 1, 0])) / torch.norm(new_y_axis))
-                rot_axis = torch.cross(new_y_axis, torch.tensor([0, 1, 0]))
+            if torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, -1, 0], dtype=torch.float32)).all():
+                rot_matrix_passive = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=torch.float32)
+            elif not torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, 1, 0], dtype=torch.float32)).all():
+                rot_angle = torch.acos(torch.dot(new_y_axis, torch.tensor([0, 1, 0], dtype=torch.float32)) / torch.norm(new_y_axis))
+                rot_axis = torch.linalg.cross(new_y_axis, torch.tensor([0, 1, 0], dtype=torch.float32))
                 rot_axis = rot_axis / torch.norm(rot_axis)
                 axis_angle = rot_axis * rot_angle
                 # convert axis-angle to rotation matrix using Rodrigues' formula
                 rot_matrix_passive = batch_rodrigues(axis_angle.unsqueeze(0), to_quats=False, to_rotmats=True)[0]
             else:
-                rot_matrix_passive = torch.eye(3)
+                rot_matrix_passive = torch.eye(3, dtype=torch.float32)
             # This is the rotation the y-axis has to undergo (passive rotation).
             # To express a point in the coordinate system with the new y-axis, 
             # we need to apply the inverse of this rotation (active rotation) to the point.
@@ -124,15 +124,15 @@ class fish_model:
         # apply the same rotation and translation to the vertices as we did to the joints in order to keep them in the same local space
         self.V = torch.matmul(self.V - translation, R_model_space_to_head_space)
 
-        body_bone_twist_axes_head_space = (self.J[:, 2:] - self.J[:, self.parent_indices[2:]]).unsqueeze(-1)
+        body_bone_twist_axes_head_space = (self.J[:, 2:] - self.J[:, self.parent_indices[2:]])
         # exclude the head bone since we treat head bone transformation as global transformation and do not calculate swing-twist for the head bone
-        self.rot_mats_to_body_bone_rest_local_spaces = [] 
+        rot_mats_to_body_bone_rest_local_spaces = [] 
         for i in range(self.n_body_bones): 
-            twist_axis = body_bone_twist_axes_head_space[:, i, :, :]
-            self.rot_mats_to_body_bone_rest_local_spaces.append(get_rot_matrix_for_y_axis_rotation(twist_axis).T)
+            twist_axis = body_bone_twist_axes_head_space[:, i]
+            rot_mats_to_body_bone_rest_local_spaces.append(get_rot_matrix_for_y_axis_rotation(twist_axis).T)
         # when calculating the swing-twist of each bone, we need to express each articulated bone tail 
         # in the local space of the rest bone head because the twist axis is required to be one of x,y, or z.
-        self.rot_mats_to_body_bone_rest_local_spaces = torch.stack(self.rot_mats_to_body_bone_rest_local_spaces, dim=0) # (n_body_bones, 3, 3)
+        self.rot_mats_to_body_bone_rest_local_spaces = torch.stack(rot_mats_to_body_bone_rest_local_spaces, dim=0) # (n_body_bones, 3, 3)
 
         # # scaling, unit conversion
         # self.V = self.V #* 0.01
@@ -142,21 +142,18 @@ class fish_model:
 
         # Body_pose angle limit (import priors from fish template json)
         # angle limits are specified for each component in an exponential map (axis-angle where angle is specified as the length of the axis vector)
-        self.bone_angle_priors = []
+        bone_angle_priors = []
         for bname in dd["bone_order"]:
             if bname not in dd["bone_priors"]:
                 raise ValueError(f"Bone {bname} does not have a corresponding prior in the json file. Please make sure that all bones have priors specified.")
             prior = dd["bone_priors"][bname]
-            self.bone_angle_priors.extend(prior["swing_x"])
-            self.bone_angle_priors.extend(prior["twist_y"])
-            self.bone_angle_priors.extend(prior["swing_z"])
-        self.bone_angle_priors = torch.tensor(self.bone_angle_priors).view(-1, 3) # (1, nb, 3) in exponential map representation (swing_x, twist_y, swing_z)
+            bone_angle_priors.extend([prior["swing_x"], prior["twist_y"], prior["swing_z"]])
+        self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, nb, 3) in exponential map representation (swing_x, twist_y, swing_z)
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
         self.bone_length_max = [1.5] * (self.n_body_bones)
 
-        self.bone_angle_priors = torch.tensor(self.bone_angle_priors)
         self.bone_length_min = torch.tensor(self.bone_length_min)
         self.bone_length_max = torch.tensor(self.bone_length_max)
 
@@ -237,14 +234,17 @@ class fish_model:
             # However, each bone's rest-pose twist axis might not be aligned with the head-joint-to-first-body-joint direction in the rest pose. 
             # We need to express the bone pose from the head space to the local space of the rest bone head (where the y-axis is the twist axis)
             # in order to align the twist axis of the rotation with the twist axis of the bone in the rest pose.
-            body_bone_poses_rest_head_spaces = (self.rot_mats_to_body_bone_rest_local_spaces.unsqueeze(0) @ body_pose_template_space) # (1, n_body_bones, 3, 3)
+            body_bone_poses_rest_bone_spaces = (self.rot_mats_to_body_bone_rest_local_spaces.unsqueeze(0) @ body_pose_template_space) # (1, n_body_bones, 3, 3)
             # comment: tail_artic_local = to_local @ pose_world @ tail_rest_world
             # @ is associative, so we can do 
             # tail_artic_local = M @ tail_rest_world
             # where M=(to_local @ pose_world)
+            # print(f"rot_mats_to_body_bone_rest_local_spaces: {self.rot_mats_to_body_bone_rest_local_spaces}")
+            # print(f"body_pose_template_space: {body_pose_template_space}")
+            # print(f"body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
 
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
-            body_bone_poses_rest_head_spaces = matrix_to_quaternion(body_bone_poses_rest_head_spaces.squeeze()).unsqueeze(0).cpu() # (1, n_body_bones, 4) (w, x, y, z)
+            body_bone_poses_rest_bone_spaces = matrix_to_quaternion(body_bone_poses_rest_bone_spaces.squeeze()).unsqueeze(0).cpu() # (1, n_body_bones, 4) (w, x, y, z)
         else:
             verts, body_pose_template_space = V, None
 
@@ -256,6 +256,6 @@ class fish_model:
         keypoints = torch.stack(keypoints)
 
         # Final output after articulation
-        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu(), "body_bone_poses_rest_head_spaces": body_bone_poses_rest_head_spaces}
+        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu(), "body_bone_poses_rest_bone_spaces": body_bone_poses_rest_bone_spaces}
 
         return output

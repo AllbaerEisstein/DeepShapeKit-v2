@@ -196,7 +196,7 @@ def extract_from_video(
                     updated_entry["P"] = P_np.tolist()
                 except Exception as exc:
                     print(f"Warning: could not recompute projection matrix for view {video_name}: {exc}")
-                print(f"Updated camera matrix for undistorted video {video_name}: {updated_entry}")
+                print(f"Updated camera matrix for undistorted video {video_name}.")
                 cam_matrices[video_name] = updated_entry
                 needs_undistortion = True
 

@@ -112,7 +112,7 @@ class LBS():
         #      future vertex translation depends on associated joint position.
 
         # extract the body pose (relative to fish head) for each joint for bone angle prior checking
-        body_pose_template_space = T_for_joints_rel_to_head[:, :, :3, :3] # (BS, n_body_joints, 3, 3)
+        body_pose_template_space = T_for_joints_rel_to_head[:, 1:, :3, :3] # (BS, n_body_joints, 3, 3)
 
         T_for_vertices = self.weights @ T_for_joints_rel_to_head.view(batch_size, self.n_body_joints, -1)
         T_for_vertices = T_for_vertices.view(batch_size, -1, 4, 4)
