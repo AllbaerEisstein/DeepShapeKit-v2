@@ -41,6 +41,8 @@ class OptimizeMV:
         self.fish = fish_model_obj
         self.faces = self.fish.faces
 
+        # torch.autograd.set_detect_anomaly(True)
+
     def __call__(
         self,
         init_ori_plus_pose: torch.Tensor,
@@ -240,20 +242,20 @@ class OptimizeMV:
             return full
 
         for _ in range(self.num_iters):
-            print(f"Stage 2 - global ori: {global_orient}")
-            print(f"Stage 2 - body global t: {global_t}")
-            print(f"Stage 2 - scale: {scale}")
-            print(f"Stage 2 - body pose: {body_pose}")
-            print(f"Stage 2 - body bone length: {body_bone_length}")
-            print(f"Stage 2 - optimizable body pose: {optimizable_body_pose}")
-            print(f"Stage 2 - optimizable body bone length: {optimizable_body_bone_length}")
-            print(f"Stage 2 - frozen body pose: {frozen_body_pose}")
-            print(f"Stage 2 - frozen body bone length: {frozen_body_bone_length}")
-            print(f"Stage 2 - in first bone group mask: {in_first_bone_group}")
+            # print(f"Stage 2 - global ori: {global_orient}")
+            # print(f"Stage 2 - body global t: {global_t}")
+            # print(f"Stage 2 - scale: {scale}")
+            # print(f"Stage 2 - body pose: {body_pose}")
+            # print(f"Stage 2 - body bone length: {body_bone_length}")
+            # print(f"Stage 2 - optimizable body pose: {optimizable_body_pose}")
+            # print(f"Stage 2 - optimizable body bone length: {optimizable_body_bone_length}")
+            # print(f"Stage 2 - frozen body pose: {frozen_body_pose}")
+            # print(f"Stage 2 - frozen body bone length: {frozen_body_bone_length}")
+            # print(f"Stage 2 - in first bone group mask: {in_first_bone_group}")
             recombined_body_pose = recombine_frozen_and_optimized_tensor(frozen_body_pose, optimizable_body_pose, in_first_bone_group)
-            print(f"Stage 2 - recombined body pose: {recombined_body_pose}")
+            # print(f"Stage 2 - recombined body pose: {recombined_body_pose}")
             recombined_body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_first_bone_group)
-            print(f"Stage 2 - recombined body bone length: {recombined_body_bone_length}")
+            # print(f"Stage 2 - recombined body bone length: {recombined_body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=recombined_body_pose.flatten(1),
@@ -296,6 +298,11 @@ class OptimizeMV:
             opt_body.zero_grad()
             loss.backward()
             if has_nonfinite_grads([optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale]):
+                print(f"Stage 2 - global ori grad: {global_orient.grad}")
+                print(f"Stage 2 - global t grad: {global_t.grad}")
+                print(f"Stage 2 - scale grad: {scale.grad}")
+                print(f"Stage 2 - optimizable body pose grad: {optimizable_body_pose.grad}")
+                print(f"Stage 2 - optimizable body bone length grad: {optimizable_body_bone_length.grad}")
                 raise ValueError("Error: Stage 2 produced non-finite gradients. Stopping Stage 2 early.")
             opt_body.step()
         

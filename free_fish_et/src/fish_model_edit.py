@@ -116,13 +116,14 @@ class fish_model:
             return rot_matrix_passive
         
         # translate to local coords, relative to head (new origin)
-        translation = self.J[0, 0].unsqueeze(0)
+        translation_head_to_origin = self.J[0, 0].unsqueeze(0)
         R_model_space_to_head_space = get_rot_matrix_for_y_axis_rotation(first_bone_twist_axis).T
-        self.J = torch.matmul(self.J - translation, R_model_space_to_head_space)
+        self.J = self.J - translation_head_to_origin
+        self.J = torch.matmul(self.J, R_model_space_to_head_space)
 
         self.V = torch.tensor(dd["V"]).unsqueeze(0) # (1,V,3)
         # apply the same rotation and translation to the vertices as we did to the joints in order to keep them in the same local space
-        self.V = torch.matmul(self.V - translation, R_model_space_to_head_space)
+        self.V = torch.matmul(self.V - translation_head_to_origin, R_model_space_to_head_space)
 
         body_bone_twist_axes_head_space = (self.J[:, 2:] - self.J[:, self.parent_indices[2:]])
         # exclude the head bone since we treat head bone transformation as global transformation and do not calculate swing-twist for the head bone
@@ -221,9 +222,10 @@ class fish_model:
         )
         # concatenate global pose and body pose
         global_ori_plus_body_pose = torch.cat([global_ori, body_pose], dim=1)
-        print("Input to fish model:")
-        print(f"  global_ori_plus_body_pose: {global_ori_plus_body_pose}")
-        print(f"  all_bone_lengths: {all_bone_lengths}")
+
+        # print("Input to fish model:")
+        # print(f"  global_ori_plus_body_pose: {global_ori_plus_body_pose}")
+        # print(f"  all_bone_lengths: {all_bone_lengths}")
 
         # print(f"all_bone_lengths: {all_bone_lengths.size()}")
         # print(f"global_ori_plus_body_pose: {global_ori_plus_body_pose.size()}")
@@ -242,9 +244,10 @@ class fish_model:
             # @ is associative, so we can do 
             # tail_artic_local = M @ tail_rest_world
             # where M=(to_local @ pose_world)
-            print("LBS output:")
-            print(f"   body_pose_template_space: {body_pose_template_space}")
-            print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
+
+            # print("LBS output:")
+            # print(f"   body_pose_template_space: {body_pose_template_space}")
+            # print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
 
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
             body_bone_poses_rest_bone_spaces = matrix_to_quaternion(body_bone_poses_rest_bone_spaces.squeeze()).unsqueeze(0).cpu() # (1, n_body_bones, 4) (w, x, y, z)

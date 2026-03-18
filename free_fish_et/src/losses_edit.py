@@ -64,8 +64,8 @@ def decompose_to_swing_twist(quats):
     y = quats[:, :, 2]  # (BS, bn)
     z = quats[:, :, 3]  # (BS, bn)
 
-    print("swing-twist")
-    print("   quats:", quats)
+    # print("swing-twist")
+    # print("   quats:", quats)
     # Singular when both w and y are ~0
     singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
 
@@ -75,12 +75,14 @@ def decompose_to_swing_twist(quats):
         torch.zeros_like(w),
         2 * torch.atan2(y, w)
     )  # (BS, bn)
-    print("   twists:", twists)
+    # print("   twists:", twists)
 
-    beta = torch.atan2(
-        torch.sqrt(x**2 + z**2),
-        torch.sqrt(y**2 + w**2)
-    )  # (BS, bn)
+    # sqrt(r^2) has undefined gradient at r=0; add epsilon to keep gradients finite
+    # for identity/near-identity quaternions where x=z=0 (and similarly y=w=0 edge cases).
+    eps = 1e-12
+    xz_norm = torch.sqrt(x**2 + z**2 + eps)
+    yw_norm = torch.sqrt(y**2 + w**2 + eps)
+    beta = torch.atan2(xz_norm, yw_norm)  # (BS, bn)
 
     gamma = twists / 2  # (BS, bn)
 
@@ -91,11 +93,9 @@ def decompose_to_swing_twist(quats):
     ], dim=-2)
 
     def sinc(x):
-        return torch.where(
-            x.abs() < 1e-6,
-            torch.ones_like(x),
-            torch.sin(x) / x
-        )
+        # torch.sinc(u) = sin(pi*u)/(pi*u), so sinc(x) = torch.sinc(x/pi).
+        # This is smooth and finite at x=0, avoiding NaN gradients from sin(x)/x.
+        return torch.sinc(x / torch.pi)
 
     # shape: (BS, bn, 2, 1)
     vec = quats[:, :, [1, 3]].unsqueeze(-1)
@@ -145,7 +145,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
     eps = 1e-8
     twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp_min(eps))**2 # (BS, bn)
-    print("Twist loss:", twist_loss.sum().item())
+    # print("Twist loss:", twist_loss.sum().item())
     
     # this function checks if swing_x,swing_z are within an ellipse with the priors as radii.
     # If a prior is exactly zero, that axis is treated as locked and penalized directly without division.
@@ -184,7 +184,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
         + z_bound_penalty
         + x_bound_penalty
     )
-    print("Swing loss:", swing_loss.sum().item())
+    # print("Swing loss:", swing_loss.sum().item())
     bone_angle_prior_loss = angle_constraint_weight * (swing_loss + twist_loss).sum(dim=-1) # sum swing and twist loss, then sum over bones -> (BS,)
 
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
