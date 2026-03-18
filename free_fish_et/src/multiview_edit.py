@@ -126,11 +126,45 @@ def fit_mesh(
     else:
         has_prev = False
 
+    nonfinite_init_names = []
+    for name, tensor in [
+        ("init_global_ori", init_global_ori),
+        ("init_body_pose", init_body_pose),
+        ("init_body_bone_length", init_body_bone_length),
+        ("init_s", init_s),
+        ("init_t", init_t),
+    ]:
+        if tensor is not None and not torch.isfinite(tensor).all():
+            nonfinite_init_names.append(name)
+    if nonfinite_init_names:
+        print(
+            f"Warning: non-finite initialization in {', '.join(nonfinite_init_names)}; "
+            "falling back to geometry-based initialization."
+        )
+        init_global_ori = None
+        init_body_pose = None
+        init_body_bone_length = None
+        init_s = None
+        init_t = None
+        has_prev = False
+
     ### Triangulation + Procrustes as initialization
     if init_global_ori == None and init_t == None and init_s == None:
         init_global_ori, init_t, init_s = fit_geometry(
             fish, keypoints, camera_group, init_pose=init_body_pose, init_body_bone_l=init_body_bone_length
         )
+        if (
+            (not torch.isfinite(init_global_ori).all())
+            or (not torch.isfinite(init_t).all())
+            or (not torch.isfinite(init_s).all())
+        ):
+            print(
+                "Warning: geometry initialization produced non-finite values; "
+                "using canonical defaults."
+            )
+            init_global_ori = torch.zeros([1, 3], device=device)
+            init_t = torch.zeros([1, 3], device=device)
+            init_s = torch.ones([1], device=device)
 
     ### If not provided (as in multiview), initialize with canonical
     if init_body_pose is None:

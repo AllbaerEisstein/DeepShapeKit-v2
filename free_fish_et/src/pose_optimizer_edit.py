@@ -107,6 +107,21 @@ class OptimizeMV:
             nonlocal kpts_conf
             kpts_conf = keypoints[..., 2].clamp(0.0, 1.0).clone()
 
+        def has_nonfinite_grads(params: list[torch.Tensor]) -> bool:
+            for param in params:
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    return True
+            return False
+
+        for name, tensor in [
+            ("init_ori_plus_pose", init_ori_plus_pose),
+            ("init_body_bone_length", init_body_bone_length),
+            ("init_t", init_t),
+            ("init_scale", init_scale),
+        ]:
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"OptimizeMV received non-finite values in {name}.")
+
 
         # ===== Initialize parameters =====
         # global_orient: (1,3), body_pose: (1,B,3), bone_length: (1,B)
@@ -157,9 +172,14 @@ class OptimizeMV:
             loss += mask_fitting_loss(
                 silhouette_renders, masks.float(), 0.1 * self.mask_weight
             )
+            if not torch.isfinite(loss):
+                raise ValueError("Error: Stage 1 produced non-finite loss. Stopping Stage 1 early.")
+                break
 
             opt_global.zero_grad()
             loss.backward()
+            if has_nonfinite_grads([global_orient, global_t, scale]):
+                raise ValueError("Error: Stage 1 produced non-finite gradients. Stopping Stage 1 early.")
             opt_global.step()
 
 
@@ -220,13 +240,20 @@ class OptimizeMV:
             return full
 
         for _ in range(self.num_iters):
-            # print(f"Stage 2 - global ori: {global_orient}")
-            # print(f"Stage 2 - body global t: {global_t}")
-            # print(f"Stage 2 - scale: {scale}")
-            # print(f"Stage 2 - body pose: {body_pose}")
-            # print(f"Stage 2 - body bone length: {body_bone_length}")
+            print(f"Stage 2 - global ori: {global_orient}")
+            print(f"Stage 2 - body global t: {global_t}")
+            print(f"Stage 2 - scale: {scale}")
+            print(f"Stage 2 - body pose: {body_pose}")
+            print(f"Stage 2 - body bone length: {body_bone_length}")
+            print(f"Stage 2 - optimizable body pose: {optimizable_body_pose}")
+            print(f"Stage 2 - optimizable body bone length: {optimizable_body_bone_length}")
+            print(f"Stage 2 - frozen body pose: {frozen_body_pose}")
+            print(f"Stage 2 - frozen body bone length: {frozen_body_bone_length}")
+            print(f"Stage 2 - in first bone group mask: {in_first_bone_group}")
             recombined_body_pose = recombine_frozen_and_optimized_tensor(frozen_body_pose, optimizable_body_pose, in_first_bone_group)
+            print(f"Stage 2 - recombined body pose: {recombined_body_pose}")
             recombined_body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_first_bone_group)
+            print(f"Stage 2 - recombined body bone length: {recombined_body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=recombined_body_pose.flatten(1),
@@ -264,8 +291,12 @@ class OptimizeMV:
             loss += mask_fitting_loss(
                 silhouette_renders, masks.float(), 0.1 * self.mask_weight
             )
+            if not torch.isfinite(loss):
+                raise ValueError("Error: Stage 2 produced non-finite loss. Stopping Stage 2 early.")
             opt_body.zero_grad()
             loss.backward()
+            if has_nonfinite_grads([optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale]):
+                raise ValueError("Error: Stage 2 produced non-finite gradients. Stopping Stage 2 early.")
             opt_body.step()
         
         # synchronise body pose and body bone length to optimized state
@@ -371,8 +402,12 @@ class OptimizeMV:
                     loss += mask_fitting_loss(
                         silhouette_renders, masks.float(), 0.1 * self.mask_weight
                     )
+                    if not torch.isfinite(loss):
+                        raise ValueError(f"Error: Stage 3 bone group {bg_idx} produced non-finite loss. Stopping this group early.")
                     opt_bone_group.zero_grad()
                     loss.backward()
+                    if has_nonfinite_grads([optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale]):
+                        raise ValueError(f"Error: Stage 3 bone group {bg_idx} produced non-finite gradients. Stopping this group early.")
                     opt_bone_group.step()
 
                 # synchronise body pose and body bone length to optimized state

@@ -61,6 +61,14 @@ class LBS():
         """
         batch_size = len(V)
         device = global_ori_plus_body_pose.device
+
+        if not torch.isfinite(global_ori_plus_body_pose).all():
+            raise ValueError("LBS received non-finite pose values before Rodrigues conversion.")
+        if not torch.isfinite(all_bone_length).all():
+            raise ValueError("LBS received non-finite bone lengths.")
+        if not torch.isfinite(scale).all():
+            raise ValueError("LBS received non-finite scale.")
+
         V_homog = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
         
         # scale the joint positions by the bone lengths -> init kin-tree excluded head joint, this step should exclude it, too
@@ -101,7 +109,8 @@ class LBS():
         #      (because every transformation will build on the transformation of the first body joint and 
         #      that transf is relative to the head joint)
         for i in range(1, self.n_body_joints):
-            T_for_joints_rel_to_head.append(T_for_joints_rel_to_head[self.parent_indices[i]] @ T_for_joints_rel_to_parent[:, i]) # self.parent_indices[i] retrieves current joint's parent, means we get the transformation matrix of this joint's parent
+            parent_idx = int(self.parent_indices[i].item()) if torch.is_tensor(self.parent_indices[i]) else int(self.parent_indices[i])
+            T_for_joints_rel_to_head.append(T_for_joints_rel_to_head[parent_idx] @ T_for_joints_rel_to_parent[:, i]) # self.parent_indices[i] retrieves current joint's parent, means we get the transformation matrix of this joint's parent
         T_for_joints_rel_to_head = torch.stack(T_for_joints_rel_to_head, dim=1)
         T_for_joints_rel_to_head[:, :, :, [-1]] -= T_for_joints_rel_to_head.clone() @ (self.joints_homog * scale)
         #   compound_rotmat(0,0) compound_rotmat(0,1) compound_rotmat(0,2) transformed_joint[0]

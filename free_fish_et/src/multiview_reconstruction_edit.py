@@ -795,8 +795,15 @@ def reconstruct(
     # setup; instantiate classes
     device = setup_device(seed)
 
+    print("\n" + "="*40)
     print("Starting multiview reconstruction with the following settings:")
-    print("Device:", device)
+    print("   Device:", device)
+    print("   Weights:")
+    print("     Mask reprojection:", mask_weight)
+    print("     Smoothness:", smooth_weight)
+    print("     Bone angle constraint:", angle_constraint_weight)
+    print("     Bone length constraint:", bone_length_constraint_weight)
+    print("="*40 + "\n")
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
     camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()

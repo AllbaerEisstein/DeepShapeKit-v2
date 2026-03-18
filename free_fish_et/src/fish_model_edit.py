@@ -221,6 +221,9 @@ class fish_model:
         )
         # concatenate global pose and body pose
         global_ori_plus_body_pose = torch.cat([global_ori, body_pose], dim=1)
+        print("Input to fish model:")
+        print(f"  global_ori_plus_body_pose: {global_ori_plus_body_pose}")
+        print(f"  all_bone_lengths: {all_bone_lengths}")
 
         # print(f"all_bone_lengths: {all_bone_lengths.size()}")
         # print(f"global_ori_plus_body_pose: {global_ori_plus_body_pose.size()}")
@@ -239,9 +242,9 @@ class fish_model:
             # @ is associative, so we can do 
             # tail_artic_local = M @ tail_rest_world
             # where M=(to_local @ pose_world)
-            # print(f"rot_mats_to_body_bone_rest_local_spaces: {self.rot_mats_to_body_bone_rest_local_spaces}")
-            # print(f"body_pose_template_space: {body_pose_template_space}")
-            # print(f"body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
+            print("LBS output:")
+            print(f"   body_pose_template_space: {body_pose_template_space}")
+            print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
 
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
             body_bone_poses_rest_bone_spaces = matrix_to_quaternion(body_bone_poses_rest_bone_spaces.squeeze()).unsqueeze(0).cpu() # (1, n_body_bones, 4) (w, x, y, z)

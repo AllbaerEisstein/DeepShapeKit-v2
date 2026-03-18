@@ -64,6 +64,8 @@ def decompose_to_swing_twist(quats):
     y = quats[:, :, 2]  # (BS, bn)
     z = quats[:, :, 3]  # (BS, bn)
 
+    print("swing-twist")
+    print("   quats:", quats)
     # Singular when both w and y are ~0
     singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
 
@@ -73,6 +75,7 @@ def decompose_to_swing_twist(quats):
         torch.zeros_like(w),
         2 * torch.atan2(y, w)
     )  # (BS, bn)
+    print("   twists:", twists)
 
     beta = torch.atan2(
         torch.sqrt(x**2 + z**2),
@@ -140,12 +143,48 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     # Add a loss according to the amount of violation of the angle limits
 
     # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
-    twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp(0, float("Inf")))**2 # (BS, bn)
+    eps = 1e-8
+    twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp_min(eps))**2 # (BS, bn)
+    print("Twist loss:", twist_loss.sum().item())
     
-    # this function checks if the swing_x,swing_z is within an ellipse of bone_angle_priors_batch[:, :, 0] and bone_angle_priors_batch[:, :, 2] as the radii. 
-    # If outside, it adds a loss proportional to the squared distance outside the ellipse (in angle space, not cartesian!!).
-    swing_loss = ((swing_twist[:, :, 0]/bone_angle_priors_batch[:, :, 0])**2 + (swing_twist[:, :, 2]/bone_angle_priors_batch[:, :, 2])**2) - 1 # (BS,bn)
-    swing_loss = swing_loss.clamp(0, float("Inf")) # only penalize if outside the ellipse
+    # this function checks if swing_x,swing_z are within an ellipse with the priors as radii.
+    # If a prior is exactly zero, that axis is treated as locked and penalized directly without division.
+    swing_x = swing_twist[:, :, 0]
+    swing_z = swing_twist[:, :, 2]
+    swing_x_lim = bone_angle_priors_batch[:, :, 0].abs()
+    swing_z_lim = bone_angle_priors_batch[:, :, 2].abs()
+
+    x_locked = swing_x_lim <= eps
+    z_locked = swing_z_lim <= eps
+    both_free = (~x_locked) & (~z_locked)
+    zero = torch.zeros_like(swing_x)
+
+    # Standard ellipse penalty for the non-degenerate case.
+    ellipse_violation = torch.where(
+        both_free,
+        (
+            (swing_x / swing_x_lim.clamp_min(eps)) ** 2
+            + (swing_z / swing_z_lim.clamp_min(eps)) ** 2
+            - 1
+        ).clamp(0, float("Inf"))
+        , zero
+    )
+
+    # Degenerate cases when one/both priors are zero: 
+    # squared swing for the locked axes, and rectangular bounds for the free axis if only one is locked.
+    x_locked_penalty = torch.where(x_locked, swing_x**2, zero)
+    z_locked_penalty = torch.where(z_locked, swing_z**2, zero)
+    z_bound_penalty = torch.where(x_locked & (~z_locked), (swing_z.abs() - swing_z_lim).clamp(0, float("Inf"))**2, zero)
+    x_bound_penalty = torch.where(z_locked & (~x_locked), (swing_x.abs() - swing_x_lim).clamp(0, float("Inf"))**2, zero)
+
+    swing_loss = (
+        ellipse_violation
+        + x_locked_penalty
+        + z_locked_penalty
+        + z_bound_penalty
+        + x_bound_penalty
+    )
+    print("Swing loss:", swing_loss.sum().item())
     bone_angle_prior_loss = angle_constraint_weight * (swing_loss + twist_loss).sum(dim=-1) # sum swing and twist loss, then sum over bones -> (BS,)
 
     # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)

@@ -20,12 +20,15 @@ def batch_rodrigues(theta, dtype=torch.float32, to_quats=False, to_rotmats=True)
         or   Quaternion corresponding to the axis-angle -- size = [B, 4] (w, x, y, z)
     """
 
-    l1norm = torch.norm(theta + 1e-8, p = 2, dim = 1)
-    angle = torch.unsqueeze(l1norm, -1)
-    normalized = torch.div(theta, angle)
-    angle = angle * 0.5
-    v_cos = torch.cos(angle)
-    v_sin = torch.sin(angle)
+    # Numerically stable axis normalization:
+    # avoid the singular case from norm(theta + eps), which can become exactly 0
+    # for theta ~= [-eps, -eps, -eps] and create NaNs downstream.
+    eps = 1e-8
+    angle = torch.norm(theta, p=2, dim=1, keepdim=True).clamp_min(eps)
+    normalized = theta / angle
+    half_angle = angle * 0.5
+    v_cos = torch.cos(half_angle)
+    v_sin = torch.sin(half_angle)
     quat = torch.cat([v_cos, v_sin * normalized], dim = 1)
     if to_quats and to_rotmats:
         return quat_to_rotmat(quat).float(), quat.float()    
