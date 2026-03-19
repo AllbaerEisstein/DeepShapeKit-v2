@@ -505,7 +505,7 @@ def get_mesh_json(context):
     def tail_pos(b): return b.tail_local.copy()
 
     # BFS traversal to preserve topology order
-    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot': []} for b in bone_list} # very inefficient way to store a tree
+    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot_world': [], 'rest_rot_local': []} for b in bone_list} # very inefficient way to store a tree
     ordered_bones = []
     queue = roots[:]
     while queue:
@@ -513,9 +513,9 @@ def get_mesh_json(context):
         ordered_bones.append(b)
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
         bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
-        #rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
-        #bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
-        bone_names_tree[b.name]['rest_rot'] = b.matrix_local.to_3x3()  # 3x3 rotation matrix
+        rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
+        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
+        bone_names_tree[b.name]['rest_rot_local'] = b.matrix_local.to_3x3()  # 3x3 rotation matrix
         for ch in b.children:
             queue.append(ch)
             bone_names_tree[b.name]['c'].append(ch.name)
@@ -762,7 +762,8 @@ def get_mesh_json(context):
                 'p': data['p'],
                 'c': data['c'],
                 'joints': data['joints_idx'],
-                'rest_rot': [[float(c) for c in row] for row in data['rest_rot']],
+                'rest_rot_world': [[float(c) for c in row] for row in data['rest_rot_world']],
+                'rest_rot_local': [[float(c) for c in row] for row in data['rest_rot_local']],
                 'priors': bone_name_2_prior[bone_name] if bone_name in bone_name_2_prior else None,
             }
             for bone_name, data in bone_names_tree.items()
@@ -2439,8 +2440,8 @@ class SYNTH_OT_export_pose_time_series_json(Operator):
                 dir_vec = child_head_arm - parent_tail_arm
                 dir_len = dir_vec.length
                 # Prepare parent rest rotation in armature space (3x3)
-                # bone_names_tree[p_name]['rest_rot'] is stored as 3x3 row lists (world-space)
-                rest_rot_rows = bone_names_tree.get(p_name, {}).get('rest_rot', None)
+                # bone_names_tree[p_name]['rest_rot_world'] is stored as 3x3 row lists (world-space)
+                rest_rot_rows = bone_names_tree.get(p_name, {}).get('rest_rot_world', None)
                 if rest_rot_rows is not None:
                     # convert rows -> 3x3 Matrix (world)
                     parent_rest_R_world = Matrix((

@@ -86,13 +86,8 @@ class fish_model:
 
         self.J = torch.tensor(dd["J"], dtype=torch.float32).unsqueeze(0) # (1,J,3)
         self.virtual_bone_mask = torch.tensor(dd["virtual_bone_mask"]) # (n_bones) binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1)
-        # set the mesh local space positive y-axis to be the head-to-first-body-joint direction in the rest pose 
-        # in order to have a priori defined twist axes for the bones and in order to adhere with Blender's 
-        # twist axis convention (twist axis is the positive y-axis)
-        # TODO: currently, we assume 0 twist in rest pose for each bone. The fish template json has a field rest_rot 
-        # for each bone that we could use to read the rest pose twist angle but considering this would make the 
-        # transformation of principal axes more complicated.
-        first_bone_twist_axis = self.J[0, 1] - self.J[0, 0]
+        # set the mesh local space to head space (head joint at origin; head-bone local axes aligned with world axes)
+        # use rest_rot_world from the mesh json.
 
         def get_rot_matrix_for_y_axis_rotation(new_y_axis):
             """
@@ -115,9 +110,33 @@ class fish_model:
             # we need to apply the inverse of this rotation (active rotation) to the point.
             return rot_matrix_passive
         
-        # translate to local coords, relative to head (new origin)
+        def get_root_rest_rotation_world():
+            bone_tree = dd.get("bone_names_tree", {})
+
+            root_bone_name = dd["bone_order"][0]
+            if root_bone_name not in bone_tree:
+                raise ValueError(f"Root bone {root_bone_name} does not have a corresponding entry in the bone tree of the json file. Please make sure that the root bone has an entry in the bone tree and that the bone tree is correctly formatted.")
+
+            root_data = bone_tree[root_bone_name]
+            rest_rot_rows = root_data.get("rest_rot_world", None)
+
+            R = torch.tensor(rest_rot_rows, dtype=torch.float32)
+            # Re-orthonormalize to guard against tiny numerical drift in serialized matrices.
+            U, _, Vh = torch.linalg.svd(R)
+            R = U @ Vh
+            if torch.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vh
+            return R
+
+        # translate to head-local coords (head joint -> origin), then rotate model/world frame -> head frame
         translation_head_to_origin = self.J[0, 0].unsqueeze(0)
-        R_model_space_to_head_space = get_rot_matrix_for_y_axis_rotation(first_bone_twist_axis).T
+        root_rest_rot_world = get_root_rest_rotation_world()
+
+        # rest_rot_world maps head-local axes to world/model axes (local->world).
+        # We need the inverse to express points in head-local coordinates.
+        R_model_space_to_head_space = root_rest_rot_world.T
+
         self.J = self.J - translation_head_to_origin
         self.J = torch.matmul(self.J, R_model_space_to_head_space)
 
@@ -130,7 +149,7 @@ class fish_model:
         rot_mats_to_body_bone_rest_local_spaces = [] 
         for i in range(self.n_body_bones): 
             twist_axis = body_bone_twist_axes_head_space[:, i]
-            rot_mats_to_body_bone_rest_local_spaces.append(get_rot_matrix_for_y_axis_rotation(twist_axis).T)
+            rot_mats_to_body_bone_rest_local_spaces.append(get_rot_matrix_for_y_axis_rotation(twist_axis.squeeze(0)).T)
         # when calculating the swing-twist of each bone, we need to express each articulated bone tail 
         # in the local space of the rest bone head because the twist axis is required to be one of x,y, or z.
         self.rot_mats_to_body_bone_rest_local_spaces = torch.stack(rot_mats_to_body_bone_rest_local_spaces, dim=0) # (n_body_bones, 3, 3)
