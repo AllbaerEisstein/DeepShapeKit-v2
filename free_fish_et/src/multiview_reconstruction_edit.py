@@ -4,6 +4,7 @@ import math
 import pickle
 import os
 import argparse
+import time
 from typing import Any, List, Optional
 import cv2
 import numpy as np
@@ -784,6 +785,8 @@ def reconstruct(
     smooth_weight: float = 30.0,
     bone_length_constraint_weight: float = 200.0,
     mask_weight: float = 200.0,
+    keypoints_weight: float = 1.0,
+    view_weights: Optional[List[float]] = None,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
@@ -800,12 +803,27 @@ def reconstruct(
     print("   Device:", device)
     print("   Weights:")
     print("     Mask reprojection:", mask_weight)
+    print("     Keypoint reprojection:", keypoints_weight)
     print("     Smoothness:", smooth_weight)
     print("     Bone angle constraint:", angle_constraint_weight)
     print("     Bone length constraint:", bone_length_constraint_weight)
     print("="*40 + "\n")
 
     dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
+    n_views = len(dataset.views)
+    if view_weights is None or len(view_weights) == 0:
+        view_weights = [1.0] * n_views
+    elif len(view_weights) == 1:
+        # Convenience behavior for the GUI default: a single value is broadcast to all views.
+        view_weights = [float(view_weights[0])] * n_views
+    elif len(view_weights) != n_views:
+        raise ValueError(
+            "view_weights length mismatch: "
+            f"got {len(view_weights)} weight(s) for {n_views} view(s) {dataset.views}. "
+            "Provide a comma-separated list with one weight per view index."
+        )
+    print("     View weights:", view_weights)
+
     camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
     camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
 
@@ -816,6 +834,8 @@ def reconstruct(
         smooth_weight=smooth_weight,
         bone_length_constraint_weight=bone_length_constraint_weight,
         mask_weight=mask_weight,
+        keypoints_weight=keypoints_weight,
+        view_weights=view_weights,
         device=torch.device(device),
         fish_model_obj=fish,
     )
@@ -831,15 +851,45 @@ def reconstruct(
     pose_time_series_frames: list[dict] = []
     processed_frames: set[int] = set()
     cached_metrics: Optional[dict] = None
+    cached_elapsed_wall_time_sec = 0.0
+    resumed_from_cache = False
+
+    def _normalize_path(path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        if str(path).strip() == "":
+            return None
+        return os.path.abspath(os.path.normpath(str(path)))
+
+    def _normalize_frame_indices(indices: Any) -> Optional[list[int]]:
+        if not isinstance(indices, (list, tuple)):
+            return None
+        try:
+            return sorted(int(i) for i in indices)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_weights(weights: Any) -> Optional[list[float]]:
+        if not isinstance(weights, (list, tuple)):
+            return None
+        try:
+            return [float(w) for w in weights]
+        except (TypeError, ValueError):
+            return None
 
     if cache_data is not None:
         cache_dataset = cache_data.get("dataset_dir")
         cache_mesh = cache_data.get("mesh_path")
         cache_frames = cache_data.get("frame_indices")
+        cache_view_weights = _normalize_weights(cache_data.get("view_weights"))
+        requested_view_weights = _normalize_weights(view_weights)
+        requested_frame_indices = _normalize_frame_indices(frame_indices)
+        cached_frame_indices = _normalize_frame_indices(cache_frames)
         if (
-            (cache_dataset and cache_dataset != dataset_dir)
-            or (cache_mesh and cache_mesh != mesh_path)
-            or (cache_frames and list(cache_frames) != list(frame_indices))
+            (_normalize_path(cache_dataset) and _normalize_path(cache_dataset) != _normalize_path(dataset_dir))
+            or (_normalize_path(cache_mesh) and _normalize_path(cache_mesh) != _normalize_path(mesh_path))
+            or (cached_frame_indices and requested_frame_indices and cached_frame_indices != requested_frame_indices)
+            or (cache_view_weights and requested_view_weights and cache_view_weights != requested_view_weights)
         ):
             print("Existing reconstruction cache does not match current configuration; starting a new reconstruction run.")
         else:
@@ -848,7 +898,13 @@ def reconstruct(
             sample_data = cache_data.get("sample_data", [])
             pose_time_series_frames = cache_data.get("pose_time_series_frames", []) or []
             cached_metrics = cache_data.get("metrics")
-            processed_frames = set(cache_data.get("processed_frames", []))
+            processed_frames = {int(i) for i in cache_data.get("processed_frames", []) if isinstance(i, (int, float))}
+            processed_frames = processed_frames.intersection(set(frame_indices))
+            try:
+                cached_elapsed_wall_time_sec = float(cache_data.get("elapsed_wall_time_sec", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                cached_elapsed_wall_time_sec = 0.0
+            resumed_from_cache = True
 
     def _fresh_metrics() -> dict:
         return {
@@ -872,12 +928,16 @@ def reconstruct(
             pose_time_series_frames = []
             processed_frames = set()
             metrics = _fresh_metrics()
+            cached_elapsed_wall_time_sec = 0.0
+            resumed_from_cache = False
 
     pbar = tqdm(
         total=len(frame_indices),
         desc=f"{os.path.basename(dataset_dir)} reconstruction frame {frame_indices[0]}",
         initial=len(processed_frames),
     )
+    run_start_wall_time_sec = time.perf_counter()
+    paused = False
 
     # --------------------------
     # loop through frames and reconstruct
@@ -1006,6 +1066,7 @@ def reconstruct(
                 metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
 
         processed_frames.add(idx)
+        elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)
 
         cache_payload = {
             "parameters": parameters,
@@ -1018,19 +1079,38 @@ def reconstruct(
             "dataset_dir": dataset_dir,
             "mesh_path": mesh_path,
             "instance_number": instance_number,
+            "elapsed_wall_time_sec": elapsed_wall_time_sec,
+            "view_weights": [float(v) for v in view_weights],
         }
         _save_reconstruction_cache(cache_dir, cache_path, cache_payload)
-
-        if pause_event is not None and pause_event.is_set():
-            print("Pause requested; stopping after cache write.")
-            break
 
         pbar.desc = f"{os.path.basename(dataset_dir)} reconstruction frame {idx}"
         pbar.update()
 
-    # reconstruction done
-    metrics['total_duration_min'] = str(pbar).split()[-2].split('<')[0].replace('[','')
-    metrics['seconds_per_frame'] = str(pbar).split()[-1].replace(']','')
+        if pause_event is not None and pause_event.is_set():
+            print("Pause requested; stopping after cache write.")
+            paused = True
+            break
+
+    # reconstruction done (or paused)
+    elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)
+    processed_frame_count = len(processed_frames)
+    seconds_per_processed_frame = (
+        elapsed_wall_time_sec / processed_frame_count if processed_frame_count > 0 else None
+    )
+
+    metrics["timing"] = {
+        "elapsed_wall_time_sec": elapsed_wall_time_sec,
+        "elapsed_wall_time_min": elapsed_wall_time_sec / 60.0,
+        "seconds_per_processed_frame": seconds_per_processed_frame,
+        "processed_frame_count": processed_frame_count,
+        "target_frame_count": len(frame_indices),
+        "resumed_from_cache": resumed_from_cache,
+        "paused": paused,
+    }
+    # Keep legacy fields for backward compatibility.
+    metrics["total_duration_min"] = elapsed_wall_time_sec / 60.0
+    metrics["seconds_per_frame"] = seconds_per_processed_frame
     pbar.close()
 
     _save_pose_pickle(
@@ -1057,7 +1137,13 @@ def reconstruct(
     with open(os.path.join(outdir, f"metrics_instance_{instance_number}.json"), "w") as metrics_out_json:
         json.dump(metrics, metrics_out_json, indent=4)
 
-    _clear_reconstruction_cache(cache_path)
+    if paused:
+        print(
+            f"Reconstruction paused after {processed_frame_count}/{len(frame_indices)} frame(s). "
+            f"Cache kept at '{cache_path}'."
+        )
+    else:
+        _clear_reconstruction_cache(cache_path)
 
 
 

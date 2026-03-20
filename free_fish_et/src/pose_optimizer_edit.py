@@ -24,6 +24,8 @@ class OptimizeMV:
         smooth_weight: float = 1.0,
         bone_length_constraint_weight: float = 1.0,
         mask_weight: float = 1.0,
+        keypoints_weight: float = 1.0,
+        view_weights: Optional[list[float]] = None,
         step_size: float = 1e-2,
         num_iters: int = 100,
         device=torch.device("cpu"),
@@ -36,6 +38,8 @@ class OptimizeMV:
         self.smooth_weight = smooth_weight
         self.bone_length_constraint_weight = bone_length_constraint_weight
         self.mask_weight = mask_weight
+        self.keypoints_weight = keypoints_weight
+        self.view_weights = view_weights
 
         # Load parametric fish mesh and faces
         self.fish = fish_model_obj
@@ -101,6 +105,19 @@ class OptimizeMV:
         batch_size = proj_m_from_blworld.shape[0]
         kpts_2d = keypoints[..., :2]
         kpts_conf = keypoints[..., 2].clone()
+        if self.view_weights is None:
+            view_weights = torch.ones(batch_size, device=self.device, dtype=kpts_2d.dtype)
+        else:
+            if len(self.view_weights) != batch_size:
+                raise ValueError(
+                    f"view_weights length mismatch in OptimizeMV: got {len(self.view_weights)}, "
+                    f"but current batch has {batch_size} views."
+                )
+            view_weights = torch.tensor(self.view_weights, device=self.device, dtype=kpts_2d.dtype)
+            if not torch.isfinite(view_weights).all():
+                raise ValueError("OptimizeMV received non-finite values in view_weights.")
+            if (view_weights < 0).any():
+                raise ValueError("OptimizeMV received negative values in view_weights; expected non-negative weights.")
         # in the extraction pipeline, undetected kpts have been set to conf=-1
         # in the loss function, conf is a coefficient of the loss -> clamp to 0, 1
         kpts_conf = kpts_conf.clamp(0.0, 1.0)
@@ -138,9 +155,9 @@ class OptimizeMV:
         # ============ Stage 1: optimize global_orient, translation, scale ============
         # loss: 
         # -----------------------------------
-        # keypoint reprojection l2 distance * keypoint confidence², 
-        # mask l1 distance, 
-        # global_t smooth loss (difference to init_t)
+        # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights),
+        # mask smooth-L1 loss (weighted by mask_weight and view_weights),
+        # global_t smoothness prior vs init_t (weighted by smooth_weight)
         # ===================================
 
         opt_global = torch.optim.Adam(
@@ -164,7 +181,14 @@ class OptimizeMV:
             # Keypoint reprojection loss
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             loss = (
-                keypoint_reprojection_loss_global(model_kpts, proj_m_from_blworld, kpts_2d, kpts_conf)
+                keypoint_reprojection_loss_global(
+                    model_kpts,
+                    proj_m_from_blworld,
+                    kpts_2d,
+                    kpts_conf,
+                    keypoints_weight=self.keypoints_weight,
+                    view_weights=view_weights,
+                )
                 + self.smooth_weight * (global_t - init_t).abs().sum()
             )
             # Silhouette loss
@@ -172,7 +196,7 @@ class OptimizeMV:
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
             loss += mask_fitting_loss(
-                silhouette_renders, masks.float(), 0.1 * self.mask_weight
+                silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
             )
             if not torch.isfinite(loss):
                 raise ValueError("Error: Stage 1 produced non-finite loss. Stopping Stage 1 early.")
@@ -197,9 +221,13 @@ class OptimizeMV:
         # --------------
         # loss: 
         # -----------------------------------
-        # (keypoint L2-distance * keypoint confidence²) of keypoints of bone group 0,
-        # mask l1 distance, 
-        # bone constraint loss (angle/length min and max)
+        # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights) for keypoints of bone group 0,
+        # mask smooth-L1 loss (weighted by mask_weight and view_weights),
+        # swing-twist angle constraint loss (weighted by angle_constraint_weight):
+        #   - twist-limit violation,
+        #   - swing ellipse violation with locked-axis handling for zero swing priors,
+        # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
+        # smoothness prior on body pose/bone length (weighted by smooth_weight; in this stage to zero/init defaults)
         # ===================================
 
         first_bone_group = self.fish.bone_groups[0]
@@ -279,9 +307,11 @@ class OptimizeMV:
                 proj_m_from_blworld,
                 kpts_2d,
                 kpts_conf,
-                recombined_body_pose.flatten(1),
-                bone_local_oris_bone_group,
-                recombined_body_bone_length,
+                keypoints_weight=self.keypoints_weight,
+                view_weights=view_weights,
+                body_pose=recombined_body_pose.flatten(1),
+                body_bone_ori_rest_head_spaces=bone_local_oris_bone_group,
+                bone_length=recombined_body_bone_length,
                 angle_constraint_weight=self.angle_constraint_weight,
                 smooth_weight=self.smooth_weight,
                 bone_length_constraint_weight=self.bone_length_constraint_weight,
@@ -291,7 +321,7 @@ class OptimizeMV:
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
             loss += mask_fitting_loss(
-                silhouette_renders, masks.float(), 0.1 * self.mask_weight
+                silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
             )
             if not torch.isfinite(loss):
                 raise ValueError("Error: Stage 2 produced non-finite loss. Stopping Stage 2 early.")
@@ -323,10 +353,13 @@ class OptimizeMV:
             # --------------
             # loss: 
             # -----------------------------------
-            # (keypoint L2-distance * keypoint confidence²) of keypoints of that bone group, 
-            # mask l1 distance,
-            # bone constraint loss (angle/length min and max)
-            # smooth loss compared to previous stage (-> L2 distance of bone orientation Rodriguez vectors and L2 distance of bone lengths) (! this loss is not present in stage 2 !)
+            # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights) for keypoints of that bone group,
+            # mask smooth-L1 loss (weighted by mask_weight and view_weights),
+            # swing-twist angle constraint loss (weighted by angle_constraint_weight):
+            #   - twist-limit violation,
+            #   - swing ellipse violation with locked-axis handling for zero swing priors,
+            # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
+            # smooth loss compared to previous stage (weighted by smooth_weight)
             # ===================================
 
             for bg_idx, bone_group in enumerate(self.fish.bone_groups[1:]):
@@ -393,9 +426,11 @@ class OptimizeMV:
                         proj_m_from_blworld,
                         kpts_2d,
                         kpts_conf,
-                        recombined_body_pose.flatten(1),
-                        bone_local_oris_bone_group,
-                        recombined_body_bone_length,
+                        keypoints_weight=self.keypoints_weight,
+                        view_weights=view_weights,
+                        body_pose=recombined_body_pose.flatten(1),
+                        body_bone_ori_rest_head_spaces=bone_local_oris_bone_group,
+                        bone_length=recombined_body_bone_length,
                         angle_constraint_weight=self.angle_constraint_weight,
                         smooth_weight=self.smooth_weight,
                         bone_length_constraint_weight=self.bone_length_constraint_weight,
@@ -407,7 +442,7 @@ class OptimizeMV:
                         out["vertices"], self.faces.unsqueeze(0), global_t
                     )
                     loss += mask_fitting_loss(
-                        silhouette_renders, masks.float(), 0.1 * self.mask_weight
+                        silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
                     )
                     if not torch.isfinite(loss):
                         raise ValueError(f"Error: Stage 3 bone group {bg_idx} produced non-finite loss. Stopping this group early.")

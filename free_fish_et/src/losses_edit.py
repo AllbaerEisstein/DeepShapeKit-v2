@@ -32,6 +32,8 @@ def keypoint_reprojection_loss_global(
     proj_m: torch.Tensor,
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
+    keypoints_weight: torch.Tensor,
+    view_weights: torch.Tensor,
 ):
     # Project model keypoints
     projected_keypoints = perspective_projection(model_keypoints, proj_m)
@@ -46,8 +48,8 @@ def keypoint_reprojection_loss_global(
     # finally, sum error of each kpt -> we get a sum of squared, Geman-McClure robustified L2-errors per view
     total_loss = reprojection_loss.sum(dim=-1)
 
-    # and, we return a scalar loss by summing over all views.
-    # -> views contribute equally
+    # apply keypoint and per-view weights before summing over views
+    total_loss = keypoints_weight * view_weights * total_loss
     return total_loss.sum() 
 
 
@@ -118,6 +120,8 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     proj_m: torch.Tensor,
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
+    keypoints_weight: torch.Tensor,
+    view_weights: torch.Tensor,
     body_pose: torch.Tensor,
     body_bone_ori_rest_head_spaces: torch.Tensor,
     bone_length: torch.Tensor,
@@ -134,7 +138,8 @@ def kpt_repr_plus_bone_pose_and_length_loss(
 
     # Weighted robust reprojection loss
     reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma)
-    reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1)
+    reprojection_loss = ((keypoints_conf**2) * reprojection_error.sum(dim=-1)) * keypoints_weight
+    reprojection_loss = reprojection_loss.sum(dim=-1) * view_weights
 
     # Joint angle limit loss
     swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces) # (BS, bn, 3)
@@ -207,7 +212,7 @@ def kpt_repr_plus_bone_pose_and_length_loss(
 
     # sum over batches (views)
     total_loss = (
-        reprojection_loss.sum(dim=-1)
+        reprojection_loss
         + bone_angle_prior_loss.sum()
         + init_prior_loss.sum()
         + bone_length_prior_loss.sum()
@@ -216,10 +221,10 @@ def kpt_repr_plus_bone_pose_and_length_loss(
     return total_loss.sum()
 
 
-def mask_fitting_loss(proj_masks, masks, mask_weight):
+def mask_fitting_loss(proj_masks, masks, mask_weight, view_weights):
     # L1 mask loss
     total_loss = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
-    total_loss = mask_weight * total_loss
+    total_loss = mask_weight * view_weights * total_loss
 
     return total_loss.sum()
 

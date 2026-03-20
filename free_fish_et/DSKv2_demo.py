@@ -68,6 +68,8 @@ class PipelineConfig:
     smooth_weight: float = 30.0
     bone_length_constraint_weight: float = 200.0
     mask_weight: float = 200.0
+    keypoints_weight: float = 1.0
+    view_weights: str = "1"
 
     def dataset_folder(self) -> Path:
         return Path(self.out_path) / self.dataset_folder_name
@@ -126,6 +128,40 @@ def parse_frame_selection(frame_selection: Optional[str]) -> List[int]:
         raise ConfigError("No frame indices parsed from frame range input.")
 
     return indices
+
+
+def parse_view_weights_csv(view_weights: Optional[str]) -> List[float]:
+    """
+    Parse comma-separated view weights (e.g. "1,0.8,1.2").
+    A single value is allowed and can be broadcast to all views later.
+    """
+    if view_weights is None:
+        return [1.0]
+
+    text = str(view_weights).strip()
+    if text == "":
+        return [1.0]
+
+    tokens = [tok.strip() for tok in text.split(",")]
+    if any(tok == "" for tok in tokens):
+        raise ConfigError(
+            "view_weights must be a comma-separated list of numbers, e.g. '1,1,0.8'."
+        )
+
+    parsed: List[float] = []
+    for tok in tokens:
+        try:
+            value = float(tok)
+        except ValueError as exc:
+            raise ConfigError(
+                f"view_weights contains a non-numeric value '{tok}'. "
+                "Use comma-separated numbers, e.g. '1,1,0.8'."
+            ) from exc
+        if value < 0:
+            raise ConfigError("view_weights entries must be non-negative.")
+        parsed.append(value)
+
+    return parsed
 
 
 def _is_all_frames_selection(frame_selection: Optional[str]) -> bool:
@@ -275,6 +311,7 @@ def run_pipeline(
             raise ConfigError("Frame range is required for reconstruction.")
         if mesh_path is None:
             raise ConfigError("mesh_path must be provided for reconstruction.")
+        parsed_view_weights = parse_view_weights_csv(config.view_weights)
         selected_views = resolve_dataset_views(dataset_folder_path, videos)
         reconstruct(
             mesh_path=str(mesh_path),
@@ -291,6 +328,8 @@ def run_pipeline(
             smooth_weight=config.smooth_weight,
             bone_length_constraint_weight=config.bone_length_constraint_weight,
             mask_weight=config.mask_weight,
+            keypoints_weight=config.keypoints_weight,
+            view_weights=parsed_view_weights,
         )
 
 
@@ -638,6 +677,8 @@ class PipelineGUI:
         self.smooth_weight_var = tk.StringVar(value=str(self.config.smooth_weight))
         self.bone_length_constraint_weight_var = tk.StringVar(value=str(self.config.bone_length_constraint_weight))
         self.mask_weight_var = tk.StringVar(value=str(self.config.mask_weight))
+        self.keypoints_weight_var = tk.StringVar(value=str(self.config.keypoints_weight))
+        self.view_weights_var = tk.StringVar(value=str(self.config.view_weights))
         self.advanced_visible = tk.BooleanVar(value=False)
         self.step_vars: Dict[str, "tk.BooleanVar"] = {
             "extract": tk.BooleanVar(value="extract" in self.steps),
@@ -821,6 +862,17 @@ class PipelineGUI:
         ttk.Label(optimization_frame, text="mask_weight").grid(row=4, column=0, sticky="w", pady=2, padx=(6, 4))
         ttk.Entry(optimization_frame, textvariable=self.mask_weight_var).grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 6))
 
+        ttk.Label(optimization_frame, text="keypoints_weight").grid(row=5, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.keypoints_weight_var).grid(row=5, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="view_weights").grid(row=6, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.view_weights_var).grid(row=6, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(
+            optimization_frame,
+            text="Comma-separated by view index (single value broadcasts).",
+            foreground="#777",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 4), padx=(6, 6))
+
         self.advanced_frame.grid_remove()
         row += 1
 
@@ -964,8 +1016,13 @@ class PipelineGUI:
             config.smooth_weight = float(self.smooth_weight_var.get().strip())
             config.bone_length_constraint_weight = float(self.bone_length_constraint_weight_var.get().strip())
             config.mask_weight = float(self.mask_weight_var.get().strip())
+            config.keypoints_weight = float(self.keypoints_weight_var.get().strip())
         except ValueError as exc:
             raise ConfigError("Optimization weights must be numeric.") from exc
+        view_weights_text = self.view_weights_var.get().strip()
+        config.view_weights = view_weights_text if view_weights_text else "1"
+        # validate numeric formatting early; view-count validation happens in reconstruct()
+        parse_view_weights_csv(config.view_weights)
 
         return config
 
@@ -1028,6 +1085,8 @@ class PipelineGUI:
         self.smooth_weight_var.set(str(config.smooth_weight))
         self.bone_length_constraint_weight_var.set(str(config.bone_length_constraint_weight))
         self.mask_weight_var.set(str(config.mask_weight))
+        self.keypoints_weight_var.set(str(config.keypoints_weight))
+        self.view_weights_var.set(str(config.view_weights))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
@@ -1300,17 +1359,12 @@ def run_gui(initial_config: PipelineConfig, steps: List[str]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the DeepShapeKit v2 pipeline.")
+    parser = argparse.ArgumentParser(description="Launch the DeepShapeKit v2 GUI.")
     parser.add_argument(
         "--steps",
         nargs="+",
         default=["extract", "masks", "keypoints", "reconstruct"],
-        help="Pipeline steps to execute.",
-    )
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Launch the GUI instead of running through the CLI.",
+        help="Initial pipeline step selection in the GUI.",
     )
     parser.add_argument(
         "--config",
@@ -1408,6 +1462,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mask fitting weight for optimization.",
     )
     parser.add_argument(
+        "--keypoints-weight",
+        type=float,
+        dest="keypoints_weight",
+        help="Keypoint reprojection weight for optimization.",
+    )
+    parser.add_argument(
+        "--view-weights",
+        type=str,
+        dest="view_weights",
+        help="Comma-separated view weights (e.g. '1,0.8,1').",
+    )
+    parser.add_argument(
         "--no-save-models",
         action="store_false",
         dest="save_models",
@@ -1460,6 +1526,10 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.bone_length_constraint_weight = args.bone_length_constraint_weight
     if getattr(args, "mask_weight", None) is not None:
         config.mask_weight = args.mask_weight
+    if getattr(args, "keypoints_weight", None) is not None:
+        config.keypoints_weight = args.keypoints_weight
+    if getattr(args, "view_weights", None) is not None:
+        config.view_weights = args.view_weights
     if hasattr(args, "save_models") and args.save_models is not None:
         config.save_models = args.save_models
     return config
@@ -1469,7 +1539,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.gui and tk is None:
+    if tk is None:
         parser.error("tkinter is not available; GUI mode cannot be used.")
 
     config = PipelineConfig()
@@ -1479,13 +1549,8 @@ def main() -> None:
 
     config = update_config_from_args(config, args)
 
-    if args.gui:
-        run_gui(config, args.steps)
-        return
-
-    run_pipeline(config, args.steps)
+    run_gui(config, args.steps)
 
 
 if __name__ == "__main__":
     main()
-
