@@ -42,26 +42,25 @@ class fish_model:
         """
         Args:
             mesh: path to json file containing fish model
-            device: 'cpu' or 'cuda'
         """
         self.device = torch.device("cpu")
         self.device_active = False
 
         with open(mesh_json_path, "r") as infile:
-            dd = json.load(infile)
+            template = json.load(infile)
 
-        self.dd = dd
+        self.template = template
 
-        self.n_bones = dd["n_bones"]
+        self.n_bones = template["n_bones"]
         # the first bone is treated differently from all the other bones (first bone: global orientation fitting; body bones: pose fitting)
         # So n_body_bones excludes the first bone
-        self.n_body_bones = dd["n_bones"] - 1
+        self.n_body_bones = template["n_bones"] - 1
 
         # we always have one more joint than bone (the head)
-        self.n_joints = len(dd["J"])
+        self.n_joints = len(template["J"])
 
         # triangulate if input mesh has quad faces
-        fish_faces = dd["F"]
+        fish_faces = template["F"]
         triangle_faces = []
         for face in fish_faces:
             if len(face) == 4:
@@ -73,19 +72,19 @@ class fish_model:
                 raise Exception("face data incorrect: got vertices number not in [3,4]")
         self.faces = torch.tensor(triangle_faces)
 
-        self.kintree_table = torch.tensor(dd["kintree_table"])[:, :]
+        self.kintree_table = torch.tensor(template["kintree_table"])[:, :]
         self.parent_indices = self.kintree_table[0][:]
 
         # a bone group is a set of indices for bones and keypoints that are going to be reconstructed together in one optimizer stage
         # keypoints and bones belonging to group 0 are at keypoint_groups[0] and bone_groups[0], respectively
-        self.bone_groups = [bg["bone_indices"] for bg in dd["bone_groups"]]
-        self.keypoint_groups = [bg["keypoint_indices"] for bg in dd["bone_groups"]]
+        self.bone_groups = [bg["bone_indices"] for bg in template["bone_groups"]]
+        self.keypoint_groups = [bg["keypoint_indices"] for bg in template["bone_groups"]]
 
-        self.weights = torch.tensor(dd["weights"])
-        self.vert2kpt = torch.tensor(dd["vert2kpt"])
+        self.weights = torch.tensor(template["weights"])
+        self.vert2kpt = torch.tensor(template["vert2kpt"])
 
-        self.J = torch.tensor(dd["J"], dtype=torch.float32).unsqueeze(0) # (1,J,3)
-        self.virtual_bone_mask = torch.tensor(dd["virtual_bone_mask"]) # (n_bones) binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1)
+        self.J = torch.tensor(template["J"], dtype=torch.float32).unsqueeze(0) # (1,J,3)
+        self.virtual_bone_mask = torch.tensor(template["virtual_bone_mask"]) # (n_bones) binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1)
         # set the mesh local space to head space (head joint at origin; head-bone local axes aligned with world axes)
         # use rest_rot_world from the mesh json.
 
@@ -111,9 +110,9 @@ class fish_model:
             return rot_matrix_passive
         
         def get_root_rest_rotation_world():
-            bone_tree = dd.get("bone_names_tree", {})
+            bone_tree = template.get("bone_names_tree", {})
 
-            root_bone_name = dd["bone_order"][0]
+            root_bone_name = template["bone_order"][0]
             if root_bone_name not in bone_tree:
                 raise ValueError(f"Root bone {root_bone_name} does not have a corresponding entry in the bone tree of the json file. Please make sure that the root bone has an entry in the bone tree and that the bone tree is correctly formatted.")
 
@@ -140,7 +139,7 @@ class fish_model:
         self.J = self.J - translation_head_to_origin
         self.J = torch.matmul(self.J, R_model_space_to_head_space)
 
-        self.V = torch.tensor(dd["V"]).unsqueeze(0) # (1,V,3)
+        self.V = torch.tensor(template["V"]).unsqueeze(0) # (1,V,3)
         # apply the same rotation and translation to the vertices as we did to the joints in order to keep them in the same local space
         self.V = torch.matmul(self.V - translation_head_to_origin, R_model_space_to_head_space)
 
@@ -160,15 +159,16 @@ class fish_model:
 
         self.LBS = LBS(self.J, self.parent_indices, self.weights, self.virtual_bone_mask)
 
-        # Body_pose angle limit (import priors from fish template json)
-        # angle limits are specified for each component in an exponential map (axis-angle where angle is specified as the length of the axis vector)
+        # global_ori and body_pose angle limits (import priors from fish template json)
+        # angle limits are specified for each component in swing-twist representation (swing_x, twist_y, swing_z) (in radian) for each bone
+        # where swing_x and swing_z are x- and y- radii of an ellipse that bounds the swing rotation, and twist_y is the maximum allowed twist rotation around the y-axis.
         bone_angle_priors = []
-        for bname in dd["bone_order"]:
-            if bname not in dd["bone_priors"]:
+        for bname in template["bone_order"]:
+            if bname not in template["bone_priors"]:
                 raise ValueError(f"Bone {bname} does not have a corresponding prior in the json file. Please make sure that all bones have priors specified.")
-            prior = dd["bone_priors"][bname]
+            prior = template["bone_priors"][bname]
             bone_angle_priors.extend([prior["swing_x"], prior["twist_y"], prior["swing_z"]])
-        self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, nb, 3) in exponential map representation (swing_x, twist_y, swing_z)
+        self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, n_bones, 3) (swing_x, twist_y, swing_z)
 
         # Body bone length limit
         self.bone_length_min = [1.0] * (self.n_body_bones)
@@ -252,13 +252,16 @@ class fish_model:
 
         # LBS
         if deform:
-            verts, body_pose_template_space = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
-            # body_pose_head_space describes the *active* rotation of each bone in the coordinate system where the y-axis
+            verts, global_ori_plus_body_pose_template_space = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
+            # global_ori_plus_body_pose_template_space describes the *active* rotation of each bone in the coordinate system where the y-axis
             # is the head-joint-to-first-body-joint direction in the rest pose.
-            # However, each bone's rest-pose twist axis might not be aligned with the head-joint-to-first-body-joint direction in the rest pose. 
-            # We need to express the bone pose from the head space to the local space of the rest bone head (where the y-axis is the twist axis)
+            # However, each bodybone's rest-pose twist axis might not be aligned with the head-joint-to-first-body-joint direction in the rest pose. 
+            # We need to convert the bone pose from the mesh local space to the local space of the rest bone head (where the y-axis is the twist axis)
             # in order to align the twist axis of the rotation with the twist axis of the bone in the rest pose.
-            body_bone_poses_rest_bone_spaces = (self.rot_mats_to_body_bone_rest_local_spaces.unsqueeze(0) @ body_pose_template_space) # (1, n_body_bones, 3, 3)
+            global_ori_mat = global_ori_plus_body_pose_template_space[:, 0] # (1, 3, 3) global rotation in mesh local space
+            body_bone_poses_rest_bone_spaces = (
+                self.rot_mats_to_body_bone_rest_local_spaces.unsqueeze(0) @ global_ori_plus_body_pose_template_space[:, 1:]
+            ) # (1, n_body_bones, 3, 3)
             # comment: tail_artic_local = to_local @ pose_world @ tail_rest_world
             # @ is associative, so we can do 
             # tail_artic_local = M @ tail_rest_world
@@ -268,10 +271,15 @@ class fish_model:
             # print(f"   body_pose_template_space: {body_pose_template_space}")
             # print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
 
+            global_ori_plus_body_pose_mats = torch.cat(
+                [global_ori_mat.unsqueeze(1), body_bone_poses_rest_bone_spaces], dim=1
+            ) # (1, n_bones, 3, 3)
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
-            body_bone_poses_rest_bone_spaces = matrix_to_quaternion(body_bone_poses_rest_bone_spaces.squeeze()).unsqueeze(0).cpu() # (1, n_body_bones, 4) (w, x, y, z)
+            global_ori_plus_body_pose_rest_bone_spaces = matrix_to_quaternion(
+                global_ori_plus_body_pose_mats.squeeze()
+            ).unsqueeze(0).cpu() # (1, n_bones, 4) (w, x, y, z)
         else:
-            verts, body_pose_template_space = V, None
+            verts, global_ori_plus_body_pose_template_space = V, None
 
         # Calculate 3d keypoint from new vertices resulted from pose
         keypoints = []
@@ -281,6 +289,6 @@ class fish_model:
         keypoints = torch.stack(keypoints)
 
         # Final output after articulation
-        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu(), "body_bone_poses_rest_bone_spaces": body_bone_poses_rest_bone_spaces}
+        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu(), "global_ori_plus_body_pose_rest_bone_spaces": global_ori_plus_body_pose_rest_bone_spaces}
 
         return output

@@ -3,7 +3,13 @@ from typing import Optional
 import torch
 from src import fish_model_edit as fish_model
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
-from src.losses_edit import keypoint_reprojection_loss_global, kpt_repr_plus_bone_pose_and_length_loss, mask_fitting_loss
+from src.losses_edit import (
+    kpt_reprojection_loss,
+    bone_angle_constraint_loss,
+    bone_length_constraint_loss,
+    init_deviation_loss,
+    mask_fitting_loss,
+)
 
 
 class OptimizeMV:
@@ -22,6 +28,7 @@ class OptimizeMV:
         fish_model_obj: fish_model.fish_model,
         angle_constraint_weight: float = 1.0,
         smooth_weight: float = 1.0,
+        big_artic_weight: float = 1.0,
         bone_length_constraint_weight: float = 1.0,
         mask_weight: float = 1.0,
         keypoints_weight: float = 1.0,
@@ -36,6 +43,7 @@ class OptimizeMV:
         self.num_iters = num_iters
         self.angle_constraint_weight = angle_constraint_weight
         self.smooth_weight = smooth_weight
+        self.big_artic_weight = big_artic_weight
         self.bone_length_constraint_weight = bone_length_constraint_weight
         self.mask_weight = mask_weight
         self.keypoints_weight = keypoints_weight
@@ -150,7 +158,11 @@ class OptimizeMV:
         global_t          = init_t.detach().clone().requires_grad_(True)
         scale             = init_scale.detach().clone().requires_grad_(True)
 
-
+        # ===== keep copies of initial body pose and bone length for smoothness prior =====
+        init_global_ori       = global_orient.detach().clone()
+        init_body_pose        = body_pose.detach().clone()
+        init_body_bone_length = body_bone_length.detach().clone()
+        
 
         # ============ Stage 1: optimize global_orient, translation, scale ============
         # loss: 
@@ -158,6 +170,7 @@ class OptimizeMV:
         # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights),
         # mask smooth-L1 loss (weighted by mask_weight and view_weights),
         # global_t smoothness prior vs init_t (weighted by smooth_weight)
+        # global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
         # ===================================
 
         opt_global = torch.optim.Adam(
@@ -181,7 +194,7 @@ class OptimizeMV:
             # Keypoint reprojection loss
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             loss = (
-                keypoint_reprojection_loss_global(
+                kpt_reprojection_loss(
                     model_kpts,
                     proj_m_from_blworld,
                     kpts_2d,
@@ -189,7 +202,9 @@ class OptimizeMV:
                     keypoints_weight=self.keypoints_weight,
                     view_weights=view_weights,
                 )
+                # smoothness loss vs initialization (previous frame)
                 + self.smooth_weight * (global_t - init_t).abs().sum()
+                + self.smooth_weight * (global_orient - init_global_ori).abs().sum()
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -200,7 +215,6 @@ class OptimizeMV:
             )
             if not torch.isfinite(loss):
                 raise ValueError("Error: Stage 1 produced non-finite loss. Stopping Stage 1 early.")
-                break
 
             opt_global.zero_grad()
             loss.backward()
@@ -227,7 +241,7 @@ class OptimizeMV:
         #   - twist-limit violation,
         #   - swing ellipse violation with locked-axis handling for zero swing priors,
         # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-        # smoothness prior on body pose/bone length (weighted by smooth_weight; in this stage to zero/init defaults)
+        # body pose and body bone length smooth loss compared to initialization (weighted by smooth_weight)
         # ===================================
 
         first_bone_group = self.fish.bone_groups[0]
@@ -293,28 +307,44 @@ class OptimizeMV:
             m_kpts = out["keypoints"].to(self.device) + global_t
             m_kpts = m_kpts.expand(batch_size, -1, -1)
 
-            bone_local_oris = out["body_bone_poses_rest_bone_spaces"].to(self.device)
-            bone_local_oris_bone_group = torch.where(
+            bone_local_oris = out["global_ori_plus_body_pose_rest_bone_spaces"].to(self.device)
+            bone_local_oris_first_bone_group = torch.where(
                 in_first_bone_group.unsqueeze(-1), 
-                bone_local_oris, 
+                bone_local_oris[:, 1:], # exclude head bone
                 torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4)
-            ) # (1, bn, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
-            loss = kpt_repr_plus_bone_pose_and_length_loss(
-                m_kpts,
-                self.fish.bone_angle_priors,
-                self.fish.bone_length_min,
-                self.fish.bone_length_max,
-                proj_m_from_blworld,
-                kpts_2d,
-                kpts_conf,
-                keypoints_weight=self.keypoints_weight,
-                view_weights=view_weights,
-                body_pose=recombined_body_pose.flatten(1),
-                body_bone_ori_rest_head_spaces=bone_local_oris_bone_group,
-                bone_length=recombined_body_bone_length,
-                angle_constraint_weight=self.angle_constraint_weight,
-                smooth_weight=self.smooth_weight,
-                bone_length_constraint_weight=self.bone_length_constraint_weight,
+            ) # (1, n_body_bones, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
+            bone_local_oris_first_bone_group = torch.cat(
+                [bone_local_oris[:, :1] if 0 in first_bone_group else torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4),
+                 bone_local_oris_first_bone_group], 
+                dim=1
+            ) # add back head bone at the start if it is in the first bone group; else add identity quat
+            loss = (
+                kpt_reprojection_loss(
+                    model_keypoints=m_kpts,
+                    proj_m=proj_m_from_blworld,
+                    keypoints_2d=kpts_2d,
+                    keypoints_conf=kpts_conf,
+                    keypoints_weight=self.keypoints_weight,
+                    view_weights=view_weights,
+                )
+                + bone_angle_constraint_loss(
+                    bone_angle_priors=self.fish.bone_angle_priors,
+                    global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_first_bone_group,
+                    angle_constraint_weight=self.angle_constraint_weight,
+                )
+                + bone_length_constraint_loss(
+                    bone_length=recombined_body_bone_length,
+                    bone_length_min=self.fish.bone_length_min,
+                    bone_length_max=self.fish.bone_length_max,
+                    bone_length_constraint_weight=self.bone_length_constraint_weight,
+                )
+                + init_deviation_loss(
+                    body_pose=recombined_body_pose,
+                    bone_length=recombined_body_bone_length,
+                    smooth_weight=self.smooth_weight,
+                    pose_init=init_body_pose,
+                    bone_init=init_body_bone_length,
+                )
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -348,7 +378,7 @@ class OptimizeMV:
             # body_pose, 
             # bone_length, 
             # global_t,
-            # global_orient 
+            # global_orient (if bone group includes root bone),
             # scale
             # --------------
             # loss: 
@@ -359,13 +389,15 @@ class OptimizeMV:
             #   - twist-limit violation,
             #   - swing ellipse violation with locked-axis handling for zero swing priors,
             # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-            # smooth loss compared to previous stage (weighted by smooth_weight)
+            # smooth loss compared to *previous stage* (weighted by big_artic_weight) 
+            # (!! in stage 2, the smooth difference was determined by the difference to init parameters and weighted by smooth_weight !!)
             # ===================================
 
             for bg_idx, bone_group in enumerate(self.fish.bone_groups[1:]):
                 # the loop starts enumerating at the second bone group, so bg_idx 0 is actually bg_idx 1 and so on
                 bg_idx = bg_idx+1 
-                # body pose excludes head joint so each bone index is actually one higher
+                # body pose excludes head joint; bone indeces stored in a bone group don't,
+                # so each bone index is actually one higher in the body pose and body bone length tensors
                 in_bone_group = torch.tensor(
                     [(b_idx + 1) in bone_group for b_idx in range(body_pose.size(1))],
                     dtype=torch.bool, device=self.device
@@ -383,19 +415,31 @@ class OptimizeMV:
                 optimizable_body_pose        = body_pose[:, in_bone_group, :].detach().clone().requires_grad_(True)
                 optimizable_body_bone_length = body_bone_length[:, in_bone_group].detach().clone().requires_grad_(True)
 
-                opt_bone_group = torch.optim.Adam(
-                    [optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale],
-                    lr=self.step_size,
-                )
+                # if the bone group includes the root bone, allow optimization of global orientation as well
+                if 0 in bone_group:
+                    global_orient.requires_grad_(True)
+                    opt_bone_group = torch.optim.Adam(
+                        [optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale],
+                        lr=self.step_size,
+                    )
+                else:
+                    global_orient.requires_grad_(False)
+                    opt_bone_group = torch.optim.Adam(
+                        [optimizable_body_pose, optimizable_body_bone_length, global_t, scale],
+                        lr=self.step_size,
+                    )
 
                 # reset kpts_conf because we manually set some entries to 0 in stage 2
                 reset_kpts_conf()
 
                 # Disable keypoints that don't belong to the bone group for this stage
                 kpts_conf[:, not_in_kpt_group] = 0
-
-                init_bp = body_pose.clone().detach()
-                init_bl = body_bone_length.clone().detach()
+                
+                # keep body pose and body bone length from previous stage for smoothness prior comparison, so that each bone group is optimized to be close to the previous stage's solution on the entire body pose and bone length
+                prev_bp = body_pose.clone().detach()
+                prev_bl = body_bone_length.clone().detach()
+                global_orient_prev = global_orient.clone().detach()
+                global_t_prev = global_t.clone().detach()
                 for i in range(self.num_iters):
                     # print(f"Stage 3 - global ori: {global_orient}")
                     # print(f"Stage 3 - body global t: {global_t}")
@@ -412,31 +456,49 @@ class OptimizeMV:
                     )
                     m_kpts = out["keypoints"].to(self.device) + global_t
                     m_kpts = m_kpts.expand(batch_size, -1, -1)
-                    bone_local_oris = out["body_bone_poses_rest_bone_spaces"].to(self.device)
+                    bone_local_oris = out["global_ori_plus_body_pose_rest_bone_spaces"].to(self.device)
                     bone_local_oris_bone_group = torch.where(
                         in_bone_group.unsqueeze(-1), 
-                        bone_local_oris, 
+                        bone_local_oris[:, 1:], # exclude head bone
                         torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4)
-                    ) # (1, bn, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
-                    loss = kpt_repr_plus_bone_pose_and_length_loss(
-                        m_kpts,
-                        self.fish.bone_angle_priors,
-                        self.fish.bone_length_min,
-                        self.fish.bone_length_max,
-                        proj_m_from_blworld,
-                        kpts_2d,
-                        kpts_conf,
-                        keypoints_weight=self.keypoints_weight,
-                        view_weights=view_weights,
-                        body_pose=recombined_body_pose.flatten(1),
-                        body_bone_ori_rest_head_spaces=bone_local_oris_bone_group,
-                        bone_length=recombined_body_bone_length,
-                        angle_constraint_weight=self.angle_constraint_weight,
-                        smooth_weight=self.smooth_weight,
-                        bone_length_constraint_weight=self.bone_length_constraint_weight,
-                        pose_init=init_bp.flatten(1),
-                        bone_init=init_bl,
+                    ) # (1, n_body_bones, 4) quaternions (w, x, y, z), set to identity quat for non-optimized bones
+                    bone_local_oris_bone_group = torch.cat(
+                        [bone_local_oris[:, :1] if 0 in bone_group else torch.tensor([1, 0, 0, 0], device=self.device).view(1, 1, 4),
+                        bone_local_oris_bone_group], 
+                        dim=1
+                    ) # add back head bone at the start if it is in the first bone group; else add identity quat
+                    loss = (
+                        kpt_reprojection_loss(
+                            model_keypoints=m_kpts,
+                            proj_m=proj_m_from_blworld,
+                            keypoints_2d=kpts_2d,
+                            keypoints_conf=kpts_conf,
+                            keypoints_weight=self.keypoints_weight,
+                            view_weights=view_weights,
+                        )
+                        + bone_angle_constraint_loss(
+                            bone_angle_priors=self.fish.bone_angle_priors,
+                            global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_bone_group,
+                            angle_constraint_weight=self.angle_constraint_weight,
+                        )
+                        + bone_length_constraint_loss(
+                            bone_length=recombined_body_bone_length,
+                            bone_length_min=self.fish.bone_length_min,
+                            bone_length_max=self.fish.bone_length_max,
+                            bone_length_constraint_weight=self.bone_length_constraint_weight,
+                        )
+                        + init_deviation_loss(
+                            body_pose=recombined_body_pose.flatten(1),
+                            bone_length=recombined_body_bone_length,
+                            smooth_weight=self.big_artic_weight,
+                            pose_init=prev_bp.flatten(1),
+                            bone_init=prev_bl,
+                        )
                     )
+                    # smoothness prior vs previous stage's solution for
+                    if 0 in bone_group:
+                        loss += self.big_artic_weight * (global_orient - global_orient_prev).abs().sum()
+                    loss += self.big_artic_weight * (global_t - global_t_prev).abs().sum()
                     # Silhouette loss
                     silhouette_renders = silhouette_renderer(
                         out["vertices"], self.faces.unsqueeze(0), global_t

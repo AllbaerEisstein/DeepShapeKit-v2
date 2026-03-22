@@ -728,12 +728,17 @@ def get_mesh_json(context):
     v2k = [list(keypoint) for keypoint in v2k]
 
     # -- priors
-    # set default to "no restriction" (180 Swing; 360 Twist) for every bone, including virtual bones
+    # set default to "no restriction" (180 Swing; 360 Twist) for every real bone
+    # set default to "locked" (0 Swing; 0 Twist) for every virtual bone
     bone_name_2_prior = {
         name: {
             "swing_x": 3.14159,
             "swing_z": 3.14159,
             "twist_y": 2*3.14159,
+        } if name not in virtual_bone_names else {
+            "swing_x": 0.0,
+            "swing_z": 0.0,
+            "twist_y": 0.0,
         } for name in bone_names_ordered
     }
 

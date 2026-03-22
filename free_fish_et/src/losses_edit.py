@@ -27,19 +27,19 @@ def gmof(x, sigma):
     return (sigma_squared * x_squared) / (sigma_squared + x_squared)
 
 
-def keypoint_reprojection_loss_global(
+def kpt_reprojection_loss(
     model_keypoints: torch.Tensor,
     proj_m: torch.Tensor,
     keypoints_2d: torch.Tensor,
     keypoints_conf: torch.Tensor,
-    keypoints_weight: torch.Tensor,
-    view_weights: torch.Tensor,
+    keypoints_weight: torch.Tensor | float = 1.0,
+    view_weights: Optional[torch.Tensor] = None,
+    sigma: float = 50,
 ):
     # Project model keypoints
     projected_keypoints = perspective_projection(model_keypoints, proj_m)
 
     # Weighted robust reprojection loss
-    sigma = 50
     # this returns Geman-McClure rubustified x², y² for each kpt:
     reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma) 
     # here, sum x² and y² and scale by conf -> squared L2-error per kpt:
@@ -48,6 +48,12 @@ def keypoint_reprojection_loss_global(
     # finally, sum error of each kpt -> we get a sum of squared, Geman-McClure robustified L2-errors per view
     total_loss = reprojection_loss.sum(dim=-1)
 
+    if view_weights is None:
+        view_weights = torch.ones(
+            total_loss.shape[0],
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        )
     # apply keypoint and per-view weights before summing over views
     total_loss = keypoints_weight * view_weights * total_loss
     return total_loss.sum() 
@@ -112,45 +118,25 @@ def decompose_to_swing_twist(quats):
     return torch.stack([swing_x, twists, swing_z], dim=-1)  # (BS, bn, 3)
 
 
-def kpt_repr_plus_bone_pose_and_length_loss(
-    model_keypoints: torch.Tensor,
+def bone_angle_constraint_loss(
     bone_angle_priors: torch.Tensor,
-    bone_length_min: torch.Tensor,
-    bone_length_max: torch.Tensor,
-    proj_m: torch.Tensor,
-    keypoints_2d: torch.Tensor,
-    keypoints_conf: torch.Tensor,
-    keypoints_weight: torch.Tensor,
-    view_weights: torch.Tensor,
-    body_pose: torch.Tensor,
-    body_bone_ori_rest_head_spaces: torch.Tensor,
-    bone_length: torch.Tensor,
-    sigma=50,
+    global_ori_plus_body_pose_rest_head_spaces: torch.Tensor,
     angle_constraint_weight: float = 1.0,
-    smooth_weight: float = 1.0,
-    bone_length_constraint_weight: float = 1.0,
-    pose_init: Optional[torch.Tensor] = None,
-    bone_init: Optional[torch.Tensor] = None,
 ):
-    # Project model keypoints
-    device = body_pose.device
-    projected_keypoints = perspective_projection(model_keypoints, proj_m)
-
-    # Weighted robust reprojection loss
-    reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma)
-    reprojection_loss = ((keypoints_conf**2) * reprojection_error.sum(dim=-1)) * keypoints_weight
-    reprojection_loss = reprojection_loss.sum(dim=-1) * view_weights
-
-    # Joint angle limit loss
-    swing_twist = decompose_to_swing_twist(body_bone_ori_rest_head_spaces) # (BS, bn, 3)
-    bone_angle_priors_batch = bone_angle_priors[:, 1:].repeat(body_pose.shape[0], 1, 1) # (BS, body_bones, 3) repeat priors for each batch element
+    """
+    Args:
+        bone_angle_priors: (1, n_bones, 3) tensor of swing_x, twist_y, swing_z angle limits for each bone; swing limits are treated as elliptical limits on the swing_x and swing_z components of the swing-twist decomposition, while twist limits are treated as simple scalar limits on the twist component.
+        global_ori_plus_body_pose_rest_head_spaces: (BS, n_bones, 4) tensor of bone orientation quats (including head bone); each in the coordinate frame of its rest pose head joint
+    """
+    swing_twist = decompose_to_swing_twist(global_ori_plus_body_pose_rest_head_spaces) # (BS, bn, 3)
+    bone_angle_priors_batch = bone_angle_priors.repeat(
+        global_ori_plus_body_pose_rest_head_spaces.shape[0], 1, 1
+    ) # (BS, n_bones, 3) repeat priors for each batch element
 
     # Add a loss according to the amount of violation of the angle limits
-
     # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
     eps = 1e-8
     twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp_min(eps))**2 # (BS, bn)
-    # print("Twist loss:", twist_loss.sum().item())
     
     # this function checks if swing_x,swing_z are within an ellipse with the priors as radii.
     # If a prior is exactly zero, that axis is treated as locked and penalized directly without division.
@@ -189,36 +175,41 @@ def kpt_repr_plus_bone_pose_and_length_loss(
         + z_bound_penalty
         + x_bound_penalty
     )
-    # print("Swing loss:", swing_loss.sum().item())
-    bone_angle_prior_loss = angle_constraint_weight * (swing_loss + twist_loss).sum(dim=-1) # sum swing and twist loss, then sum over bones -> (BS,)
+    bone_angle_prior_loss = angle_constraint_weight * (swing_loss + twist_loss).sum(dim=-1) # (BS,)
+    return bone_angle_prior_loss.sum()
 
-    # Prior Loss: difference to initialization paramaters (either from prior frame or from prior optimization stage)
-    if pose_init == None or bone_init == None:
-        init_prior_loss = body_pose.abs()
-        init_prior_loss = smooth_weight * init_prior_loss
-    else:
-        init_prior_loss = (body_pose - pose_init).abs().sum() + (
-            bone_length - bone_init
-        ).abs().sum()
-        init_prior_loss = smooth_weight * init_prior_loss
 
-    # Bone Length Limit Loss
+def bone_length_constraint_loss(
+    bone_length: torch.Tensor,
+    bone_length_min: torch.Tensor,
+    bone_length_max: torch.Tensor,
+    bone_length_constraint_weight: float = 1.0,
+):
+    device = bone_length.device
     max_bone = bone_length_max.repeat(1, 1).to(device)
     min_bone = bone_length_min.repeat(1, 1).to(device)
     # Add a loss if the length is lower than min or higher than max
     bone_length_prior_loss =   (bone_length - max_bone).clamp(0, float("Inf")) \
                 + (min_bone - bone_length).clamp(0, float("Inf"))
     bone_length_prior_loss = bone_length_constraint_weight * bone_length_prior_loss
+    return bone_length_prior_loss.sum()
 
-    # sum over batches (views)
-    total_loss = (
-        reprojection_loss
-        + bone_angle_prior_loss.sum()
-        + init_prior_loss.sum()
-        + bone_length_prior_loss.sum()
-    )
 
-    return total_loss.sum()
+def init_deviation_loss(
+    body_pose: torch.Tensor,
+    bone_length: torch.Tensor,
+    smooth_weight: float,
+    pose_init: torch.Tensor,
+    bone_init: torch.Tensor,
+):
+    """
+    difference to initialization paramaters (either from prior frame or from prior optimization stage)
+    """
+    init_prior_loss = (body_pose - pose_init).abs().sum() + (
+        bone_length - bone_init
+    ).abs().sum()
+    init_prior_loss = smooth_weight * init_prior_loss
+    return init_prior_loss.sum()
 
 
 def mask_fitting_loss(proj_masks, masks, mask_weight, view_weights):

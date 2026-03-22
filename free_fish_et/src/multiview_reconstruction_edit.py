@@ -783,6 +783,7 @@ def reconstruct(
     num_iters: int = 100,
     angle_constraint_weight: float = 200.0,
     smooth_weight: float = 30.0,
+    big_artic_weight: float = 30.0,
     bone_length_constraint_weight: float = 200.0,
     mask_weight: float = 200.0,
     keypoints_weight: float = 1.0,
@@ -811,12 +812,13 @@ def reconstruct(
             "Provide a comma-separated list with one weight per view index."
         )
     print("   Device:", device)
-    print("   Weights:")
-    print("     Mask reprojection:", mask_weight)
-    print("     Keypoint reprojection:", keypoints_weight)
-    print("     Smoothness:", smooth_weight)
-    print("     Bone angle constraint:", angle_constraint_weight)
-    print("     Bone length constraint:", bone_length_constraint_weight)
+    print("   Contributions to the loss function:")
+    print("     Mask reprojection error:          ", mask_weight)
+    print("     Keypoint reprojection error:      ", keypoints_weight)
+    print("     Smoothness violation:             ", smooth_weight)
+    print("     Bone angle constraint violation:  ", angle_constraint_weight)
+    print("     Bone length constraint violation: ", bone_length_constraint_weight)
+    print("     Bone group deviation:             ", big_artic_weight)
     print("     Views:")
     for view_name, weight in zip(dataset.views, view_weights):
         print(f"          {view_name}: {weight}")
@@ -831,6 +833,7 @@ def reconstruct(
         num_iters=num_iters,
         angle_constraint_weight=angle_constraint_weight,
         smooth_weight=smooth_weight,
+        big_artic_weight=big_artic_weight,
         bone_length_constraint_weight=bone_length_constraint_weight,
         mask_weight=mask_weight,
         keypoints_weight=keypoints_weight,

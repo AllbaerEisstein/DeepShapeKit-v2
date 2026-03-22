@@ -66,6 +66,7 @@ class PipelineConfig:
     num_iters: int = 100
     angle_constraint_weight: float = 200.0
     smooth_weight: float = 30.0
+    big_artic_weight: float = 30.0
     bone_length_constraint_weight: float = 200.0
     mask_weight: float = 200.0
     keypoints_weight: float = 1.0
@@ -326,6 +327,7 @@ def run_pipeline(
             num_iters=config.num_iters,
             angle_constraint_weight=config.angle_constraint_weight,
             smooth_weight=config.smooth_weight,
+            big_artic_weight=config.big_artic_weight,
             bone_length_constraint_weight=config.bone_length_constraint_weight,
             mask_weight=config.mask_weight,
             keypoints_weight=config.keypoints_weight,
@@ -675,6 +677,7 @@ class PipelineGUI:
         self.num_iters_var = tk.StringVar(value=str(self.config.num_iters))
         self.angle_constraint_weight_var = tk.StringVar(value=str(self.config.angle_constraint_weight))
         self.smooth_weight_var = tk.StringVar(value=str(self.config.smooth_weight))
+        self.big_artic_weight_var = tk.StringVar(value=str(self.config.big_artic_weight))
         self.bone_length_constraint_weight_var = tk.StringVar(value=str(self.config.bone_length_constraint_weight))
         self.mask_weight_var = tk.StringVar(value=str(self.config.mask_weight))
         self.keypoints_weight_var = tk.StringVar(value=str(self.config.keypoints_weight))
@@ -856,22 +859,25 @@ class PipelineGUI:
         ttk.Label(optimization_frame, text="smooth_weight").grid(row=2, column=0, sticky="w", pady=2, padx=(6, 4))
         ttk.Entry(optimization_frame, textvariable=self.smooth_weight_var).grid(row=2, column=1, sticky="ew", pady=2, padx=(0, 6))
 
-        ttk.Label(optimization_frame, text="bone_length_constraint_weight").grid(row=3, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.bone_length_constraint_weight_var).grid(row=3, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_frame, text="big_artic_weight").grid(row=3, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.big_artic_weight_var).grid(row=3, column=1, sticky="ew", pady=2, padx=(0, 6))
 
-        ttk.Label(optimization_frame, text="mask_weight").grid(row=4, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.mask_weight_var).grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_frame, text="bone_length_constraint_weight").grid(row=4, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.bone_length_constraint_weight_var).grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 6))
 
-        ttk.Label(optimization_frame, text="keypoints_weight").grid(row=5, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.keypoints_weight_var).grid(row=5, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_frame, text="mask_weight").grid(row=5, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.mask_weight_var).grid(row=5, column=1, sticky="ew", pady=2, padx=(0, 6))
 
-        ttk.Label(optimization_frame, text="view_weights").grid(row=6, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.view_weights_var).grid(row=6, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_frame, text="keypoints_weight").grid(row=6, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.keypoints_weight_var).grid(row=6, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        ttk.Label(optimization_frame, text="view_weights").grid(row=7, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.view_weights_var).grid(row=7, column=1, sticky="ew", pady=2, padx=(0, 6))
         ttk.Label(
             optimization_frame,
             text="Comma-separated by view index (single value broadcasts).",
             foreground="#777",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 4), padx=(6, 6))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 4), padx=(6, 6))
 
         self.advanced_frame.grid_remove()
         row += 1
@@ -1014,6 +1020,7 @@ class PipelineGUI:
         try:
             config.angle_constraint_weight = float(self.angle_constraint_weight_var.get().strip())
             config.smooth_weight = float(self.smooth_weight_var.get().strip())
+            config.big_artic_weight = float(self.big_artic_weight_var.get().strip())
             config.bone_length_constraint_weight = float(self.bone_length_constraint_weight_var.get().strip())
             config.mask_weight = float(self.mask_weight_var.get().strip())
             config.keypoints_weight = float(self.keypoints_weight_var.get().strip())
@@ -1083,6 +1090,7 @@ class PipelineGUI:
         self.num_iters_var.set(str(config.num_iters))
         self.angle_constraint_weight_var.set(str(config.angle_constraint_weight))
         self.smooth_weight_var.set(str(config.smooth_weight))
+        self.big_artic_weight_var.set(str(config.big_artic_weight))
         self.bone_length_constraint_weight_var.set(str(config.bone_length_constraint_weight))
         self.mask_weight_var.set(str(config.mask_weight))
         self.keypoints_weight_var.set(str(config.keypoints_weight))
@@ -1450,6 +1458,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Smoothness weight for optimization.",
     )
     parser.add_argument(
+        "--big-artic-weight",
+        type=float,
+        dest="big_artic_weight",
+        help="Smoothness weight for big articulation stage (stage 3).",
+    )
+    parser.add_argument(
         "--bone-length-constraint-weight",
         type=float,
         dest="bone_length_constraint_weight",
@@ -1522,6 +1536,8 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.angle_constraint_weight = args.angle_constraint_weight
     if getattr(args, "smooth_weight", None) is not None:
         config.smooth_weight = args.smooth_weight
+    if getattr(args, "big_artic_weight", None) is not None:
+        config.big_artic_weight = args.big_artic_weight
     if getattr(args, "bone_length_constraint_weight", None) is not None:
         config.bone_length_constraint_weight = args.bone_length_constraint_weight
     if getattr(args, "mask_weight", None) is not None:
