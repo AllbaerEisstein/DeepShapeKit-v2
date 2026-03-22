@@ -800,6 +800,16 @@ def reconstruct(
 
     print("\n" + "="*40)
     print("Starting multiview reconstruction with the following settings:")
+    dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
+    n_views = len(dataset.views)
+    if view_weights is None or len(view_weights) == 0:
+        view_weights = [1.0] * n_views
+    elif len(view_weights) != n_views:
+        raise ValueError(
+            "view_weights length mismatch: "
+            f"got {len(view_weights)} weight(s) for {n_views} view(s) {dataset.views}. "
+            "Provide a comma-separated list with one weight per view index."
+        )
     print("   Device:", device)
     print("   Weights:")
     print("     Mask reprojection:", mask_weight)
@@ -807,22 +817,11 @@ def reconstruct(
     print("     Smoothness:", smooth_weight)
     print("     Bone angle constraint:", angle_constraint_weight)
     print("     Bone length constraint:", bone_length_constraint_weight)
+    print("     Views:")
+    for view_name, weight in zip(dataset.views, view_weights):
+        print(f"          {view_name}: {weight}")
     print("="*40 + "\n")
 
-    dataset = Multiview_Dataset(root=dataset_dir, views=video_names)
-    n_views = len(dataset.views)
-    if view_weights is None or len(view_weights) == 0:
-        view_weights = [1.0] * n_views
-    elif len(view_weights) == 1:
-        # Convenience behavior for the GUI default: a single value is broadcast to all views.
-        view_weights = [float(view_weights[0])] * n_views
-    elif len(view_weights) != n_views:
-        raise ValueError(
-            "view_weights length mismatch: "
-            f"got {len(view_weights)} weight(s) for {n_views} view(s) {dataset.views}. "
-            "Provide a comma-separated list with one weight per view index."
-        )
-    print("     View weights:", view_weights)
 
     camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
     camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
