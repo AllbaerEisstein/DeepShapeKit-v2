@@ -78,8 +78,11 @@ def _save_reconstruction_images(
     view_names: List[str],
     mask_predictions: Optional[torch.Tensor] = None, # for calculating mask-reprojection IoU
     keypoint_predictions: Optional[torch.Tensor] = None, # for calculating keypoint L2 distance
+    optimizer_losses: Optional[dict[str, Optional[float]]] = None,
+    optimizer_loss_weights: Optional[dict[str, float]] = None,
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
+    show_metrics: bool = True,
     draw_verts: bool = False,
     draw_coordinate_axes: bool = False,
     annotate_global_t: bool = True,
@@ -124,6 +127,108 @@ def _save_reconstruction_images(
         anchor = tuple(int(round(c)) for c in position)
         cv2.putText(image, text, anchor, font, font_scale, color, thickness, line_type)
 
+    def _fmt_metric_value(value: Any) -> str:
+        if value is None:
+            return "n/a"
+        if isinstance(value, str):
+            return value
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not np.isfinite(value_f):
+            return "nan"
+        return f"{value_f:.4f}"
+
+    def _fmt_weighted_loss(loss_name: str, loss_value: Any) -> str:
+        if loss_value is None:
+            return "n/a"
+        if optimizer_loss_weights is None:
+            return _fmt_metric_value(loss_value)
+        weight = optimizer_loss_weights.get(loss_name)
+        if weight is None:
+            return _fmt_metric_value(loss_value)
+        try:
+            loss_value_f = float(loss_value)
+            weight_f = float(weight)
+        except (TypeError, ValueError):
+            return _fmt_metric_value(loss_value)
+        if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
+            return _fmt_metric_value(loss_value_f)
+        return f"{weight_f:.2g} * {loss_value_f / weight_f:.2f}"
+
+    def _draw_metrics_table(image: np.ndarray, rows: list[tuple[str, Any]]) -> None:
+        if not rows:
+            return
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        header_scale = 0.45
+        row_scale = 0.4
+        thickness = 1
+        margin = 8
+        pad = 8
+        row_height = 16
+        col_gap = 12
+        header = "Metrics"
+
+        formatted_rows = [(name, _fmt_metric_value(value)) for name, value in rows]
+        name_widths = [cv2.getTextSize(name, font, row_scale, thickness)[0][0] for name, _ in formatted_rows]
+        value_widths = [cv2.getTextSize(value, font, row_scale, thickness)[0][0] for _, value in formatted_rows]
+        header_width = cv2.getTextSize(header, font, header_scale, thickness)[0][0]
+
+        name_col_width = max(name_widths) if name_widths else 0
+        value_col_width = max(value_widths) if value_widths else 0
+        panel_width = max(header_width, name_col_width + col_gap + value_col_width) + 2 * pad
+        panel_height = pad + 18 + (row_height * len(formatted_rows)) + pad
+
+        h, w = image.shape[:2]
+        panel_width = min(panel_width, max(32, w - 2 * margin))
+        panel_height = min(panel_height, max(32, h - 2 * margin))
+
+        x0 = margin
+        y0 = margin
+        x1 = min(w - margin, x0 + panel_width)
+        y1 = min(h - margin, y0 + panel_height)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), color=(10, 10, 10), thickness=-1)
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), color=(210, 210, 210), thickness=1)
+        image[:] = cv2.addWeighted(overlay, 0.62, image, 0.38, 0.0)
+
+        draw_text(
+            image,
+            header,
+            (x0 + pad, y0 + pad + 10),
+            font_scale=header_scale,
+            color=(255, 255, 255),
+            thickness=1,
+            font=font,
+        )
+
+        current_y = y0 + pad + 26
+        for name, value in formatted_rows:
+            draw_text(
+                image,
+                name,
+                (x0 + pad, current_y),
+                font_scale=row_scale,
+                color=(225, 225, 225),
+                thickness=1,
+                font=font,
+            )
+            draw_text(
+                image,
+                value,
+                (x0 + pad + name_col_width + col_gap, current_y),
+                font_scale=row_scale,
+                color=(255, 255, 0),
+                thickness=1,
+                font=font,
+            )
+            current_y += row_height
+
     silhouettes = renderer(reconstructed_vertices_local, faces_from_vert_indices, global_t)
     silhouettes_np = silhouettes.detach().cpu().numpy()
     alpha = silhouettes_np  # (N, H, W)
@@ -144,7 +249,17 @@ def _save_reconstruction_images(
                 keypoint_name: None for keypoint_name in keypoint_names
             } for view_name in view_names
         },
+        "optimizer_losses": {
+            "kpt_reprojection_loss": None,
+            "mask_fitting_loss": None,
+            "bone_angle_constraint_loss": None,
+            "bone_length_constraint_loss": None,
+        },
     }
+    if optimizer_losses is not None:
+        for name in metrics["optimizer_losses"].keys():
+            value = optimizer_losses.get(name)
+            metrics["optimizer_losses"][name] = None if value is None else float(value)
 
     assert len(orig_image_paths) == n_views, "orig_image_paths length must match rendered views"
     assert cameras.batch_size == n_views, "Camera batch size must match number of views"
@@ -592,6 +707,35 @@ def _save_reconstruction_images(
 
                 blended = cv2.addWeighted(overlay, 0.6, blended, 0.4, 0)
 
+        if show_metrics:
+            view_name = view_names[view_idx]
+            view_kpt_errors = [
+                distance
+                for distance in metrics["keypoint_L2_distance"][view_name].values()
+                if distance is not None and np.isfinite(distance)
+            ]
+            keypoint_mean_error = (
+                float(np.mean(view_kpt_errors)) if len(view_kpt_errors) > 0 else None
+            )
+            metric_rows = [
+                ("view", view_name),
+                ("orig_IoU", metrics["orig_IoU"][view_name]),
+                ("mask_detection_IoU", metrics["mask_detection_IoU"][view_name]),
+                ("mask_IoU", metrics["mask_IoU"][view_name]),
+                ("kpt_L2_mean", keypoint_mean_error),
+                ("kpt_valid", f"{len(view_kpt_errors)}/{len(keypoint_names)}"),
+            ]
+            for keypoint_name in keypoint_names:
+                metric_rows.append(
+                    (
+                        f"kpt_L2_{keypoint_name}",
+                        metrics["keypoint_L2_distance"][view_name][keypoint_name],
+                    )
+                )
+            for loss_name, loss_value in metrics["optimizer_losses"].items():
+                metric_rows.append((loss_name, _fmt_weighted_loss(loss_name, loss_value)))
+            _draw_metrics_table(blended, metric_rows)
+
         # Prepare output dirs & filename
         view_output_dir = os.path.join(outdir, view_names[view_idx] + "_reconstruction_images")
         instance_dir = os.path.join(view_output_dir, f"instance_{instance_number}")
@@ -726,8 +870,8 @@ def _save_pose_time_series_json(
         "dataset_dir": dataset_dir,
         "dataset_name": dataset_name,
         "instance": int(instance_number),
-        "bone_order": fish.dd.get("bone_order", []),
-        "virtual_bone_names": fish.dd.get("virtual_bone_names", []),
+        "bone_order": fish.template.get("bone_order", []),
+        "virtual_bone_names": fish.template.get("virtual_bone_names", []),
         "frame_start": int(frame_start),
         "frame_end": int(frame_end),
         "frame_indices": processed_frames,
@@ -823,6 +967,12 @@ def reconstruct(
     for view_name, weight in zip(dataset.views, view_weights):
         print(f"          {view_name}: {weight}")
     print("="*40 + "\n")
+    optimizer_loss_weight_map = {
+        "kpt_reprojection_loss": float(keypoints_weight),
+        "mask_fitting_loss": float(mask_weight),
+        "bone_angle_constraint_loss": float(angle_constraint_weight),
+        "bone_length_constraint_loss": float(bone_length_constraint_weight),
+    }
 
 
     camera_group_uniform_size_cpu = dataset.cams.get_camera_group().with_intrinsics_adjusted_for_uniform_image_size()
@@ -855,6 +1005,12 @@ def reconstruct(
     cached_metrics: Optional[dict] = None
     cached_elapsed_wall_time_sec = 0.0
     resumed_from_cache = False
+    optimizer_loss_names = [
+        "kpt_reprojection_loss",
+        "mask_fitting_loss",
+        "bone_angle_constraint_loss",
+        "bone_length_constraint_loss",
+    ]
 
     def _normalize_path(path: Optional[str]) -> Optional[str]:
         if path is None:
@@ -917,7 +1073,35 @@ def reconstruct(
                 view_name: {kpt: [] for kpt in dataset.index_json["keypoint_list"]}
                 for view_name in dataset.views
             },
+            "optimizer_losses": {name: [] for name in optimizer_loss_names},
         }
+
+    def _ensure_metrics_schema(metrics_dict: dict) -> dict:
+        metrics_dict.setdefault("mask_detection_IoU", {})
+        metrics_dict.setdefault("orig_IoU", {})
+        metrics_dict.setdefault("mask_IoU", {})
+        metrics_dict.setdefault("keypoint_L2_distance", {})
+        for view_name in dataset.views:
+            metrics_dict["mask_detection_IoU"].setdefault(view_name, [])
+            metrics_dict["orig_IoU"].setdefault(view_name, [])
+            metrics_dict["mask_IoU"].setdefault(view_name, [])
+            metrics_dict["keypoint_L2_distance"].setdefault(view_name, {})
+            for kpt_name in dataset.index_json["keypoint_list"]:
+                metrics_dict["keypoint_L2_distance"][view_name].setdefault(kpt_name, [])
+
+        metrics_dict.setdefault("optimizer_losses", {})
+        target_len = max(
+            [len(metrics_dict["orig_IoU"].get(view_name, [])) for view_name in dataset.views] or [0]
+        )
+        for loss_name in optimizer_loss_names:
+            if isinstance(metrics_dict["optimizer_losses"].get(loss_name), list):
+                loss_values = metrics_dict["optimizer_losses"][loss_name]
+            else:
+                loss_values = []
+            if len(loss_values) < target_len:
+                loss_values.extend([None] * (target_len - len(loss_values)))
+            metrics_dict["optimizer_losses"][loss_name] = loss_values
+        return metrics_dict
 
     metrics = cached_metrics if cached_metrics is not None else _fresh_metrics()
 
@@ -932,6 +1116,7 @@ def reconstruct(
             metrics = _fresh_metrics()
             cached_elapsed_wall_time_sec = 0.0
             resumed_from_cache = False
+    metrics = _ensure_metrics_schema(metrics)
 
     pbar = tqdm(
         total=len(frame_indices),
@@ -1008,7 +1193,15 @@ def reconstruct(
             index=idx,
             bboxs=bboxes,
         )
-        vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, _ = result
+        (
+            vertices_world_est,
+            keypoints_world_est,
+            global_t_est,
+            global_ori_plus_pose_est,
+            body_bone_est,
+            scale_est,
+            final_losses,
+        ) = result
 
         # --------------------------
         # cache results
@@ -1052,7 +1245,9 @@ def reconstruct(
             keypoint_names=dataset.index_json["keypoint_list"],
             view_names=dataset.views,
             mask_predictions=masks,
-            keypoint_predictions=keypoints
+            keypoint_predictions=keypoints,
+            optimizer_losses=final_losses,
+            optimizer_loss_weights=optimizer_loss_weight_map,
         )
 
         if save_models:
@@ -1066,6 +1261,10 @@ def reconstruct(
             metrics["mask_IoU"][view].append(frame_metrics["mask_IoU"][view])
             for kpt in dataset.index_json["keypoint_list"]:
                 metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
+        for loss_name in optimizer_loss_names:
+            metrics["optimizer_losses"][loss_name].append(
+                frame_metrics.get("optimizer_losses", {}).get(loss_name)
+            )
 
         processed_frames.add(idx)
         elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)

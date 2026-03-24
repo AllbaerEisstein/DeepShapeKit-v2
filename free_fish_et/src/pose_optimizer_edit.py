@@ -20,7 +20,7 @@ class OptimizeMV:
       3. Tail and silhouette offset refinement
 
     On call, returns posed vertices, pose parameters, bone lengths,
-    scale, translation, plus a placeholder tuple.
+    scale, translation, and a dict with final component losses.
     """
 
     def __init__(
@@ -52,6 +52,13 @@ class OptimizeMV:
         # Load parametric fish mesh and faces
         self.fish = fish_model_obj
         self.faces = self.fish.faces
+
+        # Introduce constant factors for each loss to balance them because their magnitudes are different
+        self.constant_factor_bone_angle_constraint_loss = 10.0
+        self.constant_factor_bone_length_constraint_loss = 10.0
+        self.constant_factor_smooth_loss = 1.0
+        self.constant_factor_mask_loss = 0.1
+        self.constant_factor_kpt_loss = 0.1
 
         # torch.autograd.set_detect_anomaly(True)
 
@@ -149,6 +156,16 @@ class OptimizeMV:
             if not torch.isfinite(tensor).all():
                 raise ValueError(f"OptimizeMV received non-finite values in {name}.")
 
+        final_losses: dict[str, Optional[float]] = {
+            "kpt_reprojection_loss": None,
+            "mask_fitting_loss": None,
+            "bone_angle_constraint_loss": None,
+            "bone_length_constraint_loss": None,
+        }
+
+        def _to_float(loss_tensor: torch.Tensor) -> float:
+            return float(loss_tensor.detach().item())
+
 
         # ===== Initialize parameters =====
         # global_orient: (1,3), body_pose: (1,B,3), bone_length: (1,B)
@@ -182,6 +199,7 @@ class OptimizeMV:
             # print(f"Stage 1 - scale: {scale}")
             # print(f"Stage 1 - body pose: {body_pose}")
             # print(f"Stage 1 - body bone length: {body_bone_length}")
+
             # Apply global ori and scale
             out = self.fish(
                 global_ori=global_orient,
@@ -193,26 +211,29 @@ class OptimizeMV:
             model_kpts = out["keypoints"].to(self.device) + global_t
             # Keypoint reprojection loss
             model_kpts = model_kpts.expand(batch_size, -1, -1)
-            loss = (
-                kpt_reprojection_loss(
-                    model_kpts,
-                    proj_m_from_blworld,
-                    kpts_2d,
-                    kpts_conf,
-                    keypoints_weight=self.keypoints_weight,
-                    view_weights=view_weights,
-                )
-                # smoothness loss vs initialization (previous frame)
-                + self.smooth_weight * (global_t - init_t).abs().sum()
+            kpt_loss = self.constant_factor_kpt_loss * kpt_reprojection_loss(
+                model_kpts,
+                proj_m_from_blworld,
+                kpts_2d,
+                kpts_conf,
+                keypoints_weight=self.keypoints_weight,
+                view_weights=view_weights,
+            )
+            # smoothness loss vs initialization (previous frame)
+            smoothness_loss = self.constant_factor_smooth_loss * (
+                self.smooth_weight * (global_t - init_t).abs().sum()
                 + self.smooth_weight * (global_orient - init_global_ori).abs().sum()
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
-            loss += mask_fitting_loss(
-                silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
+            mask_loss = self.constant_factor_mask_loss * mask_fitting_loss(
+                silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
             )
+            loss = kpt_loss + smoothness_loss + mask_loss
+            final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
+            final_losses["mask_fitting_loss"] = _to_float(mask_loss)
             if not torch.isfinite(loss):
                 raise ValueError("Error: Stage 1 produced non-finite loss. Stopping Stage 1 early.")
 
@@ -318,52 +339,55 @@ class OptimizeMV:
                  bone_local_oris_first_bone_group], 
                 dim=1
             ) # add back head bone at the start if it is in the first bone group; else add identity quat
-            loss = (
-                kpt_reprojection_loss(
-                    model_keypoints=m_kpts,
-                    proj_m=proj_m_from_blworld,
-                    keypoints_2d=kpts_2d,
-                    keypoints_conf=kpts_conf,
-                    keypoints_weight=self.keypoints_weight,
-                    view_weights=view_weights,
-                )
-                + bone_angle_constraint_loss(
-                    bone_angle_priors=self.fish.bone_angle_priors,
-                    global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_first_bone_group,
-                    angle_constraint_weight=self.angle_constraint_weight,
-                )
-                + bone_length_constraint_loss(
-                    bone_length=recombined_body_bone_length,
-                    bone_length_min=self.fish.bone_length_min,
-                    bone_length_max=self.fish.bone_length_max,
-                    bone_length_constraint_weight=self.bone_length_constraint_weight,
-                )
-                + init_deviation_loss(
-                    body_pose=recombined_body_pose,
-                    bone_length=recombined_body_bone_length,
-                    smooth_weight=self.smooth_weight,
-                    pose_init=init_body_pose,
-                    bone_init=init_body_bone_length,
-                )
+
+            kpt_loss = self.constant_factor_kpt_loss * kpt_reprojection_loss(
+                model_keypoints=m_kpts,
+                proj_m=proj_m_from_blworld,
+                keypoints_2d=kpts_2d,
+                keypoints_conf=kpts_conf,
+                keypoints_weight=self.keypoints_weight,
+                view_weights=view_weights,
+            )
+            angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
+                bone_angle_priors=self.fish.bone_angle_priors,
+                global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_first_bone_group,
+                angle_constraint_weight=self.angle_constraint_weight,
+            )
+            bone_length_loss = self.constant_factor_bone_length_constraint_loss * bone_length_constraint_loss(
+                bone_length=recombined_body_bone_length,
+                bone_length_min=self.fish.bone_length_min,
+                bone_length_max=self.fish.bone_length_max,
+                bone_length_constraint_weight=self.bone_length_constraint_weight,
+            )
+            smoothness_loss = self.constant_factor_smooth_loss * init_deviation_loss(
+                body_pose=recombined_body_pose,
+                bone_length=recombined_body_bone_length,
+                smooth_weight=self.smooth_weight,
+                pose_init=init_body_pose,
+                bone_init=init_body_bone_length,
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
-            loss += mask_fitting_loss(
-                silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
+            mask_loss = self.constant_factor_mask_loss * mask_fitting_loss(
+                silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
             )
+            loss = kpt_loss + angle_loss + bone_length_loss + smoothness_loss + mask_loss
+            final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
+            final_losses["mask_fitting_loss"] = _to_float(mask_loss)
+            final_losses["bone_angle_constraint_loss"] = _to_float(angle_loss)
+            final_losses["bone_length_constraint_loss"] = _to_float(bone_length_loss)
+
             if not torch.isfinite(loss):
                 raise ValueError("Error: Stage 2 produced non-finite loss. Stopping Stage 2 early.")
+            
             opt_body.zero_grad()
             loss.backward()
+
             if has_nonfinite_grads([optimizable_body_pose, optimizable_body_bone_length, global_orient, global_t, scale]):
-                print(f"Stage 2 - global ori grad: {global_orient.grad}")
-                print(f"Stage 2 - global t grad: {global_t.grad}")
-                print(f"Stage 2 - scale grad: {scale.grad}")
-                print(f"Stage 2 - optimizable body pose grad: {optimizable_body_pose.grad}")
-                print(f"Stage 2 - optimizable body bone length grad: {optimizable_body_bone_length.grad}")
                 raise ValueError("Error: Stage 2 produced non-finite gradients. Stopping Stage 2 early.")
+            
             opt_body.step()
         
         # synchronise body pose and body bone length to optimized state
@@ -467,45 +491,50 @@ class OptimizeMV:
                         bone_local_oris_bone_group], 
                         dim=1
                     ) # add back head bone at the start if it is in the first bone group; else add identity quat
-                    loss = (
-                        kpt_reprojection_loss(
-                            model_keypoints=m_kpts,
-                            proj_m=proj_m_from_blworld,
-                            keypoints_2d=kpts_2d,
-                            keypoints_conf=kpts_conf,
-                            keypoints_weight=self.keypoints_weight,
-                            view_weights=view_weights,
-                        )
-                        + bone_angle_constraint_loss(
-                            bone_angle_priors=self.fish.bone_angle_priors,
-                            global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_bone_group,
-                            angle_constraint_weight=self.angle_constraint_weight,
-                        )
-                        + bone_length_constraint_loss(
-                            bone_length=recombined_body_bone_length,
-                            bone_length_min=self.fish.bone_length_min,
-                            bone_length_max=self.fish.bone_length_max,
-                            bone_length_constraint_weight=self.bone_length_constraint_weight,
-                        )
-                        + init_deviation_loss(
-                            body_pose=recombined_body_pose.flatten(1),
-                            bone_length=recombined_body_bone_length,
-                            smooth_weight=self.big_artic_weight,
-                            pose_init=prev_bp.flatten(1),
-                            bone_init=prev_bl,
-                        )
+
+                    kpt_loss = self.constant_factor_kpt_loss * kpt_reprojection_loss(
+                        model_keypoints=m_kpts,
+                        proj_m=proj_m_from_blworld,
+                        keypoints_2d=kpts_2d,
+                        keypoints_conf=kpts_conf,
+                        keypoints_weight=self.keypoints_weight,
+                        view_weights=view_weights,
+                    )
+                    angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
+                        bone_angle_priors=self.fish.bone_angle_priors,
+                        global_ori_plus_body_pose_rest_head_spaces=bone_local_oris_bone_group,
+                        angle_constraint_weight=self.angle_constraint_weight,
+                    )
+                    bone_length_loss = self.constant_factor_bone_length_constraint_loss * bone_length_constraint_loss(
+                        bone_length=recombined_body_bone_length,
+                        bone_length_min=self.fish.bone_length_min,
+                        bone_length_max=self.fish.bone_length_max,
+                        bone_length_constraint_weight=self.bone_length_constraint_weight,
+                    )
+                    smoothness_loss = init_deviation_loss(
+                        body_pose=recombined_body_pose.flatten(1),
+                        bone_length=recombined_body_bone_length,
+                        smooth_weight=self.big_artic_weight,
+                        pose_init=prev_bp.flatten(1),
+                        bone_init=prev_bl,
                     )
                     # smoothness prior vs previous stage's solution for
                     if 0 in bone_group:
-                        loss += self.big_artic_weight * (global_orient - global_orient_prev).abs().sum()
-                    loss += self.big_artic_weight * (global_t - global_t_prev).abs().sum()
+                        smoothness_loss += self.big_artic_weight * (global_orient - global_orient_prev).abs().sum()
+                    smoothness_loss += self.big_artic_weight * (global_t - global_t_prev).abs().sum()
+                    smoothness_loss = self.constant_factor_smooth_loss * smoothness_loss
                     # Silhouette loss
                     silhouette_renders = silhouette_renderer(
                         out["vertices"], self.faces.unsqueeze(0), global_t
                     )
-                    loss += mask_fitting_loss(
-                        silhouette_renders, masks.float(), 0.1 * self.mask_weight, view_weights=view_weights
+                    mask_loss = self.constant_factor_mask_loss * mask_fitting_loss(
+                        silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
                     )
+                    loss = kpt_loss + angle_loss + bone_length_loss + smoothness_loss + mask_loss
+                    final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
+                    final_losses["mask_fitting_loss"] = _to_float(mask_loss)
+                    final_losses["bone_angle_constraint_loss"] = _to_float(angle_loss)
+                    final_losses["bone_length_constraint_loss"] = _to_float(bone_length_loss)
                     if not torch.isfinite(loss):
                         raise ValueError(f"Error: Stage 3 bone group {bg_idx} produced non-finite loss. Stopping this group early.")
                     opt_bone_group.zero_grad()
@@ -526,4 +555,4 @@ class OptimizeMV:
         bone = body_bone_length.detach().cpu()
         scale = scale.detach().cpu()
         translation = global_t.detach().cpu()
-        return vertices, pose, bone, scale, translation, (0, 0)
+        return vertices, pose, bone, scale, translation, final_losses
