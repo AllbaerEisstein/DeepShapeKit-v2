@@ -513,8 +513,8 @@ def get_mesh_json(context):
         ordered_bones.append(b)
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
         bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
-        rest_mat_world = (arm.matrix_world @ b.matrix_local)   # bone rest->world (armature-space -> world)
-        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world.to_3x3()  # 3x3 rotation matrix
+        rest_mat_world = (arm.matrix_world.to_3x3() @ b.matrix_local.to_3x3()).normalized()   # bone rest->world (armature-space -> world)
+        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world  # 3x3 rotation matrix
         bone_names_tree[b.name]['rest_rot_local'] = b.matrix_local.to_3x3()  # 3x3 rotation matrix
         for ch in b.children:
             queue.append(ch)
@@ -525,6 +525,7 @@ def get_mesh_json(context):
     joint_names = []
     parent_indices = []
 
+    # NOTE: Logic needs to be checked again
     def get_virtual_bone_world_space_matrix_from_bones(parentb, childb):
         parent_world_tail = arm.matrix_world @ tail_pos(parentb)   # world-space parent tail
         child_world_head  = arm.matrix_world @ head_pos(childb)          # world-space child head

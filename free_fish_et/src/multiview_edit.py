@@ -69,18 +69,6 @@ def fit_geometry(
     init_t = t
     init_s = s
 
-    # init_t = torch.tensor([
-    #     8.999272346496582,
-    #     -7.749894598980923e-16,
-    #     -0.0403549000620842
-    #   ]).float().to(keypoints.device)
-    # init_ori = torch.tensor([
-    #     1.3050808906555176,
-    #     1.1443520784378052,
-    #     -1.3050808906555176
-    #   ]).float().to(keypoints.device).unsqueeze(0)
-    #init_s = torch.tensor(1).to(keypoints.device)
-
     return init_ori, init_t, init_s
 
 
@@ -203,10 +191,6 @@ def fit_mesh(
     ### Generating mesh output
     fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, deform=True)
 
-    # NOTE:
-    # things to check: Correct row-major, column major order always?
-    # pixel/mm/m? E.g. in fish model there seems to be a conversion cm -> m
-    # world/local coords for fish model?
     vertices_world_est = fish_output["vertices"] + global_t_est
     keypoints_world_est = fish_output["keypoints"] + global_t_est
 
@@ -217,102 +201,3 @@ def fit_mesh(
     # vertices_world_est = fish_output["vertices"] + init_t.cpu()
     # keypoints_world_est = fish_output["keypoints"] + init_t.cpu()
     # return vertices_world_est, keypoints_world_est, init_t, init_ori_plus_pose, init_body_bone_length, init_s, None
-
-
-def multiview_rigid_alignment(
-    fish, pose, bone, keypoints, frames, device="cpu", num_iters=100
-):
-    """
-    Rigidly align single view reconstruction to multiview instance so we can
-    check reconstruction accuracy across different views.
-    1. First run general Procrustes for global alignment
-    2. Because Procrustes can only use keypoints that are visible from at least two views,
-    we run a short optimizition (rigidly, fixed pose and shape) afterward to improve alignment.
-    Input:
-        pose and bone are from singleview reconstruction;
-        keypoints are ground truth for alignments
-    """
-
-    ### Camera parameter
-    proj_m_set, focal, center, R, T, distortion = mutils.get_cam(device)
-
-    ### Triangulation + Procrustes for global alignemnt
-    global_orient, global_t, scale = fit_geometry(
-        fish, keypoints, frames, init_pose=pose, init_body_bone_l=bone
-    )
-
-    ### Optimization to improve alignment
-    pose = pose.detach().clone().to(device)
-    bone = bone.detach().clone().to(device)
-    keypoints = keypoints.clone().to(device)
-    batch_size = len(frames)
-
-    global_orient = global_orient.to(device)
-    global_t = global_t.to(device)
-    scale = scale.to(device)
-
-    global_orient.requires_grad = True
-    global_t.requires_grad = True
-    scale.requires_grad = True
-
-    global_params = [global_orient, global_t, scale]
-    global_optimizer = torch.optim.Adam(global_params, lr=1e-2, betas=(0.9, 0.999))
-    for i in range(num_iters):
-        fish_output = fish(
-            global_ori=global_orient, body_pose=pose, body_bone_length=bone, scale=scale
-        )
-
-        model_keypoints = fish_output["keypoints"] + global_t.repeat(1, 1, 1)
-        model_keypoints = model_keypoints.repeat([batch_size, 1, 1])
-
-        loss = camera_fitting_loss(
-            model_keypoints, proj_m_set, keypoints[:, :, :2], keypoints[:, :, -1]
-        )
-
-        global_optimizer.zero_grad()
-        loss.backward()
-        global_optimizer.step()
-
-    # Output
-    fish_output = fish(
-        global_ori=global_orient, body_pose=pose, body_bone_length=bone, scale=scale
-    )
-    model_mesh = fish_output["vertices"] + global_t.repeat(1, 1, 1)
-    model_keypoints = fish_output["keypoints"] + global_t.repeat(1, 1, 1)
-
-    model_mesh = model_mesh.detach().to("cpu")
-    model_keypoints = model_keypoints.detach().to("cpu")
-
-    return model_mesh, model_keypoints
-
-
-def reproject_masks(vertex_est, renderer_list, frames):
-    # Transform vertex for each camera view
-    proj_m_set, focal, center, R, T, distortion = mutils.get_cam()
-    rotation = torch.stack([R, R], 0)
-    translation = torch.stack([T, T], 0).unsqueeze(1)
-
-    points = vertex_est.repeat([len(frames), 1, 1])
-    points = torch.einsum("bij,bkj->bki", rotation, points) + translation
-
-    # Render for each view
-    img = torch.zeros([368, 368, 3])
-    proj_masks = []
-    for i in range(len(frames)):
-        renderer = renderer_list[frames[i]]
-        img_pose, depth_map = renderer(
-            points[i].cpu().numpy(), np.eye(3), [0, 0, 0], img.clone().numpy()
-        )
-        mask = torch.tensor(depth_map > 0)
-        proj_masks.append(mask)
-
-    return proj_masks
-
-
-def reproject_keypoints(mesh_keypoints, frames):
-    proj_m_set, focal, center, R, T, distortion = mutils.get_cam()
-
-    kpts = mesh_keypoints.repeat([len(frames), 1, 1])
-    proj_kpts = perspective_projection(kpts, proj_m_set)
-
-    return proj_kpts

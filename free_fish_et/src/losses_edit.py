@@ -35,13 +35,18 @@ def kpt_reprojection_loss(
     keypoints_weight: torch.Tensor | float = 1.0,
     view_weights: Optional[torch.Tensor] = None,
     sigma: float = 50,
+    #bboxes: Optional[torch.Tensor] = None
 ):
     # Project model keypoints
     projected_keypoints = perspective_projection(model_keypoints, proj_m)
+    reprojection_diff = projected_keypoints - keypoints_2d
+    # TODO: keypoint errors should be calculated relative to the bounding box size so that far-away views contribute 
+    # equally as close-up views (those will have higher absolute keypoint error)
+    # However, it can be argued that detection quality of far-away views is lower and that they should indeed contribute less.
 
     # Weighted robust reprojection loss
     # this returns Geman-McClure rubustified x², y² for each kpt:
-    reprojection_error = gmof(projected_keypoints - keypoints_2d, sigma) 
+    reprojection_error = gmof(reprojection_diff, sigma) 
     # here, sum x² and y² and scale by conf -> squared L2-error per kpt:
     reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1) 
 
@@ -203,11 +208,12 @@ def init_deviation_loss(
     bone_init: torch.Tensor,
 ):
     """
-    difference to initialization paramaters (either from prior frame or from prior optimization stage)
+    L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
     """
-    init_prior_loss = (body_pose - pose_init).abs().sum() + (
-        bone_length - bone_init
-    ).abs().sum()
+    init_prior_loss = (
+        (body_pose - pose_init).abs().sum()
+        + (bone_length - bone_init).abs().sum()
+    )
     init_prior_loss = smooth_weight * init_prior_loss
     return init_prior_loss.sum()
 

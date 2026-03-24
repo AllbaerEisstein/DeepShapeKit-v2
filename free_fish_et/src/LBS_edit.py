@@ -29,13 +29,9 @@ class LBS():
             virtual_bone_mask (n_bones): binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1). Virtual bone rotation is set to identity in the LBS-call since virtual bones represent a translation of parent joint to child joint only.
 
             !! 
-            Attention: The twist axes of the bones are defined by the rest position of the template joints. 
-            In mesh local space, the twist axis is always the vector from the parent joint to the child joint.
-
-            So, the first body bone's twist axis is defined by the vector from the head joint to the first body joint in the rest pose.
-            When creating the fish model in fish_model.py, the mesh local space y-axis is set to be the head-to-first-body-joint direction
-            in the rest pose in order to have a priori defined twist axes for the bones and in order to adhere with Blender's twist axis 
-            convention (twist axis is the y-axis).
+            Attention: Everything passed to LBS is treated to be in the same reference as the Joints.
+            Usually, this is the same space the mesh is defined in, a.k.a., the template space.
+            Even if something is "relative to head", it still doesn't reference the head bone coordinate system.
             !!
         """
         self.J = J
@@ -134,5 +130,5 @@ class LBS():
         R[:, :, -1, -1] = 1
         V_homog = R @ V_homog
 
-        # return vertices in local space (relative to head joint) and the rotations of joints relative to their parent (for bone angle prior checking)
+        # return vertices in local space (relative to head joint) and the rotations of joints in template space (for bone angle prior checking)
         return V_homog[:, :, :3, 0] / V_homog[:, :, [3], 0], global_ori_plus_body_pose_template_space

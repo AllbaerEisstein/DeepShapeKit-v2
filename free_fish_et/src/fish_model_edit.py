@@ -85,73 +85,22 @@ class fish_model:
 
         self.J = torch.tensor(template["J"], dtype=torch.float32).unsqueeze(0) # (1,J,3)
         self.virtual_bone_mask = torch.tensor(template["virtual_bone_mask"]) # (n_bones) binary mask for which bones are virtual bones (virtual bone at index i: mask[i]=1)
-        # set the mesh local space to head space (head joint at origin; head-bone local axes aligned with world axes)
-        # use rest_rot_world from the mesh json.
-
-        def get_rot_matrix_for_y_axis_rotation(new_y_axis):
-            """
-            This function calculates the rotation matrix that rotates the positive y-axis to the new y-axis (bone twist axis).
-            """
-            # take care of the cases in that y-axis is parallel to the head-to-first-body-joint direction
-            if torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, -1, 0], dtype=torch.float32)).all():
-                rot_matrix_passive = torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=torch.float32)
-            elif not torch.isclose(new_y_axis/torch.norm(new_y_axis), torch.tensor([0, 1, 0], dtype=torch.float32)).all():
-                rot_angle = torch.acos(torch.dot(new_y_axis, torch.tensor([0, 1, 0], dtype=torch.float32)) / torch.norm(new_y_axis))
-                rot_axis = torch.linalg.cross(new_y_axis, torch.tensor([0, 1, 0], dtype=torch.float32))
-                rot_axis = rot_axis / torch.norm(rot_axis)
-                axis_angle = rot_axis * rot_angle
-                # convert axis-angle to rotation matrix using Rodrigues' formula
-                rot_matrix_passive = batch_rodrigues(axis_angle.unsqueeze(0), to_quats=False, to_rotmats=True)[0]
-            else:
-                rot_matrix_passive = torch.eye(3, dtype=torch.float32)
-            # This is the rotation the y-axis has to undergo (passive rotation).
-            # To express a point in the coordinate system with the new y-axis, 
-            # we need to apply the inverse of this rotation (active rotation) to the point.
-            return rot_matrix_passive
-        
-        def get_root_rest_rotation_world():
-            bone_tree = template.get("bone_names_tree", {})
-
-            root_bone_name = template["bone_order"][0]
-            if root_bone_name not in bone_tree:
-                raise ValueError(f"Root bone {root_bone_name} does not have a corresponding entry in the bone tree of the json file. Please make sure that the root bone has an entry in the bone tree and that the bone tree is correctly formatted.")
-
-            root_data = bone_tree[root_bone_name]
-            rest_rot_rows = root_data.get("rest_rot_world", None)
-
-            R = torch.tensor(rest_rot_rows, dtype=torch.float32)
-            # Re-orthonormalize to guard against tiny numerical drift in serialized matrices.
-            U, _, Vh = torch.linalg.svd(R)
-            R = U @ Vh
-            if torch.linalg.det(R) < 0:
-                U[:, -1] *= -1
-                R = U @ Vh
-            return R
-
-        # translate to head-local coords (head joint -> origin), then rotate model/world frame -> head frame
+        # translate to head-local coords (head joint -> origin)
         translation_head_to_origin = self.J[0, 0].unsqueeze(0)
-        root_rest_rot_world = get_root_rest_rotation_world()
-
-        # rest_rot_world maps head-local axes to world/model axes (local->world).
-        # We need the inverse to express points in head-local coordinates.
-        R_model_space_to_head_space = root_rest_rot_world.T
-
         self.J = self.J - translation_head_to_origin
-        self.J = torch.matmul(self.J, R_model_space_to_head_space)
 
         self.V = torch.tensor(template["V"]).unsqueeze(0) # (1,V,3)
-        # apply the same rotation and translation to the vertices as we did to the joints in order to keep them in the same local space
-        self.V = torch.matmul(self.V - translation_head_to_origin, R_model_space_to_head_space)
+        # apply the same translation to the vertices as we did to the joints in order to keep them in the same local space
+        self.V = self.V - translation_head_to_origin
 
-        body_bone_twist_axes_head_space = (self.J[:, 2:] - self.J[:, self.parent_indices[2:]])
-        # exclude the head bone since we treat head bone transformation as global transformation and do not calculate swing-twist for the head bone
-        rot_mats_to_body_bone_rest_local_spaces = [] 
-        for i in range(self.n_body_bones): 
-            twist_axis = body_bone_twist_axes_head_space[:, i]
-            rot_mats_to_body_bone_rest_local_spaces.append(get_rot_matrix_for_y_axis_rotation(twist_axis.squeeze(0)).T)
         # when calculating the swing-twist of each bone, we need to express each articulated bone tail 
         # in the local space of the rest bone head because the twist axis is required to be one of x,y, or z.
-        self.rot_mats_to_body_bone_rest_local_spaces = torch.stack(rot_mats_to_body_bone_rest_local_spaces, dim=0) # (n_body_bones, 3, 3)
+        template_to_bone_spaces = []
+        for bone_name in template["bone_order"]:
+            bone_to_template = torch.tensor(template["bone_names_tree"][bone_name]["rest_rot_world"])
+            template_to_bone = bone_to_template.T
+            template_to_bone_spaces.append(template_to_bone)
+        self.template_to_bone_spaces = torch.stack(template_to_bone_spaces, dim=0).unsqueeze(0) # (1, n_bones, 3, 3)
 
         # # scaling, unit conversion
         # self.V = self.V #* 0.01
@@ -198,7 +147,7 @@ class fish_model:
         self.virtual_bone_mask = self.virtual_bone_mask.to(self.device)
         self.LBS = LBS(self.J, self.parent_indices, self.weights, self.virtual_bone_mask)
         self.device = self.faces.device
-        self.rot_mats_to_body_bone_rest_local_spaces = self.rot_mats_to_body_bone_rest_local_spaces.to(self.device)
+        self.template_to_bone_spaces = self.template_to_bone_spaces.to(self.device)
         self.device_active = True
 
 
@@ -253,30 +202,18 @@ class fish_model:
         # LBS
         if deform:
             verts, global_ori_plus_body_pose_template_space = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
-            # global_ori_plus_body_pose_template_space describes the *active* rotation of each bone in the coordinate system where the y-axis
-            # is the head-joint-to-first-body-joint direction in the rest pose.
-            # However, each bodybone's rest-pose twist axis might not be aligned with the head-joint-to-first-body-joint direction in the rest pose. 
-            # We need to convert the bone pose from the mesh local space to the local space of the rest bone head (where the y-axis is the twist axis)
-            # in order to align the twist axis of the rotation with the twist axis of the bone in the rest pose.
-            global_ori_mat = global_ori_plus_body_pose_template_space[:, 0] # (1, 3, 3) global rotation in mesh local space
-            body_bone_poses_rest_bone_spaces = (
-                self.rot_mats_to_body_bone_rest_local_spaces.unsqueeze(0) @ global_ori_plus_body_pose_template_space[:, 1:]
+            # transform each bone ori from template space to its own rest space
+            global_ori_plus_body_pose_rest_bone_local_space = (
+                self.template_to_bone_spaces @ global_ori_plus_body_pose_template_space @ self.template_to_bone_spaces.transpose(-1,-2)
             ) # (1, n_body_bones, 3, 3)
-            # comment: tail_artic_local = to_local @ pose_world @ tail_rest_world
-            # @ is associative, so we can do 
-            # tail_artic_local = M @ tail_rest_world
-            # where M=(to_local @ pose_world)
 
             # print("LBS output:")
             # print(f"   body_pose_template_space: {body_pose_template_space}")
             # print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
 
-            global_ori_plus_body_pose_mats = torch.cat(
-                [global_ori_mat.unsqueeze(1), body_bone_poses_rest_bone_spaces], dim=1
-            ) # (1, n_bones, 3, 3)
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
             global_ori_plus_body_pose_rest_bone_spaces = matrix_to_quaternion(
-                global_ori_plus_body_pose_mats.squeeze()
+                global_ori_plus_body_pose_rest_bone_local_space.squeeze()
             ).unsqueeze(0).cpu() # (1, n_bones, 4) (w, x, y, z)
         else:
             verts, global_ori_plus_body_pose_template_space = V, None

@@ -57,8 +57,9 @@ class OptimizeMV:
         self.constant_factor_bone_angle_constraint_loss = 10.0
         self.constant_factor_bone_length_constraint_loss = 10.0
         self.constant_factor_smooth_loss = 1.0
-        self.constant_factor_mask_loss = 0.01
+        self.constant_factor_mask_loss = 0.001
         self.constant_factor_kpt_loss = 0.01
+        self.constant_factor_scale_loss = 10.0
 
         # torch.autograd.set_detect_anomaly(True)
 
@@ -179,6 +180,7 @@ class OptimizeMV:
         init_global_ori       = global_orient.detach().clone()
         init_body_pose        = body_pose.detach().clone()
         init_body_bone_length = body_bone_length.detach().clone()
+        init_scale            = init_scale.detach().clone()
         
 
         # ============ Stage 1: optimize global_orient, translation, scale ============
@@ -186,8 +188,10 @@ class OptimizeMV:
         # -----------------------------------
         # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights),
         # mask smooth-L1 loss (weighted by mask_weight and view_weights),
-        # global_t smoothness prior vs init_t (weighted by smooth_weight)
-        # global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
+        # smoothness: 
+        #   global_t smoothness prior vs init_t (weighted by smooth_weight)
+        #   global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
+        #   scale smoothness prior vs init_scale (weighted by smooth_weight)
         # ===================================
 
         opt_global = torch.optim.Adam(
@@ -223,6 +227,7 @@ class OptimizeMV:
             smoothness_loss = self.constant_factor_smooth_loss * (
                 self.smooth_weight * (global_t - init_t).abs().sum()
                 + self.smooth_weight * (global_orient - init_global_ori).abs().sum()
+                + self.smooth_weight * self.constant_factor_scale_loss * (scale - init_scale).abs()
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -262,7 +267,12 @@ class OptimizeMV:
         #   - twist-limit violation,
         #   - swing ellipse violation with locked-axis handling for zero swing priors,
         # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-        # body pose and body bone length smooth loss compared to initialization (weighted by smooth_weight)
+        # smoothness:
+        #   body pose L1 and 
+        #   body bone length L1 and
+        #   global translation L1 and
+        #   global orientation L1 (if root bone in first bone group)
+        #   scale L1 loss compared to initialization (weighted by smooth_weight)
         # ===================================
 
         first_bone_group = self.fish.bone_groups[0]
@@ -359,12 +369,18 @@ class OptimizeMV:
                 bone_length_max=self.fish.bone_length_max,
                 bone_length_constraint_weight=self.bone_length_constraint_weight,
             )
+            # smoothness loss
             smoothness_loss = self.constant_factor_smooth_loss * init_deviation_loss(
                 body_pose=recombined_body_pose,
                 bone_length=recombined_body_bone_length,
                 smooth_weight=self.smooth_weight,
                 pose_init=init_body_pose,
                 bone_init=init_body_bone_length,
+            )
+            smoothness_loss += self.constant_factor_smooth_loss * self.smooth_weight * (
+                (global_t - init_t).abs().sum()
+                + (global_orient - init_global_ori).abs().sum()
+                + self.constant_factor_scale_loss * (scale - init_scale).abs()
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -413,8 +429,12 @@ class OptimizeMV:
             #   - twist-limit violation,
             #   - swing ellipse violation with locked-axis handling for zero swing priors,
             # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-            # smooth loss compared to *previous stage* (weighted by big_artic_weight) 
-            # (!! in stage 2, the smooth difference was determined by the difference to init parameters and weighted by smooth_weight !!)
+            # smoothness (!compared to previous stage 3 loop!):
+            #   body pose and body bone L1 (weighted by big_artic_weight)
+            #   global_orient L1 if root bone in this bone group (weighted by smooth_weight)
+            #   global translation L1 (weighted by smooth_weight)
+            #   scale L1 loss !compared to init_scale! (weighted by smooth_weight)
+            #   (!! in stage 2, the smooth difference was determined by the difference to init parameters and weighted by smooth_weight !!)
             # ===================================
 
             for bg_idx, bone_group in enumerate(self.fish.bone_groups[1:]):
@@ -511,6 +531,7 @@ class OptimizeMV:
                         bone_length_max=self.fish.bone_length_max,
                         bone_length_constraint_weight=self.bone_length_constraint_weight,
                     )
+                    # smoothness loss vs previous stage's solution
                     smoothness_loss = init_deviation_loss(
                         body_pose=recombined_body_pose.flatten(1),
                         bone_length=recombined_body_bone_length,
@@ -518,10 +539,10 @@ class OptimizeMV:
                         pose_init=prev_bp.flatten(1),
                         bone_init=prev_bl,
                     )
-                    # smoothness prior vs previous stage's solution for
+                    smoothness_loss += self.smooth_weight * (global_t - global_t_prev).abs().sum()
+                    smoothness_loss += self.constant_factor_scale_loss * (scale - init_scale).abs()
                     if 0 in bone_group:
-                        smoothness_loss += self.big_artic_weight * (global_orient - global_orient_prev).abs().sum()
-                    smoothness_loss += self.big_artic_weight * (global_t - global_t_prev).abs().sum()
+                        smoothness_loss += self.smooth_weight * (global_orient - global_orient_prev).abs().sum()
                     smoothness_loss = self.constant_factor_smooth_loss * smoothness_loss
                     # Silhouette loss
                     silhouette_renders = silhouette_renderer(

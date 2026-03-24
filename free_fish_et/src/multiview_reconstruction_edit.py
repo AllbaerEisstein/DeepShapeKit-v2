@@ -1171,8 +1171,6 @@ def reconstruct(
         bboxes = instance_sample["bboxes"]
         # Normalize mask to [0,1] on appropriate device
         masks = masks / 255.0
-        keypoints = keypoints
-        bboxes = bboxes
 
 
         # --------------------------
