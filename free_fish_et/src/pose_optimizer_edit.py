@@ -57,8 +57,8 @@ class OptimizeMV:
         self.constant_factor_bone_angle_constraint_loss = 10.0
         self.constant_factor_bone_length_constraint_loss = 10.0
         self.constant_factor_smooth_loss = 1.0
-        self.constant_factor_mask_loss = 0.1
-        self.constant_factor_kpt_loss = 0.1
+        self.constant_factor_mask_loss = 0.01
+        self.constant_factor_kpt_loss = 0.01
 
         # torch.autograd.set_detect_anomaly(True)
 

@@ -155,7 +155,7 @@ def _save_reconstruction_images(
             return _fmt_metric_value(loss_value)
         if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
             return _fmt_metric_value(loss_value_f)
-        return f"{weight_f:.2g} * {loss_value_f / weight_f:.2f}"
+        return f"{weight_f:.2f} * {loss_value_f / weight_f:.2f}"
 
     def _draw_metrics_table(image: np.ndarray, rows: list[tuple[str, Any]]) -> None:
         if not rows:
