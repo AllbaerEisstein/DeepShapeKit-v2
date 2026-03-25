@@ -80,6 +80,7 @@ def _save_reconstruction_images(
     keypoint_predictions: Optional[torch.Tensor] = None, # for calculating keypoint L2 distance
     optimizer_losses: Optional[dict[str, Optional[float]]] = None,
     optimizer_loss_weights: Optional[dict[str, float]] = None,
+    view_weights: Optional[List[float]] = None,
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
     show_metrics: bool = True,
@@ -140,7 +141,11 @@ def _save_reconstruction_images(
             return "nan"
         return f"{value_f:.4f}"
 
-    def _fmt_weighted_loss(loss_name: str, loss_value: Any) -> str:
+    def _fmt_weighted_loss(
+        loss_name: str,
+        loss_value: Any,
+        view_weight: Optional[float] = None,
+    ) -> str:
         if loss_value is None:
             return "n/a"
         if optimizer_loss_weights is None:
@@ -153,9 +158,24 @@ def _save_reconstruction_images(
             weight_f = float(weight)
         except (TypeError, ValueError):
             return _fmt_metric_value(loss_value)
-        if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
+        if view_weight is None:
+            if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
+                return _fmt_metric_value(loss_value_f)
+            return f"{weight_f:.2f} * {loss_value_f / weight_f:.2f}"
+
+        try:
+            view_weight_f = float(view_weight)
+        except (TypeError, ValueError):
+            view_weight_f = float("nan")
+        combined_weight = view_weight_f * weight_f
+        if (
+            (not np.isfinite(loss_value_f))
+            or (not np.isfinite(weight_f))
+            or (not np.isfinite(view_weight_f))
+            or abs(combined_weight) < 1e-12
+        ):
             return _fmt_metric_value(loss_value_f)
-        return f"{weight_f:.2f} * {loss_value_f / weight_f:.2f}"
+        return f"{view_weight_f:.2f} * {weight_f:.2f} * {loss_value_f / combined_weight:.2f}"
 
     def _draw_metrics_table(image: np.ndarray, rows: list[tuple[str, Any]]) -> None:
         if not rows:
@@ -264,6 +284,8 @@ def _save_reconstruction_images(
     assert len(orig_image_paths) == n_views, "orig_image_paths length must match rendered views"
     assert cameras.batch_size == n_views, "Camera batch size must match number of views"
     assert len(view_names) == n_views, "Number of view names must match number of views"
+    if view_weights is not None:
+        assert len(view_weights) == n_views, "view_weights length must match number of views"
 
     keypoints_world = (reconstructed_keypoints_local + global_t).squeeze(0)
     keypoints_proj = cameras.perspective_projection_from_blworld(keypoints_world.unsqueeze(0)).detach().cpu()
@@ -709,6 +731,9 @@ def _save_reconstruction_images(
 
         if show_metrics:
             view_name = view_names[view_idx]
+            current_view_weight = (
+                float(view_weights[view_idx]) if view_weights is not None else None
+            )
             view_kpt_errors = [
                 distance
                 for distance in metrics["keypoint_L2_distance"][view_name].values()
@@ -733,7 +758,7 @@ def _save_reconstruction_images(
                     )
                 )
             for loss_name, loss_value in metrics["optimizer_losses"].items():
-                metric_rows.append((loss_name, _fmt_weighted_loss(loss_name, loss_value)))
+                metric_rows.append((loss_name, _fmt_weighted_loss(loss_name, loss_value, current_view_weight)))
             _draw_metrics_table(blended, metric_rows)
 
         # Prepare output dirs & filename
@@ -1246,6 +1271,7 @@ def reconstruct(
             keypoint_predictions=keypoints,
             optimizer_losses=final_losses,
             optimizer_loss_weights=optimizer_loss_weight_map,
+            view_weights=view_weights,
         )
 
         if save_models:

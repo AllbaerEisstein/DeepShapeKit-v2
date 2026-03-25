@@ -10,14 +10,10 @@ modified from bird model by Badger et al.
 https://github.com/marcbadger/avian-mesh
 """
 
-import os
 import json
-from src.geometry import batch_rodrigues
 import torch
 from .LBS_edit import LBS
 from pytorch3d.transforms import matrix_to_quaternion
-
-# from .LBS_origin import LBS
 
 
 class fish_model:
