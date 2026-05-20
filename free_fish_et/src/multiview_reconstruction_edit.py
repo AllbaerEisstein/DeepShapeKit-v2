@@ -889,6 +889,10 @@ def _save_pose_time_series_json(
             fps = float(fps)
         except (TypeError, ValueError):
             fps = None
+    
+    bone_rest_rot_world = {}
+    for bone_name in fish.template["bone_order"]:
+        bone_rest_rot_world[bone_name] = fish.template["bone_names_tree"][bone_name]["rest_rot_world"]
 
     meta = {
         "source": "multiview_reconstruction_edit.py",
@@ -897,6 +901,8 @@ def _save_pose_time_series_json(
         "instance": int(instance_number),
         "bone_order": fish.template.get("bone_order", []),
         "virtual_bone_names": fish.template.get("virtual_bone_names", []),
+        "bone_rest_rot_world": bone_rest_rot_world,
+        "swing_twist_order": ["swing_x", "twist_y", "swing_z"],
         "frame_start": int(frame_start),
         "frame_end": int(frame_end),
         "frame_indices": processed_frames,
@@ -919,6 +925,7 @@ def _save_pose_time_series_json(
             "frame": int(payload["frame"]),
             "global_t": payload["global_t"],
             "global_ori": payload["global_ori"],
+            "swing_twist": payload["swing_twist"],
             "body_pose": payload["body_pose"],
             "body_bone_length": payload["body_bone_length"],
         }
@@ -1224,6 +1231,8 @@ def reconstruct(
             body_bone_est,
             scale_est,
             final_losses,
+            global_ori_plus_body_pose_rest_bone_spaces,
+            swing_twist
         ) = result
 
         # --------------------------
@@ -1247,8 +1256,9 @@ def reconstruct(
         pose_time_series_frames.append(
             {
                 "frame": int(idx),
-                "global_ori": [float(x) for x in global_ori_cpu],
-                "body_pose": [[float(v) for v in triple] for triple in body_pose_triplets],
+                "global_ori": [float(x) for x in global_ori_plus_body_pose_rest_bone_spaces[0][0].tolist()],
+                "body_pose": [[float(v) for v in quat] for quat in global_ori_plus_body_pose_rest_bone_spaces[0][1:].tolist()],
+                "swing_twist": [[float(v) for v in quat] for quat in swing_twist[0].tolist()],
                 "body_bone_length": [float(v) for v in body_bone_lengths],
                 "global_t": [float(v) for v in global_t_list],
                 "scale": float(scale_list[0]) if scale_list else None,

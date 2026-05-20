@@ -20,7 +20,7 @@ import re
 import glob
 import math
 from collections import defaultdict
-from mathutils import Vector, Matrix
+from mathutils import Vector, Matrix, Quaternion
 from bpy.props import (
     StringProperty, BoolProperty, FloatProperty, IntProperty,
     PointerProperty, CollectionProperty,
@@ -2650,6 +2650,7 @@ def create_animation_from_pose_time_series(context, timeseries_path):
 
     meta = ts.get('meta', {})
     bone_order_ts = meta.get('bone_order')
+    bone_rest_rot_world_ts = meta.get('bone_rest_rot_world') # should be dict of bone_name -> 3x3 row lists
 
     mesh_info = get_mesh_json(context)
 
@@ -2716,12 +2717,16 @@ def create_animation_from_pose_time_series(context, timeseries_path):
         return (tail_pos - head_pos)
 
     # precompute rest vectors and rest rotations (as 3x3 Matrices) for all exported bones
-    bone_rest_vec = {}
-    bone_rest_R_world = {}   # 3x3 Matrix for each exported bone
+    bone_rest_vecs = {}
+    bone_rest_Rs_world = {}   # 3x3 Matrix for each exported bone
     for bname in exported_bone_order:
-        bone_rest_vec[bname] = rest_head_tail_vector_for_bonename(bname)
         rows = bone_names_tree[bname]['rest_rot_world']
-        bone_rest_R_world[bname] = _matrix3_from_rows(rows)
+        bone_rest_Rs_world[bname] = _matrix3_from_rows(rows)
+        # check if rest_rot_world is still accurate
+        rows = bone_rest_rot_world_ts[bname]
+        rest_rot_world_ts = _matrix3_from_rows(rows)
+        bone_rest_vecs[bname] = rest_head_tail_vector_for_bonename(bname)
+
 
     arm_world = new_arm.matrix_world
 
@@ -2746,18 +2751,26 @@ def create_animation_from_pose_time_series(context, timeseries_path):
 
         # root global transform from timeseries
         global_t = Vector(frame_entry['global_t'])
-        global_ori_exp = Vector(frame_entry['global_ori'])
-        root_rot_4 = _expmap_to_rotation_matrix_4x4(global_ori_exp)
-        root_world_frame = Matrix.Translation(global_t) @ root_rot_4
+        root_bone_local_ori = Quaternion(frame_entry['global_ori']).to_matrix().to_4x4()
+        root_rest_rot_world = bone_rest_Rs_world.get(exported_bone_order[0]).to_4x4()  # convert to 4x4 for conjugation
+        root_bone_world_ori = root_rest_rot_world @ root_bone_local_ori @ root_rest_rot_world.transposed()
+        root_bone_world_frame = Matrix.Translation(global_t) @ root_bone_world_ori
 
         # start chain with root_world_frame as parent_world
-        parent_world = root_world_frame
+        parent_world = root_bone_world_frame
+        parent_name = exported_bone_order[0]
 
-        body_pose_list = frame_entry.get('body_pose', [])
-        body_len_list = frame_entry.get('body_bone_length', [])
+        # store already computed world transforms
+        bone_world_matrices = {
+            parent_name: parent_world.copy()
+        }
+
+        body_pose_list = frame_entry.get('body_pose')
+        body_len_list = frame_entry.get('body_bone_length')
 
         # iterate exported bones in order
         for i, bname in enumerate(exported_bone_order):
+            
             if i == 0:
                 # root: set its pose bone transform if present
                 if bname in pose_bone_names:
@@ -2766,62 +2779,77 @@ def create_animation_from_pose_time_series(context, timeseries_path):
                     pb.rotation_mode = 'QUATERNION'
                     pb.keyframe_insert(data_path="location", frame=frame_num)
                     pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
+
+                bone_world_matrices[bname] = parent_world.copy()
+                parent_name = bname
+
                 # continue, parent_world remains as is
                 continue
 
+
+            # lookup actual parent from hierarchy
+            expected_parent_name = bone_names_tree[bname]['p']
+
+            # if traversal moved to another branch, load correct parent transform
+            if expected_parent_name is not None and expected_parent_name != parent_name:
+                parent_world = bone_world_matrices[expected_parent_name]
+                parent_name = expected_parent_name
+
             entry_idx = i - 1 # root bone is excluded from body pose, thus decrement index
-            rel_exp = Vector((0.0, 0.0, 0.0))
+
+            bone_rest_space_ori = Matrix.Identity(4)  # default to identity if no pose provided for this bone
             length_scale = 1.0
+
             if entry_idx < len(body_pose_list):
-                rel_exp = Vector(body_pose_list[entry_idx])
+                bone_rest_space_ori = Quaternion(body_pose_list[entry_idx]).to_matrix().to_4x4()
+
                 if entry_idx < len(body_len_list):
                     length_scale = float(body_len_list[entry_idx])
 
-            # convert rel exponential map to rotation (4x4)
-            R_rel_local_4 = _expmap_to_rotation_matrix_4x4(rel_exp)   # rotation expressed in parent's local pose axes (as exported)
+            # Now *conjugate* rest space rotation into world frame using bones rest_rot_world:
+            # bone_ori_world = bone_rest_rot_world * bone_rest_space_ori * bone_rest_rot_world^-1
+            bone_rest_rot_world = bone_rest_Rs_world.get(bname).to_4x4()
+            bone_world_ori = (
+                bone_rest_rot_world
+                @ bone_rest_space_ori
+                @ bone_rest_rot_world.transposed()
+            )
 
-            # Now *conjugate* rel rotation into world frame using parent's rest_rot:
-            # R_parent_rest_world (3x3) is the parent's rest rotation in world coordinates.
-            # Convert it to 4x4 for conjugation
-            R_parent_rest_3 = bone_rest_R_world.get(exported_bone_order[i-1], Matrix.Identity(3))
-            R_parent_rest_4 = R_parent_rest_3.to_4x4()
-            try:
-                R_parent_rest_inv_4 = R_parent_rest_4.inverted()
-            except Exception:
-                R_parent_rest_inv_4 = R_parent_rest_4.copy()  # fallback (shouldn't happen)
+            # Build translation using PARENT orientation
+            rest_vec = bone_rest_vecs[bname] * length_scale
 
-            # conjugate: R_rel_world = R_parent_rest * R_rel_local * R_parent_rest^-1
-            R_rel_world_4 = R_parent_rest_4 @ R_rel_local_4 @ R_parent_rest_inv_4
+            parent_rot_world = parent_world.to_3x3()
 
-            # Build translation: rotate rest vector and scale it
-            rest_vec = bone_rest_vec.get(bname, Vector((0.0, 0.1, 0.0)))
-            # rotate using rotation part of R_rel_world_4
-            translated = (R_rel_world_4.to_3x3() @ (rest_vec * length_scale))
+            bone_translation_vec = parent_rot_world @ rest_vec
 
-            rel_mat = Matrix.Translation(translated) @ R_rel_world_4
+            local_translation = Matrix.Translation(bone_translation_vec)
 
-            # compute child_world by chaining
-            child_world = parent_world @ rel_mat
+            # hierarchical propagation
+            tail_joint_world = (
+                parent_world
+                @ local_translation
+                @ bone_world_ori
+            )
 
-            # if virtual bone, advance chain but do not set pose
+            # if virtual bone, do not set pose
             if bname in virtual_bone_names:
-                parent_world = child_world
-                continue
-
-            # else real bone: set pose_bone such that arm_world @ pb.matrix == child_world
-            if bname not in pose_bone_names:
-                # missing on duplicated armature: advance chain
-                parent_world = child_world
+                bone_world_matrices[bname] = tail_joint_world.copy()
+                parent_world = tail_joint_world
+                parent_name = bname
                 continue
 
             pb = pose_bones[bname]
-            pb.matrix = arm_world.inverted() @ child_world
+
+            pb.matrix = arm_world.inverted() @ tail_joint_world
             pb.rotation_mode = 'QUATERNION'
+
             pb.keyframe_insert(data_path="location", frame=frame_num)
             pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
 
-            # advance chain
-            parent_world = child_world
+            # propagate hierarchy
+            bone_world_matrices[bname] = tail_joint_world.copy()
+            parent_world = tail_joint_world
+            parent_name = bname
 
     # finalize
     new_arm.animation_data.action = action

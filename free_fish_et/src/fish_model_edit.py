@@ -115,9 +115,9 @@ class fish_model:
             bone_angle_priors.extend([prior["swing_x"], prior["twist_y"], prior["swing_z"]])
         self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, n_bones, 3) (swing_x, twist_y, swing_z)
 
-        # Body bone length limit
-        self.bone_length_min = [1.0] * (self.n_body_bones)
-        self.bone_length_max = [1.5] * (self.n_body_bones)
+        # Body bone length factor limits
+        self.bone_length_min = [0.7] * (self.n_body_bones)
+        self.bone_length_max = [1.2] * (self.n_body_bones)
 
         self.bone_length_min = torch.tensor(self.bone_length_min)
         self.bone_length_max = torch.tensor(self.bone_length_max)
