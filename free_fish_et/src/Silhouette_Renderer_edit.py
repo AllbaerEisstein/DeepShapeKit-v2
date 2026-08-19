@@ -1,6 +1,7 @@
 
 import torch
 
+import numpy as np
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     SoftSilhouetteShader,
@@ -46,11 +47,12 @@ class Silhouette_Renderer:
         height = int(torch.round(image_hw[0, 0]).item())
         width = int(torch.round(image_hw[0, 1]).item())
 
-        blend_params = BlendParams(sigma=1e-2, gamma=1e-4)
+        blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
+        blur_radius = np.log(1. / 1e-4 - 1.) * blend_params.sigma
         raster_settings = RasterizationSettings(
             image_size=(height, width),
-            blur_radius=0.0,
-            faces_per_pixel=1,
+            blur_radius=blur_radius,
+            faces_per_pixel=50,
         )
 
         # I have no clue why we need this.....

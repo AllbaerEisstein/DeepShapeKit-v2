@@ -208,22 +208,31 @@ def init_deviation_loss(
     bone_init: torch.Tensor,
 ):
     """
-    L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
+    Smooth L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
     """
     init_prior_loss = (
-        (body_pose - pose_init).abs().sum()
-        + (bone_length - bone_init).abs().sum()
+        F.smooth_l1_loss(body_pose, pose_init, reduction="sum")
+        + F.smooth_l1_loss(bone_length, bone_init, reduction="sum")
     )
     init_prior_loss = smooth_weight * init_prior_loss
     return init_prior_loss.sum()
 
 
 def mask_fitting_loss(proj_masks, masks, mask_weight, view_weights):
-    # L1 mask loss
+    """
+    Smooth L1 difference between tensors of mask detection image and reprojection image
+    """
     total_loss = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
     total_loss = mask_weight * view_weights * total_loss
 
     return total_loss.sum()
+
+
+def soft_iou_loss(proj_masks, masks, mask_weight, view_weights):
+    intersection = (proj_masks * masks).sum(dim=[1, 2])
+    union = (proj_masks + masks - proj_masks * masks).sum(dim=[1, 2])
+    iou_loss = 1.0 - intersection / union.clamp_min(1e-6)
+    return (mask_weight * view_weights * iou_loss).sum()
 
 
 def mask_jaccard_index(proj_masks, masks, mask_weight):
