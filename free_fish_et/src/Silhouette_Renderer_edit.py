@@ -19,7 +19,7 @@ from src.constants_edit import BLENDERWORLD_2_PYTORCH3D, CV_2_PYTORCH3D
 class Silhouette_Renderer:
     """Differentiable silhouette renderer for cameras described in Blender/CV space."""
 
-    def __init__(self, device: str, camera_group: CameraGroup):
+    def __init__(self, device: str, camera_group: CameraGroup, sigma: float = 1e-4, gamma: float = 1e-4):
         self.device = torch.device(device)
 
         self.uniform_cg = camera_group.to(self.device)
@@ -47,7 +47,7 @@ class Silhouette_Renderer:
         height = int(torch.round(image_hw[0, 0]).item())
         width = int(torch.round(image_hw[0, 1]).item())
 
-        blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
+        blend_params = BlendParams(sigma=sigma, gamma=gamma)
         blur_radius = np.log(1. / 1e-4 - 1.) * blend_params.sigma
         raster_settings = RasterizationSettings(
             image_size=(height, width),

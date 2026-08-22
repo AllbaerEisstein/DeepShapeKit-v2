@@ -161,7 +161,7 @@ def _save_reconstruction_images(
         if view_weight is None:
             if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
                 return _fmt_metric_value(loss_value_f)
-            return f"{weight_f:.2f} * {loss_value_f / weight_f:.2f}"
+            return f"{weight_f:.5f} * {loss_value_f / weight_f:.5f}"
 
         try:
             view_weight_f = float(view_weight)
@@ -248,20 +248,20 @@ def _save_reconstruction_images(
                 font=font,
             )
             current_y += row_height
-
+    
     silhouettes = renderer(reconstructed_vertices_local, faces_from_vert_indices, global_t)
     silhouettes_np = silhouettes.detach().cpu().numpy()
     alpha = silhouettes_np  # (N, H, W)
     n_views, H, W = alpha.shape
 
     metrics = {
-        "mask_detection_IoU": {
+        "IoU_mask_detection_and_gt": {
             view_name: None for view_name in view_names
         },
-        "orig_IoU": {
+        "IoU_reconstruction_and_gt": {
             view_name: None for view_name in view_names
         },
-        "mask_IoU": {
+        "IoU_reconstruction_and_mask_detection": {
             view_name: None for view_name in view_names
         },
         "keypoint_L2_distance": {
@@ -274,6 +274,7 @@ def _save_reconstruction_images(
             "mask_fitting_loss": None,
             "bone_angle_constraint_loss": None,
             "bone_length_constraint_loss": None,
+            "final_deviation_from_prev_frame": None
         },
     }
     if optimizer_losses is not None:
@@ -482,7 +483,7 @@ def _save_reconstruction_images(
         reprojection_mask_binary = torch.tensor(cv2.threshold(a, 0, 1, cv2.THRESH_BINARY)[1], device=device)
         metric = BinaryJaccardIndex().to(device=device)
 
-        orig_iou = metric(
+        IoU_reconstruction_and_gt = metric(
             torch.tensor(padded_binary, device=device),
             reprojection_mask_binary
         )
@@ -493,17 +494,17 @@ def _save_reconstruction_images(
                     mask_pred_view,
                     (extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom),
                 )
-            mask_detection_iou = metric(
+            IoU_mask_detection_and_gt = metric(
                 torch.tensor(padded_binary, device=device),
                 mask_pred_view
             ) # to evaluate the quality of yolo mask detection, given we are working with synthetic data
-            mask_iou = metric(
+            IoU_reconstruction_and_mask_detection = metric(
                 mask_pred_view,
                 reprojection_mask_binary
             )
-            metrics["mask_detection_IoU"][view_names[view_idx]] = mask_detection_iou.item()
-            metrics["mask_IoU"][view_names[view_idx]] = mask_iou.item()
-        metrics["orig_IoU"][view_names[view_idx]] = orig_iou.item()
+            metrics["IoU_mask_detection_and_gt"][view_names[view_idx]] = IoU_mask_detection_and_gt.item()
+            metrics["IoU_reconstruction_and_mask_detection"][view_names[view_idx]] = IoU_reconstruction_and_mask_detection.item()
+        metrics["IoU_reconstruction_and_gt"][view_names[view_idx]] = IoU_reconstruction_and_gt.item()
 
 
         # Build red overlay image (BGR) and blend: out = orig*(1 - bf * a) + red*(bf * a)
@@ -744,9 +745,9 @@ def _save_reconstruction_images(
             )
             metric_rows = [
                 ("view", view_name),
-                ("orig_IoU", metrics["orig_IoU"][view_name]),
-                ("mask_detection_IoU", metrics["mask_detection_IoU"][view_name]),
-                ("mask_IoU", metrics["mask_IoU"][view_name]),
+                ("IoU_reconstruction_and_gt", metrics["IoU_reconstruction_and_gt"][view_name]),
+                ("IoU_mask_detection_and_gt", metrics["IoU_mask_detection_and_gt"][view_name]),
+                ("IoU_reconstruction_and_mask_detection", metrics["IoU_reconstruction_and_mask_detection"][view_name]),
                 ("kpt_L2_mean", keypoint_mean_error),
                 ("kpt_valid", f"{len(view_kpt_errors)}/{len(keypoint_names)}"),
             ]
@@ -997,6 +998,7 @@ def reconstruct(
         "mask_fitting_loss": float(mask_weight),
         "bone_angle_constraint_loss": float(angle_constraint_weight),
         "bone_length_constraint_loss": float(bone_length_constraint_weight),
+        "final_deviation_from_prev_frame": float(smooth_weight)
     }
 
 
@@ -1016,7 +1018,8 @@ def reconstruct(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer = Silhouette_Renderer(device, camera_group_uniform_size_device)
+    renderer_for_reconstrcution = Silhouette_Renderer(device, camera_group_uniform_size_device)
+    renderer_for_saving_images = Silhouette_Renderer(device, camera_group_uniform_size_device, sigma=0, gamma=0)
 
     # --------------------------
     # load cache, if available
@@ -1035,6 +1038,7 @@ def reconstruct(
         "mask_fitting_loss",
         "bone_angle_constraint_loss",
         "bone_length_constraint_loss",
+        "final_deviation_from_prev_frame"
     ]
 
     def _normalize_path(path: Optional[str]) -> Optional[str]:
@@ -1091,9 +1095,9 @@ def reconstruct(
 
     def _fresh_metrics() -> dict:
         return {
-            "mask_detection_IoU": {view_name: [] for view_name in dataset.views},
-            "orig_IoU": {view_name: [] for view_name in dataset.views},
-            "mask_IoU": {view_name: [] for view_name in dataset.views},
+            "IoU_mask_detection_and_gt": {view_name: [] for view_name in dataset.views},
+            "IoU_reconstruction_and_gt": {view_name: [] for view_name in dataset.views},
+            "IoU_reconstruction_and_mask_detection": {view_name: [] for view_name in dataset.views},
             "keypoint_L2_distance": {
                 view_name: {kpt: [] for kpt in dataset.index_json["keypoint_list"]}
                 for view_name in dataset.views
@@ -1102,21 +1106,21 @@ def reconstruct(
         }
 
     def _ensure_metrics_schema(metrics_dict: dict) -> dict:
-        metrics_dict.setdefault("mask_detection_IoU", {})
-        metrics_dict.setdefault("orig_IoU", {})
-        metrics_dict.setdefault("mask_IoU", {})
+        metrics_dict.setdefault("IoU_mask_detection_and_gt", {})
+        metrics_dict.setdefault("IoU_reconstruction_and_gt", {})
+        metrics_dict.setdefault("IoU_reconstruction_and_mask_detection", {})
         metrics_dict.setdefault("keypoint_L2_distance", {})
         for view_name in dataset.views:
-            metrics_dict["mask_detection_IoU"].setdefault(view_name, [])
-            metrics_dict["orig_IoU"].setdefault(view_name, [])
-            metrics_dict["mask_IoU"].setdefault(view_name, [])
+            metrics_dict["IoU_mask_detection_and_gt"].setdefault(view_name, [])
+            metrics_dict["IoU_reconstruction_and_gt"].setdefault(view_name, [])
+            metrics_dict["IoU_reconstruction_and_mask_detection"].setdefault(view_name, [])
             metrics_dict["keypoint_L2_distance"].setdefault(view_name, {})
             for kpt_name in dataset.index_json["keypoint_list"]:
                 metrics_dict["keypoint_L2_distance"][view_name].setdefault(kpt_name, [])
 
         metrics_dict.setdefault("optimizer_losses", {})
         target_len = max(
-            [len(metrics_dict["orig_IoU"].get(view_name, [])) for view_name in dataset.views] or [0]
+            [len(metrics_dict["IoU_reconstruction_and_gt"].get(view_name, [])) for view_name in dataset.views] or [0]
         )
         for loss_name in optimizer_loss_names:
             if isinstance(metrics_dict["optimizer_losses"].get(loss_name), list):
@@ -1131,7 +1135,7 @@ def reconstruct(
     metrics = cached_metrics if cached_metrics is not None else _fresh_metrics()
 
     if cached_metrics is not None:
-        cached_views = set(cached_metrics.get("orig_IoU", {}).keys())
+        cached_views = set(cached_metrics.get("IoU_reconstruction_and_gt", {}).keys())
         if cached_views != set(dataset.views):
             print("Cached reconstruction metrics do not match current dataset views; restarting reconstruction run.")
             parameters = []
@@ -1210,7 +1214,7 @@ def reconstruct(
             camera_group_uniform_size_device,
             keypoints,
             masks,
-            renderer,
+            renderer_for_reconstrcution,
             device,
             *([] if init is None else init),
             index=idx,
@@ -1258,7 +1262,7 @@ def reconstruct(
         frame_metrics = _save_reconstruction_images(
             orig_image_paths=orig_img_paths,
             outdir=outdir,
-            renderer=renderer,
+            renderer=renderer_for_saving_images,
             instance_number=instance_number,
             cameras=camera_group_uniform_size_device,
             reconstructed_keypoints_local=reconstructed_keypoints_local,
@@ -1280,9 +1284,9 @@ def reconstruct(
 
         # cache quality metrics for this frame
         for view in dataset.views:
-            metrics["mask_detection_IoU"][view].append(frame_metrics["mask_detection_IoU"][view])
-            metrics["orig_IoU"][view].append(frame_metrics["orig_IoU"][view])
-            metrics["mask_IoU"][view].append(frame_metrics["mask_IoU"][view])
+            metrics["IoU_mask_detection_and_gt"][view].append(frame_metrics["IoU_mask_detection_and_gt"][view])
+            metrics["IoU_reconstruction_and_gt"][view].append(frame_metrics["IoU_reconstruction_and_gt"][view])
+            metrics["IoU_reconstruction_and_mask_detection"][view].append(frame_metrics["IoU_reconstruction_and_mask_detection"][view])
             for kpt in dataset.index_json["keypoint_list"]:
                 metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
         for loss_name in optimizer_loss_names:

@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from src import fish_model_edit as fish_model
 from src.Silhouette_Renderer_edit import Silhouette_Renderer
 from src.losses_edit import (
@@ -57,6 +58,7 @@ class OptimizeMV:
         # Introduce constant factors for each loss to balance them because their magnitudes are different
         self.constant_factor_bone_angle_constraint_loss = 10.0
         self.constant_factor_bone_length_constraint_loss = 10.0
+        self.constant_factor_scale_loss = 10.0
         self.constant_factor_init_deviation_loss = 2
         #self.constant_factor_mask_loss = 0.3 # this is for the smooth l1 loss
         self.constant_factor_mask_loss = 1.5 # this is for the IoU loss
@@ -181,6 +183,7 @@ class OptimizeMV:
         init_global_ori       = global_orient.detach().clone()
         init_body_pose        = body_pose.detach().clone()
         init_body_bone_length = body_bone_length.detach().clone()
+        init_scale            = init_scale.detach().clone()
         
 
 
@@ -192,8 +195,10 @@ class OptimizeMV:
         # -----------------------------------
         # keypoint reprojection (GMoF robustified, weighted by keypoint confidence², keypoints_weight, and view_weights),
         # mask smooth-L1 loss (weighted by mask_weight and view_weights),
-        # global_t smoothness prior vs init_t (weighted by smooth_weight)
-        # global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
+        # smoothness: 
+        #   global_t smoothness prior vs init_t (weighted by smooth_weight)
+        #   global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
+        #   scale smoothness prior vs init_scale (weighted by smooth_weight)
         # ===================================
 
         opt_global = torch.optim.Adam(
@@ -226,9 +231,15 @@ class OptimizeMV:
                 view_weights=view_weights,
             )
             # smoothness loss vs initialization (previous frame)
-            smoothness_loss = self.constant_factor_init_deviation_loss * (
-                self.smooth_weight * (global_t - init_t).abs().sum()
-                + self.smooth_weight * (global_orient - init_global_ori).abs().sum()
+            smoothness_loss = self.constant_factor_init_deviation_loss * init_deviation_loss(
+                smooth_weight=self.smooth_weight,
+                translation=global_t,
+                translation_init=init_t,
+                orientation=global_orient,
+                orientation_init=init_global_ori,
+                scale=scale,
+                scale_init=init_scale,
+                scale_weight=self.constant_factor_scale_loss
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -270,7 +281,12 @@ class OptimizeMV:
         #   - twist-limit violation,
         #   - swing ellipse violation with locked-axis handling for zero swing priors,
         # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-        # body pose and body bone length smooth loss compared to initialization (weighted by smooth_weight)
+        # smoothness:
+        #   body pose smooth L1 and 
+        #   body bone length L1 and
+        #   global translation L1 and
+        #   global orientation L1 (if root bone in first bone group)
+        #   scale L1 loss compared to initialization (weighted by smooth_weight)
         # ===================================
 
         first_bone_group = self.fish.bone_groups[0]
@@ -313,20 +329,8 @@ class OptimizeMV:
             return full
 
         for _ in range(self.num_iters):
-            # print(f"Stage 2 - global ori: {global_orient}")
-            # print(f"Stage 2 - body global t: {global_t}")
-            # print(f"Stage 2 - scale: {scale}")
-            # print(f"Stage 2 - body pose: {body_pose}")
-            # print(f"Stage 2 - body bone length: {body_bone_length}")
-            # print(f"Stage 2 - optimizable body pose: {optimizable_body_pose}")
-            # print(f"Stage 2 - optimizable body bone length: {optimizable_body_bone_length}")
-            # print(f"Stage 2 - frozen body pose: {frozen_body_pose}")
-            # print(f"Stage 2 - frozen body bone length: {frozen_body_bone_length}")
-            # print(f"Stage 2 - in first bone group mask: {in_first_bone_group}")
             recombined_body_pose = recombine_frozen_and_optimized_tensor(frozen_body_pose, optimizable_body_pose, in_first_bone_group)
-            # print(f"Stage 2 - recombined body pose: {recombined_body_pose}")
             recombined_body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_first_bone_group)
-            # print(f"Stage 2 - recombined body bone length: {recombined_body_bone_length}")
             out = self.fish(
                 global_ori=global_orient,
                 body_pose=recombined_body_pose.flatten(1),
@@ -373,6 +377,13 @@ class OptimizeMV:
                 smooth_weight=self.smooth_weight,
                 pose_init=init_body_pose,
                 bone_init=init_body_bone_length,
+                translation=global_t,
+                translation_init=init_t,
+                orientation=global_orient,
+                orientation_init=init_global_ori,
+                scale=scale,
+                scale_init=init_scale,
+                scale_weight=self.constant_factor_scale_loss
             )
             # Silhouette loss
             silhouette_renders = silhouette_renderer(
@@ -403,12 +414,6 @@ class OptimizeMV:
         body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_first_bone_group)
 
 
-
-
-
-
-
-
         if len(self.fish.bone_groups) > 1:
             #*******************************************************************************
             # ============ Stage 3: optimize remaining bone groups individually ============
@@ -428,8 +433,12 @@ class OptimizeMV:
             #   - twist-limit violation,
             #   - swing ellipse violation with locked-axis handling for zero swing priors,
             # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
-            # smooth loss compared to *previous stage* (weighted by big_artic_weight) 
-            # (!! in stage 2, the smooth difference was determined by the difference to init parameters and weighted by smooth_weight !!)
+            # smoothness (!compared to previous stage 3 loop!):
+            #   body pose and body bone L1 (weighted by big_artic_weight)
+            #   global_orient L1 if root bone in this bone group (weighted by smooth_weight)
+            #   global translation L1 (weighted by smooth_weight)
+            #   scale L1 loss !compared to init_scale! (weighted by smooth_weight)
+            #   (!! in stage 2, the smooth difference was determined by the difference to init parameters and weighted by smooth_weight !!)
             # ===================================
 
             for bg_idx, bone_group in enumerate(self.fish.bone_groups[1:]):
@@ -526,17 +535,19 @@ class OptimizeMV:
                         bone_length_max=self.fish.bone_length_max,
                         bone_length_constraint_weight=self.bone_length_constraint_weight,
                     )
+                    # smoothness loss vs previous stage's solution
                     smoothness_loss = init_deviation_loss(
                         body_pose=recombined_body_pose.flatten(1),
                         bone_length=recombined_body_bone_length,
                         smooth_weight=self.big_artic_weight,
                         pose_init=prev_bp.flatten(1),
                         bone_init=prev_bl,
-                    )
-                    # smoothness prior vs previous stage's solution for
+                    ) # use big artic weight to allow articulation of bone groups to be more variable or more restricted, depending big artic weight
+                    # other smoothness term summands still go with smooth_weight; these are not articulation-specific.
+                    smoothness_loss += self.smooth_weight * self.constant_factor_scale_loss * F.smooth_l1_loss(scale, init_scale, reduction="sum")
+                    smoothness_loss += self.smooth_weight * F.smooth_l1_loss(global_t, global_t_prev, reduction="sum")
                     if 0 in bone_group:
-                        smoothness_loss += self.big_artic_weight * (global_orient - global_orient_prev).abs().sum()
-                    smoothness_loss += self.big_artic_weight * (global_t - global_t_prev).abs().sum()
+                        smoothness_loss += self.smooth_weight * F.smooth_l1_loss(global_orient, global_orient_prev, reduction="sum")
                     smoothness_loss = self.constant_factor_init_deviation_loss * smoothness_loss
                     # Silhouette loss
                     silhouette_renders = silhouette_renderer(
@@ -546,17 +557,17 @@ class OptimizeMV:
                         silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
                     )
                     ######################################################
-                    for name, l in [
-                            ("kpt_loss", kpt_loss),
-                            ("angle_loss", angle_loss),
-                            ("bone_length_loss", bone_length_loss),
-                            ("smoothness_loss", smoothness_loss),
-                            ("mask_loss", mask_loss),
-                        ]:
-                            g_pose = torch.autograd.grad(l, [optimizable_body_pose], retain_graph=True, allow_unused=True)[0]
-                            g_bone = torch.autograd.grad(l, [optimizable_body_bone_length], retain_graph=True, allow_unused=True)[0]
-                            print(f"{name}: pose_norm={g_pose.norm().item() if g_pose is not None else None}, "
-                                f"bone_norm={g_bone.norm().item() if g_bone is not None else None}")
+                    # for name, l in [
+                    #         ("kpt_loss", kpt_loss),
+                    #         ("angle_loss", angle_loss),
+                    #         ("bone_length_loss", bone_length_loss),
+                    #         ("smoothness_loss", smoothness_loss),
+                    #         ("mask_loss", mask_loss),
+                    #     ]:
+                    #         g_pose = torch.autograd.grad(l, [optimizable_body_pose], retain_graph=True, allow_unused=True)[0]
+                    #         g_bone = torch.autograd.grad(l, [optimizable_body_bone_length], retain_graph=True, allow_unused=True)[0]
+                    #         print(f"{name}: pose_norm={g_pose.norm().item() if g_pose is not None else None}, "
+                    #             f"bone_norm={g_bone.norm().item() if g_bone is not None else None}")
                     #######################################################
                     loss = kpt_loss + angle_loss + bone_length_loss + smoothness_loss + mask_loss
                     final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
@@ -576,7 +587,78 @@ class OptimizeMV:
                 body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_bone_group)
 
 
+        # ============ Final unmasked evaluation ============
+        # `final_losses` must describe the mesh that is actually returned/rendered for this
+        # frame. Two issues would otherwise make it misleading:
+        #   1. Staleness: inside the stage loops, `final_losses` is captured from the forward
+        #      pass BEFORE the loop's last `opt.step()`, i.e. one gradient step behind the
+        #      parameters we actually return below.
+        #   2. Partial coverage: during Stage 3, `kpts_conf` and the bone-angle quaternions are
+        #      masked down to a single bone group per inner loop, so whatever values happen to
+        #      survive from the very last bone group processed do NOT represent a whole-body
+        #      loss (unlike bone_length_loss and mask_loss, which are always computed on the
+        #      full body/silhouette already).
+        # Recomputing once here, after every stage has finished, with the final parameters and
+        # full (un-masked) keypoints/bones fixes both problems consistently for all four terms.
+        with torch.no_grad():
+            reset_kpts_conf()
+            final_out = self.fish(
+                global_ori=global_orient,
+                body_pose=body_pose.flatten(1),
+                body_bone_length=body_bone_length,
+                scale=scale,
+            )
+            final_m_kpts = (final_out["keypoints"].to(self.device) + global_t).expand(batch_size, -1, -1)
+
+            final_kpt_loss = self.constant_factor_kpt_loss * kpt_reprojection_loss(
+                model_keypoints=final_m_kpts,
+                proj_m=proj_m_from_blworld,
+                keypoints_2d=kpts_2d,
+                keypoints_conf=kpts_conf,
+                keypoints_weight=self.keypoints_weight,
+                view_weights=view_weights,
+            )
+            final_bone_local_oris = final_out["global_ori_plus_body_pose_rest_bone_spaces"].to(self.device)
+            final_angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
+                bone_angle_priors=self.fish.bone_angle_priors,
+                global_ori_plus_body_pose_rest_head_spaces=final_bone_local_oris,
+                angle_constraint_weight=self.angle_constraint_weight,
+            )
+            final_bone_length_loss = self.constant_factor_bone_length_constraint_loss * bone_length_constraint_loss(
+                bone_length=body_bone_length,
+                bone_length_min=self.fish.bone_length_min,
+                bone_length_max=self.fish.bone_length_max,
+                bone_length_constraint_weight=self.bone_length_constraint_weight,
+            )
+            final_silhouette_renders = silhouette_renderer(
+                final_out["vertices"], self.faces.unsqueeze(0), global_t
+            )
+            final_mask_loss = self.constant_factor_mask_loss * soft_iou_loss(
+                final_silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
+            )
+            final_deviation_from_prev_frame = self.constant_factor_init_deviation_loss * init_deviation_loss(
+                body_pose=body_pose,
+                bone_length=body_bone_length,
+                smooth_weight=self.smooth_weight,
+                pose_init=init_body_pose,
+                bone_init=init_body_bone_length,
+                translation=global_t,
+                translation_init=init_t,
+                orientation=global_orient,
+                orientation_init=init_global_ori,
+                scale=scale,
+                scale_init=init_scale,
+                scale_weight=self.constant_factor_scale_loss
+            )
+
+        final_losses["kpt_reprojection_loss"] = _to_float(final_kpt_loss)
+        final_losses["mask_fitting_loss"] = _to_float(final_mask_loss)
+        final_losses["bone_angle_constraint_loss"] = _to_float(final_angle_loss)
+        final_losses["bone_length_constraint_loss"] = _to_float(final_bone_length_loss)
+        final_losses["final_deviation_from_prev_frame"] = _to_float(final_deviation_from_prev_frame)
+
         # Gather final outputs
+        out = final_out
         vertices = out["vertices"].detach().cpu()
         # Flatten body_pose back to (B, J*3) for the concatenation
         pose = torch.cat([global_orient, body_pose.reshape(body_pose.shape[0], -1)], dim=-1).detach().cpu()

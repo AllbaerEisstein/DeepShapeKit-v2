@@ -201,18 +201,33 @@ def bone_length_constraint_loss(
 
 
 def init_deviation_loss(
-    body_pose: torch.Tensor,
-    bone_length: torch.Tensor,
-    smooth_weight: float,
-    pose_init: torch.Tensor,
-    bone_init: torch.Tensor,
+    body_pose: Optional[torch.Tensor] = None,
+    bone_length: Optional[torch.Tensor] = None,
+    smooth_weight: Optional[float] = None,
+    pose_init: Optional[torch.Tensor] = None,
+    bone_init: Optional[torch.Tensor] = None,
+    translation_init: Optional[torch.Tensor] = None,
+    orientation_init: Optional[torch.Tensor] = None,
+    scale_init: Optional[torch.Tensor] = None,
+    translation: Optional[torch.Tensor] = None,
+    orientation: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    scale_weight: Optional[float] = None,
 ):
     """
     Smooth L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
     """
     init_prior_loss = (
-        F.smooth_l1_loss(body_pose, pose_init, reduction="sum")
-        + F.smooth_l1_loss(bone_length, bone_init, reduction="sum")
+        (F.smooth_l1_loss(body_pose, pose_init, reduction="sum")
+            if body_pose is not None else 0.0)
+        + (F.smooth_l1_loss(bone_length, bone_init, reduction="sum")
+            if bone_length is not None else 0.0)
+        + (F.smooth_l1_loss(translation, translation_init, reduction="sum")
+            if translation is not None else 0.0)
+        + (F.smooth_l1_loss(orientation, orientation_init, reduction="sum")
+            if orientation is not None else 0.0)
+        + (F.smooth_l1_loss(scale, scale_init, reduction="sum") * scale_weight
+            if scale is not None else 0.0)
     )
     init_prior_loss = smooth_weight * init_prior_loss
     return init_prior_loss.sum()
