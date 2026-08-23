@@ -1,0 +1,25 @@
+{
+  "videos": [
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/05142025/4-cam-1/cam-1.mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/05142025/4-cam-2/cam-2.mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/05142025/4-cam-3/cam-3.mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/05142025/4-cam-4/cam-4.mp4"
+  ],
+  "segmentation_model_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/segment_bluegill.pt",
+  "pose_model_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/bluegill_pose.pt",
+  "mesh_path": "src/DSKv2/Bluegill_Body_mesh.json",
+  "cam_matrices_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/bluegill_multi_camera_calibration.json",
+  "out_path": "src/results/bluegill",
+  "final_output_folder": "src/results/bluegill/output",
+  "frame_range": "670-710",
+  "instance_number": 0,
+  "pose_time_series_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/pose_time_series_Test_Cube_rotating.json",
+  "pose_time_series_deform": true,
+  "pose_time_series_offset_by_range_start": true,
+  "dataset_folder_name": "dataset",
+  "seed": 700,
+  "save_models": true,
+  "conf_threshold": 0.8,
+  "also_create_frame2video_csv": true,
+  "undistort": true
+}

@@ -335,10 +335,15 @@ def run_pipeline(
         )
 
 
+import math
+
 def _mean_median(values: List[float], metric_name: str) -> Dict[str, float]:
     if not values:
         raise ValueError(f"No values provided for metric '{metric_name}'.")
-    return {"mean": float(mean(values)), "median": float(median(values))}
+    finite_values = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not finite_values:
+        return {"mean": float("nan"), "median": float("nan")}
+    return {"mean": float(mean(finite_values)), "median": float(median(finite_values))}
 
 
 def _summarize_scalar_metric(metric_name: str, metric_data: Dict[str, List[float]]) -> Dict[str, Any]:
@@ -419,7 +424,7 @@ def _summarize_keypoint_metric(metric_name: str, metric_data: Dict[str, Dict[str
 
 def compute_metrics_summary(metrics_data: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
-    scalar_metrics = ["orig_IoU", "mask_IoU"]
+    scalar_metrics = ["IoU_mask_detection_and_gt", "IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection"]
 
     for metric_name in scalar_metrics:
         metric_values = metrics_data.get(metric_name)
@@ -442,7 +447,7 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
     def fmt(stats: Dict[str, Optional[float]]) -> str:
         mean_val = stats.get("mean")
         median_val = stats.get("median")
-        if mean_val is None or median_val is None:
+        if mean_val is None or median_val is None or math.isnan(mean_val) or math.isnan(median_val):
             return "mean=NA, median=NA"
         return f"mean={mean_val:.4f}, median={median_val:.4f}"
 

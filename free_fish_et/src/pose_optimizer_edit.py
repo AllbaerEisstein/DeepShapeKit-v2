@@ -79,6 +79,7 @@ class OptimizeMV:
         has_prev: bool = False,
         index: Optional[torch.Tensor] = None,
         bboxes: Optional[torch.Tensor] = None,
+        seg_mask_present_mask: Optional[torch.Tensor] = None
     ):
         """
         Args:
@@ -89,6 +90,7 @@ class OptimizeMV:
             proj_m (vn, 3, 4): projection matrices for vn views
             keypoints (vn, kn, 3): 2D keypoints + confidence
             masks (vn, H, W): silhouette masks
+            seg_mask_present_mask: (vn,) bool/float per view indicating which view has a valid detection
         """
         if not (
             all(
@@ -107,13 +109,14 @@ class OptimizeMV:
             and self.fish.device_active == True
         ):
             keypoints = keypoints.to(self.device)
-            masks = masks.to(self.device) 
+            masks = masks.to(self.device)
             self.fish.to_device(self.device) 
             init_ori_plus_pose = init_ori_plus_pose.to(self.device) 
             init_body_bone_length = init_body_bone_length.to(self.device) 
             init_t = init_t.to(self.device) 
             init_scale = init_scale.to(self.device) 
-            proj_m_from_blworld = proj_m_from_blworld.to(self.device) 
+            proj_m_from_blworld = proj_m_from_blworld.to(self.device)
+
             
         if not "cuda" in str(keypoints.device):
             print(
@@ -140,6 +143,27 @@ class OptimizeMV:
         # in the extraction pipeline, undetected kpts have been set to conf=-1
         # in the loss function, conf is a coefficient of the loss -> clamp to 0, 1
         kpts_conf = kpts_conf.clamp(0.0, 1.0)
+
+        # take care that views without detection (they have an all-zero dummy mask) don't contribute a mask loss:
+        if self.view_weights is None:
+            view_weights = torch.ones(batch_size, device=self.device, dtype=keypoints.dtype)
+        else:
+            view_weights = torch.tensor(self.view_weights, device=self.device, dtype=keypoints.dtype)
+        # mask-only weights: zero out views with no mask detection, WITHOUT touching
+        # view_weights (which also drives the keypoint reprojection loss).
+        if seg_mask_present_mask is not None:
+            mask_present = torch.as_tensor(
+                seg_mask_present_mask, device=self.device, dtype=view_weights.dtype
+            )
+            if mask_present.shape[0] != batch_size:
+                raise ValueError(
+                    f"seg_mask_present_mask length mismatch: got {mask_present.shape[0]}, "
+                    f"but current batch has {batch_size} views."
+                )
+            mask_view_weights = view_weights * mask_present
+        else:
+            mask_view_weights = view_weights
+
 
         def reset_kpts_conf():
             nonlocal kpts_conf
@@ -205,11 +229,6 @@ class OptimizeMV:
             [global_orient, global_t, scale], lr=self.step_size
         )
         for _ in range(self.num_iters):
-            # print(f"Stage 1 - global ori: {global_orient}")
-            # print(f"Stage 1 - body global t: {global_t}")
-            # print(f"Stage 1 - scale: {scale}")
-            # print(f"Stage 1 - body pose: {body_pose}")
-            # print(f"Stage 1 - body bone length: {body_bone_length}")
 
             # Apply global ori and scale
             out = self.fish(
@@ -220,6 +239,7 @@ class OptimizeMV:
             )
             # Apply global t
             model_kpts = out["keypoints"].to(self.device) + global_t
+
             # Keypoint reprojection loss
             model_kpts = model_kpts.expand(batch_size, -1, -1)
             kpt_loss = self.constant_factor_kpt_loss * kpt_reprojection_loss(
@@ -246,7 +266,7 @@ class OptimizeMV:
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
             mask_loss = self.constant_factor_mask_loss * soft_iou_loss(
-                silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
+                silhouette_renders, masks.float(), self.mask_weight, view_weights=mask_view_weights
             )
             loss = kpt_loss + smoothness_loss + mask_loss
             final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
@@ -264,7 +284,7 @@ class OptimizeMV:
 
 
         #***********************************************************
-        # ============ Stage 2: refine first bone group ============
+        # ============ Stage 2: refine first bone group ("torso optimization") ============
         # optimize:
         # -----------------------------------
         # body_pose, 
@@ -390,7 +410,7 @@ class OptimizeMV:
                 out["vertices"], self.faces.unsqueeze(0), global_t
             )
             mask_loss = self.constant_factor_mask_loss * soft_iou_loss(
-                silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
+                silhouette_renders, masks.float(), self.mask_weight, view_weights=mask_view_weights
             )
             loss = kpt_loss + angle_loss + bone_length_loss + smoothness_loss + mask_loss
             final_losses["kpt_reprojection_loss"] = _to_float(kpt_loss)
@@ -414,9 +434,11 @@ class OptimizeMV:
         body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_first_bone_group)
 
 
+
+
         if len(self.fish.bone_groups) > 1:
             #*******************************************************************************
-            # ============ Stage 3: optimize remaining bone groups individually ============
+            # ============ Stage 3: optimize remaining bone groups individually ("limb optimization") ============
             # optimize:
             # -----------------------------------
             # body_pose, 
@@ -489,11 +511,6 @@ class OptimizeMV:
                 global_orient_prev = global_orient.clone().detach()
                 global_t_prev = global_t.clone().detach()
                 for i in range(self.num_iters):
-                    # print(f"Stage 3 - global ori: {global_orient}")
-                    # print(f"Stage 3 - body global t: {global_t}")
-                    # print(f"Stage 3 - scale: {scale}")
-                    # print(f"Stage 3 - body pose: {body_pose}")
-                    # print(f"Stage 3 - body bone length: {body_bone_length}")
                     recombined_body_pose = recombine_frozen_and_optimized_tensor(frozen_body_pose, optimizable_body_pose, in_bone_group)
                     recombined_body_bone_length = recombine_frozen_and_optimized_tensor(frozen_body_bone_length, optimizable_body_bone_length, in_bone_group)
                     out = self.fish(
@@ -554,7 +571,7 @@ class OptimizeMV:
                         out["vertices"], self.faces.unsqueeze(0), global_t
                     )
                     mask_loss = self.constant_factor_mask_loss * soft_iou_loss(
-                        silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
+                        silhouette_renders, masks.float(), self.mask_weight, view_weights=mask_view_weights
                     )
                     ######################################################
                     # for name, l in [
@@ -634,7 +651,7 @@ class OptimizeMV:
                 final_out["vertices"], self.faces.unsqueeze(0), global_t
             )
             final_mask_loss = self.constant_factor_mask_loss * soft_iou_loss(
-                final_silhouette_renders, masks.float(), self.mask_weight, view_weights=view_weights
+                final_silhouette_renders, masks.float(), self.mask_weight, view_weights=mask_view_weights
             )
             final_deviation_from_prev_frame = self.constant_factor_init_deviation_loss * init_deviation_loss(
                 body_pose=body_pose,

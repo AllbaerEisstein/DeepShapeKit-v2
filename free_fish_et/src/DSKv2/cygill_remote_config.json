@@ -1,0 +1,26 @@
+{
+  "videos": [
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/bluegill_renders/002_Fish Top L.mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/bluegill_renders/006_Positive Z (Fish Ventral Side).mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/bluegill_renders/005_Positive Y (Fish L Side).mp4",
+    "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/videos/bluegill_renders/001_Fish Bottom R.mp4"
+  ],
+  "segmentation_model_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/cygill_seg.pt",
+  "pose_model_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/cygill_pose.pt",
+  "mesh_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/Bluegill_Body_mesh.json",
+  "cam_matrices_path": "/home/lli/DSKv2/deepshapekit-v2/free_fish_et/src/DSKv2/cam_matrices.json",
+  "out_path": "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/reconstruction_data",
+  "final_output_folder": "/home/lli/DSKv2/deepshapekit-v2/bluegill_data/reconstruction_data",
+  "frame_range": "0-30",
+  "instance_number": 0,
+  "pose_time_series_path": "src/DSKv2/pose_time_series_Bluegill_Body.json",
+  "pose_time_series_deform": false,
+  "pose_time_series_offset_by_range_start": false,
+  "center_origin_on_camera_mean": false,
+  "dataset_folder_name": "dataset",
+  "seed": 700,
+  "save_models": true,
+  "conf_threshold": 0.8,
+  "also_create_frame2video_csv": true,
+  "undistort": true
+}

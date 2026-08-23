@@ -239,7 +239,7 @@ class Multiview_Dataset(torch.utils.data.Dataset):
                     for kpt_index, kpt_name in enumerate(self.index_json["keypoint_list"]):
                         if self.view_2_frames_2_instances_2_kpts[view][frame_key][str(instance_number)].get(kpt_name, None) is not None:
                             kpt_present_mask[instance_number][view_index][kpt_index] = (
-                                self.view_2_frames_2_instances_2_kpts[view][frame_key][str(instance_number)][kpt_name][2] != -1
+                                self.view_2_frames_2_instances_2_kpts[view][frame_key][str(instance_number)][kpt_name][2] > 0
                             )
                         else:
                             kpt_present_mask[instance_number][view_index][kpt_index] = False

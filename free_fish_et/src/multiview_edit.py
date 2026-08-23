@@ -87,6 +87,7 @@ def fit_mesh(
     init_t: Optional[torch.Tensor] = None,
     index: Optional[torch.Tensor] = None,
     bboxs: Optional[torch.Tensor] = None,
+    seg_mask_present_mask: Optional[torch.Tensor] = None
 ):
     """
     Only used in multiview and crossview fitting:
@@ -186,6 +187,7 @@ def fit_mesh(
         has_prev,
         index,
         bboxs,
+        seg_mask_present_mask
     )
 
     ### Generating mesh output
