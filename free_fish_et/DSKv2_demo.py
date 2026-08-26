@@ -452,7 +452,7 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
         return f"mean={mean_val:.4f}, median={median_val:.4f}"
 
     sections: List[str] = []
-    metric_order = ["orig_IoU", "mask_IoU", "keypoint_L2_distance"]
+    metric_order = ["IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection", "keypoint_L2_distance"]
 
     sections.append("Overall metrics")
     for metric_name in metric_order:

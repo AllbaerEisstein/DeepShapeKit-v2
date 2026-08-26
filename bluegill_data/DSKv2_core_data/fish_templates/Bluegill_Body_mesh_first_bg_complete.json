@@ -76180,52 +76180,23 @@
         5,
         6
       ]
+    }, 
+    {
+    "keypoints_names": [
+	"mouth tip",
+	"gill",
+	"root of pelvic fin",
+	"caudal peduncle"
+      ],
+      "bone_names": ["Bone", "Bone.001", "Bone.002", "Bone.003", "Bone.004"],
+      "keypoint_indices": [0, 1, 2, 3],
+      "bone_indices": [0, 1, 2, 3, 4]
     },
     {
-      "keypoints_names": [
-        "mouth tip",
-        "gill",
-        "root of pelvic fin",
-        "caudal peduncle"
-      ],
-      "bone_names": [
-        "Bone.001",
-        "Bone.002",
-        "Bone.003",
-        "Bone.004"
-      ],
-      "keypoint_indices": [
-        0,
-        1,
-        2,
-        3
-      ],
-      "bone_indices": [
-        1,
-        2,
-        3,
-        4
-      ]
-    },
-    {
-      "keypoints_names": [
-        "middle of caudal fin",
-        "lower tip of caudal fin"
-      ],
-      "bone_names": [
-        "Bone.004",
-        "Bone.005",
-        "Bone.006"
-      ],
-      "keypoint_indices": [
-        4,
-        5
-      ],
-      "bone_indices": [
-        4,
-        5,
-        6
-      ]
+      "keypoints_names": ["caudal peduncle", "middle of caudal fin", "lower tip of caudal fin"],
+      "bone_names": ["Bone.004", "Bone.005", "Bone.006"],
+      "keypoint_indices": [3, 4, 5],
+      "bone_indices": [4, 5, 6]
     }
   ],
   "bone_priors": {
