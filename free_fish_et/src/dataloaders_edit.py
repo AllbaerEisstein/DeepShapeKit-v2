@@ -9,7 +9,7 @@ import pickle
 import json
 from pathlib import Path
 from PIL import Image
-from src.types import *
+from src.dsk_types import *
 from src.parse_cams_json import CameraSet
 
 class Multiview_Dataset(torch.utils.data.Dataset):
@@ -164,12 +164,61 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
         self.instance_indices = list(range(self.index_json['max_n_instances']))
 
+        # CLAUDE FIX: the views are assumed to be frame-synchronized, so they must supply the same
+        # number of extracted frames. Check this once here and report the discrepancy explicitly:
+        # a view that is short by even one frame otherwise silently shifts every later frame of
+        # that view against the others, which produces a plausible-looking but wrong reconstruction.
+        self.frame_counts: dict[str, int] = {
+            view: len(self.origin_frames_meta[view]) for view in self.views
+        }
+        recorded_counts = self.index_json.get("image_counts")
+        if isinstance(recorded_counts, dict):
+            for view in self.views:
+                if view in recorded_counts and int(recorded_counts[view]) != self.frame_counts[view]:
+                    raise ValueError(
+                        f"View '{view}' lists {int(recorded_counts[view])} extracted frames in "
+                        f"index.json but files.csv contains {self.frame_counts[view]} rows. "
+                        f"Re-run frame extraction for this view."
+                    )
+        distinct_counts = set(self.frame_counts.values())
+        if len(distinct_counts) > 1:
+            raise ValueError(
+                "Synchronized views have different frame counts: "
+                + ", ".join(f"{view}={count}" for view, count in self.frame_counts.items())
+                + ". Trim the inputs to a common range or supply per-view offsets via "
+                  "frame2video_1.csv before reconstructing."
+            )
+        self.n_frames = next(iter(distinct_counts)) if distinct_counts else 0
+
         self.prev_data = None
 
 
     def __len__(self) -> int:
-        # assume same length across views
-        return len(self.index_json["image_count"])
+        # CLAUDE FIX: the number of synchronized frames in the dataset. This used to take the length
+        # of index.json's 'image_count' entry, which held a single integer (so `len()` raised) and,
+        # when it did not, would have reported the number of views rather than the number of frames.
+        return self.n_frames
+
+    def _origin_frame_number(self, view: str, frame_key: str) -> str:
+        """
+        CLAUDE FIX: single place that maps a reconstruction frame index to a view's own frame number.
+
+        Masks, images and keypoints are all stored under the *origin* frame number of their view.
+        Keypoints used to be looked up with the raw reconstruction index instead, which agrees with
+        the mapped number only as long as frame2video_1.csv is the identity it is currently written
+        as. The moment that mapping carries real per-view synchronization offsets, keypoints and
+        masks would come from different frames with nothing to indicate it. Routing every lookup
+        through this helper keeps the two in step.
+
+        Raises IndexError (not KeyError) for an unavailable frame so that callers iterating over a
+        frame range can skip it with the same handling they use for other missing samples.
+        """
+        try:
+            return self.frame_map[view][frame_key]
+        except KeyError:
+            raise IndexError(
+                f"Frame {frame_key} is not listed in frame2video_1.csv for view '{view}'."
+            ) from None
 
 
     def __getitem__(self, frame_idx: int, instance_idx: Optional[int] = None) -> dict:
@@ -181,15 +230,15 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             sample['frames'] (list[int]): the list of the view indices
             sample['instances'] (list[int]): the indices of instances in this sample (= list(range(max_n_instances)))
             sample['bboxes'] (n_instances, n_views, 4): bounding boxes of the segmentation masks in the format (x0, y0, x1, y1)
-            sample['masks_full'] (n_instances, n_views, uniform_img_width, uniform_img_height): tensor storing the binary segmentation mask
-            sample['keypoints'] (n_instances, n_views, n_keypoints, 3): tensor storing (x,y,conf) for each keypoint (keypoint missing -> conf=-1)
+            sample['masks_full'] (n_instances, n_views, uniform_img_height, uniform_img_width): tensor storing the binary segmentation mask, in row-major (H, W) order as returned by cv2
+            sample['keypoints'] (n_instances, n_views, n_keypoints, 3): tensor storing (x,y,conf) for each keypoint, ordered exactly like index.json['keypoint_list'] (keypoint missing -> conf=-1)
             sample['seg_mask_present_mask'] (n_instances, n_views): boolean values indicating if an instance has mask detections for each view
             sample['kpt_present_mask'] (n_instances, n_views, n_keypoints): boolean values indicating if an instance has a keypoint detection for each view and each keypoint
         OR, if `instance_idx` is specified, the following fields are different:
             sample['instances'] (int): the index of the instance in this sample
             sample['bboxes'] (n_views, 4): bounding boxes of the segmentation masks in the format (x0, y0, x1, y1)
-            sample['masks_full'] (n_views, uniform_img_width, uniform_img_height): tensor storing the binary segmentation mask
-            sample['keypoints'] (n_views, n_keypoints, 3): tensor storing (x,y,conf) for each keypoint (keypoint missing -> conf=-1)
+            sample['masks_full'] (n_views, uniform_img_height, uniform_img_width): tensor storing the binary segmentation mask, in row-major (H, W) order as returned by cv2
+            sample['keypoints'] (n_views, n_keypoints, 3): tensor storing (x,y,conf) for each keypoint, ordered exactly like index.json['keypoint_list'] (keypoint missing -> conf=-1)
             sample['seg_mask_present_mask'] (n_views): boolean values indicating if this instance has mask detections for each view
             sample['kpt_present_mask'] (n_views, n_keypoints): boolean values indicating if this instance has a keypoint detection for each view and each keypoint
         """
@@ -225,28 +274,38 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
         view_data = {}
         for view_index, view in enumerate(self.views):
-            origin_frame_number = self.frame_map[view][frame_key]
+            # CLAUDE FIX: one frame number per view, used for images, masks *and* keypoints alike.
+            origin_frame_number = self._origin_frame_number(view, frame_key)
             # image path
-            file_loc = self.origin_frames_meta[view][origin_frame_number]['file_loc']
+            try:
+                file_loc = self.origin_frames_meta[view][origin_frame_number]['file_loc']
+            except KeyError:
+                raise IndexError(
+                    f"Frame {origin_frame_number} of view '{view}' is listed in "
+                    f"frame2video_1.csv but was never extracted (not present in files.csv)."
+                ) from None
             origin_img_path = self.root / file_loc
-        
+
+            view_kpts_for_frame = self.view_2_frames_2_instances_2_kpts[view].get(
+                origin_frame_number, {}
+            )
 
             # extract keypoints for each instance
             for instance_number in self.instance_indices:
-                if str(instance_number) not in self.view_2_frames_2_instances_2_kpts[view][frame_key].keys():
+                if str(instance_number) not in view_kpts_for_frame.keys():
                     kpt_present_mask[instance_number][view_index] = [False]*len(self.index_json["keypoint_list"])
                 else:
                     for kpt_index, kpt_name in enumerate(self.index_json["keypoint_list"]):
-                        if self.view_2_frames_2_instances_2_kpts[view][frame_key][str(instance_number)].get(kpt_name, None) is not None:
+                        if view_kpts_for_frame[str(instance_number)].get(kpt_name, None) is not None:
                             kpt_present_mask[instance_number][view_index][kpt_index] = (
-                                self.view_2_frames_2_instances_2_kpts[view][frame_key][str(instance_number)][kpt_name][2] > 0
+                                view_kpts_for_frame[str(instance_number)][kpt_name][2] > 0
                             )
                         else:
                             kpt_present_mask[instance_number][view_index][kpt_index] = False
             kpt_list: list[torch.Tensor] = self._extract_keypoints(
                 view, 
                 self.view_2_frames_2_instances_2_kpts, 
-                frame_idx, 
+                origin_frame_number, 
                 flip=False
             )
 
@@ -417,15 +476,14 @@ class Multiview_Dataset(torch.utils.data.Dataset):
 
     def _load_grayscale_image(self, view: str, rel_path: str) -> np.ndarray:
         """
-        Use cv2.imread() to read an image to np.ndarray and transpose because cv2 read to row-major order but we require column-major order.
+        Read an image from disk as a single-channel np.ndarray.
+
+        CLAUDE FIX: the returned array is in cv2's native row-major (H, W) layout, i.e. indexed as
+        [row, column] == [y, x]. This matches the (H, W) grid the differentiable renderer produces,
+        so masks and rendered silhouettes can be compared elementwise without any transpose. The
+        docstring previously described a transpose to column-major order that the code did not
+        perform, which invites an x/y swap wherever these arrays are consumed.
         """
-        # rel_path example: "video1/mask/image_0_0_mask.png"
-        # try:
-        #     img = Image.open(str(self.root / rel_path))
-        #     img.verify()
-        #     print("PIL load OK")
-        # except Exception as e:
-        #     print("PIL failed:", e)
         return np.array(cv2.imread(str(self.root / rel_path), cv2.IMREAD_GRAYSCALE))
     
     def _get_present_instances(self, f_idx: int) -> list[int]:
@@ -477,23 +535,40 @@ class Multiview_Dataset(torch.utils.data.Dataset):
             - f_idx: index of the frame of which the keypoints shall be extracted
             - flip: 
         Build a list of (K,3) tensors for each instance from keypoints outputs.
+
+        CLAUDE FIX: keypoints are assembled by looking each name up in
+        `index.json['keypoint_list']`, so the returned rows are always in the canonical order that
+        the template's `vert2kpt` matrix and the bone groups' `keypoint_indices` are defined
+        against. Relying on the stored dictionary's own iteration order instead would silently
+        permute keypoint identities whenever that order differs from the canonical list -- the fit
+        would then converge confidently onto the wrong correspondences with nothing to flag it.
+        Names absent from the stored dictionary are filled in as undetected rather than shifting
+        every subsequent keypoint up by one.
         """
-        #filename = self.get_files_for_frame([view], ['bbox-masked'], [idx])[view]['bbox_masked'][idx][0]
-        inst_2_kpts: InstancesKeypointsDict = view_2_frames_2_instances_2_kpts[view][str(f_idx)]
+        inst_2_kpts: InstancesKeypointsDict = view_2_frames_2_instances_2_kpts[view].get(str(f_idx), {})
+        canonical_kpt_names = self.index_json['keypoint_list']
         kpt_list = []
         for inst in range(self.index_json['max_n_instances']):
             inst = str(inst)
-            pts = []
             if inst_2_kpts.get(inst, None) is None:
                 # instance was not detected by keypoint detection
-                pts = [[-1.0, -1.0, -1.0] for _ in range(len(self.index_json['keypoint_list']))]
+                pts = [[-1.0, -1.0, -1.0] for _ in canonical_kpt_names]
                 kpt_list.append(torch.tensor(pts, dtype=torch.float32))
                 continue
-            for x,y,conf in inst_2_kpts[inst].values():
+
+            instance_kpts = inst_2_kpts[inst]
+            pts = []
+            for kpt_name in canonical_kpt_names:
+                entry = instance_kpts.get(kpt_name, None)
+                if entry is None:
+                    # this keypoint name was not produced for this instance -> treat as undetected
+                    pts.append([-1.0, -1.0, -1.0])
+                    continue
+                x, y, conf = entry[0], entry[1], entry[2]
                 if flip:
-                    x = self.index_json["image_size"][0] - x
-                pts.append([x,y,conf])                              # one tuple for each kpt
-            kpt_list.append(torch.tensor(pts, dtype=torch.float32)) # one tensor for reach instance
+                    x = self.index_json["image_sizes"][view][0] - x
+                pts.append([float(x), float(y), float(conf)])
+            kpt_list.append(torch.tensor(pts, dtype=torch.float32)) # one tensor for each instance
         return kpt_list
 
     def _get_files_for_frame(self, views: list[str], categories: list[str], idxs: list[int]) -> dict[str, dict[str, dict[int, list[Path]]]]:
@@ -719,5 +794,3 @@ class UniLabDataset(object):
 
     def __len__(self):
         return len(self.imgs)
-
-

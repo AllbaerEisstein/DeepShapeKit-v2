@@ -1002,9 +1002,16 @@ def reconstruct(
     mask_weight: float = 1.0,
     keypoints_weight: float = 1.0,
     view_weights: Optional[List[float]] = None,
+    render_scale: float = 1.0,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
+
+    Args:
+        render_scale: CLAUDE FIX. Linear resolution factor for the differentiable silhouette
+            renderer used during fitting, relative to the calibrated image size (1.0 = full
+            resolution). Lowering it reduces rasterization time and GPU memory roughly with its
+            square. Images saved for inspection are always rendered at full resolution.
     """
 
     _ensure_dir(outdir)
@@ -1033,6 +1040,7 @@ def reconstruct(
     print("     Bone angle constraint violation:  ", angle_constraint_weight)
     print("     Bone length constraint violation: ", bone_length_constraint_weight)
     print("     Bone group deviation:             ", big_artic_weight)
+    print("   Silhouette render scale:            ", render_scale)
     print("     Views:")
     for view_name, weight in zip(dataset.views, view_weights):
         print(f"          {view_name}: {weight}")
@@ -1050,7 +1058,13 @@ def reconstruct(
     camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
 
     fish = fish_model(mesh_json_path=mesh_path)
+    # CLAUDE FIX: the optimizer is told how large the capture volume is, in the calibration's own
+    # world units, so it can size its translation steps relative to the rig instead of using a
+    # fixed step that is meaningful only for one particular choice of units.
+    scene_scale = float(camera_group_uniform_size_cpu.scene_scale)
+    print(f"   Camera rig scale (mean baseline): {scene_scale:.4f} world units")
     optimizer = OptimizeMV(
+        scene_scale=scene_scale,
         num_iters=num_iters,
         angle_constraint_weight=angle_constraint_weight,
         smooth_weight=smooth_weight,
@@ -1062,8 +1076,19 @@ def reconstruct(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer_for_reconstrcution = Silhouette_Renderer(device, camera_group_uniform_size_device)
+    # CLAUDE FIX: the fitting renderer runs at the configured render_scale; the renderer used only
+    # for the saved inspection images stays at full resolution so the output is unaffected.
+    renderer_for_reconstrcution = Silhouette_Renderer(
+        device, camera_group_uniform_size_device, render_scale=render_scale
+    )
     renderer_for_saving_images = Silhouette_Renderer(device, camera_group_uniform_size_device, sigma=0, gamma=0)
+
+    # CLAUDE FIX: verify once, before any frame is processed, that the renderer's camera model and
+    # the projection matrices driving the keypoint loss put the same 3D point in the same place.
+    # If they disagree, the silhouette term and the keypoint term pull the mesh towards different
+    # image positions and the fit quietly settles on a compromise between two inconsistent camera
+    # models -- a failure mode that produces no error and no obviously broken output.
+    renderer_for_reconstrcution.check_camera_consistency(tolerance_px=1.0)
 
     # --------------------------
     # load cache, if available
@@ -1209,8 +1234,11 @@ def reconstruct(
         # load from dataset
         try:
             instance_sample = dataset.__getitem__(idx, instance_number)
-        except IndexError:
-            print(f"Sample {idx} missing, skipping")
+        except (IndexError, KeyError) as exc:
+            # CLAUDE FIX: a frame that is absent from one view's index surfaces as a lookup failure
+            # rather than an out-of-range error, so both are treated as "this frame is unavailable"
+            # and skipped, with the reason reported instead of aborting the whole run.
+            print(f"Sample {idx} unavailable ({type(exc).__name__}: {exc}), skipping")
             pbar.update()
             continue
 

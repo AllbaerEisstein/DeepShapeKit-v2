@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -87,6 +86,25 @@ class CameraGroup:
         t_column = self.t.unsqueeze(-1)
         centers = -torch.matmul(self.R.transpose(1, 2), t_column).squeeze(-1)
         return centers
+
+    @property
+    def scene_scale(self) -> torch.Tensor:
+        """
+        CLAUDE FIX: a characteristic length of the capture volume, in whatever world units the
+        calibration uses, taken as the mean distance between camera centers (the rig baseline).
+
+        The optimizer uses this to express its translation step size as a fraction of the rig
+        rather than as a fixed number, so that the same configured step size behaves the same way
+        whether the calibration is in millimeters, centimeters or arbitrary units. Falls back to
+        the distance of the single camera from the world origin when only one view is available.
+        """
+        centers = self.camera_centers  # (B, 3)
+        if centers.shape[0] < 2:
+            return centers.norm(dim=-1).mean().clamp_min(1.0)
+        pairwise = torch.cdist(centers, centers)
+        n = centers.shape[0]
+        # sum of all ordered pairs divided by the number of ordered pairs (diagonal contributes 0)
+        return (pairwise.sum() / (n * (n - 1))).clamp_min(1e-6)
 
     @property
     def original_image_size_hw(self) -> torch.Tensor:

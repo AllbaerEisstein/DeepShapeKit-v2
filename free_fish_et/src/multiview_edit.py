@@ -39,14 +39,18 @@ def fit_geometry(
     """
 
     # 3D kpts on bird
-    if init_pose == None and init_body_bone_l == None:
+    if init_pose is None and init_body_bone_l is None:
         # initial position: rest pose
         fish_mesh_kpts_local = torch.matmul(fish.vert2kpt, fish.V[0])
     else:
         # no initial guess for global position/orientation
         init_ori = torch.zeros([1, 3]).float().to(keypoints.device)
+        # CLAUDE FIX: this branch runs the articulated model while the branch above reads the rest
+        # keypoints straight off the template. Those two now agree at a zero pose, because skinning
+        # reproduces the rest mesh exactly, so the Procrustes target is the same geometry the
+        # optimizer's forward model will produce regardless of which branch was taken.
         fish_articulated = fish(init_ori, init_pose, init_body_bone_l)
-        fish_mesh_kpts_local = fish_articulated["keypoints"][0]
+        fish_mesh_kpts_local = fish_articulated["keypoints"][0].to(keypoints.device)
 
     # Triangulation with LBFGS
     camera_group = cameras.to(keypoints.device)
@@ -191,7 +195,16 @@ def fit_mesh(
     )
 
     ### Generating mesh output
-    fish_output = fish(global_ori_plus_pose_est[:, 0:3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, deform=True)
+    # CLAUDE FIX: the model keeps its outputs on its own device by default now, so this call asks
+    # explicitly for host tensors to match the CPU parameters returned by the optimizer.
+    fish_output = fish(
+        global_ori_plus_pose_est[:, 0:3],
+        global_ori_plus_pose_est[:, 3:],
+        body_bone_est,
+        scale_est,
+        deform=True,
+        output_device="cpu",
+    )
 
     vertices_world_est = fish_output["vertices"] + global_t_est
     keypoints_world_est = fish_output["keypoints"] + global_t_est
