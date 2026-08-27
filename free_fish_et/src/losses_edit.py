@@ -143,23 +143,42 @@ def decompose_to_swing_twist(quats):
 
     # print("swing-twist")
     # print("   quats:", quats)
-    # Singular when both w and y are ~0
-    singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
-
-    # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
-    twists = torch.where(
-        singular_quats_mask,
-        torch.zeros_like(w),
-        2 * torch.atan2(y, w)
-    )  # (BS, bn)
-    # print("   twists:", twists)
-
     # sqrt(r^2) has undefined gradient at r=0; add epsilon to keep gradients finite
     # for identity/near-identity quaternions where x=z=0 (and similarly y=w=0 edge cases).
     eps = 1e-12
     xz_norm = torch.sqrt(x**2 + z**2 + eps)
     yw_norm = torch.sqrt(y**2 + w**2 + eps)
-    beta = torch.atan2(xz_norm, yw_norm)  # (BS, bn)
+    beta = torch.atan2(xz_norm, yw_norm)  # (BS, bn) half of the swing angle
+
+    # CLAUDE FIX: `yw_norm` equals |cos(swing_angle / 2)|, so it measures how well swing and twist
+    # can be told apart. It goes to zero as the swing approaches 180 degrees, and there a rotation
+    # can be written *either* as a swing about one axis *or* as a swing about the perpendicular axis
+    # combined with a half turn of twist -- the two are the same rotation. Reading the twist from
+    # `atan2(y, w)` in that region returns an arbitrary value (typically near +/-pi), which then
+    # rotates the swing off the axis it actually belongs to. For a bone whose swing limits differ
+    # per axis, that turns a legal turn about the permitted axis into a large apparent violation of
+    # the restricted one, and the resulting penalty wall stops the bone from turning any further.
+    #
+    # Of the equivalent representations, the one with the least twist is the meaningful choice, so
+    # the twist is faded out smoothly as the decomposition degenerates. The gate is 1 (no change at
+    # all) for swings up to `SWING_GATE_START` and reaches 0 at a 180 degree swing, so ordinary
+    # articulation is unaffected and only the ambiguous region is stabilized.
+    SWING_GATE_START = 150.0 * torch.pi / 180.0
+    gate_ref = torch.cos(torch.tensor(SWING_GATE_START / 2.0, device=w.device, dtype=w.dtype))
+    t = (yw_norm / gate_ref).clamp(0.0, 1.0)
+    degeneracy_gate = t * t * (3.0 - 2.0 * t)  # smoothstep: C1-continuous, no kink at the ends
+
+    # CLAUDE FIX: mask the *inputs* to atan2 rather than its output. `torch.where` evaluates both
+    # branches and backpropagates through both, and the derivative of atan2(y, w) at y = w = 0 is
+    # 0/0, so selecting a safe branch after the fact still lets a NaN gradient through from the
+    # branch that was not selected -- precisely in the case the mask exists to handle.
+    singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
+    w_safe = torch.where(singular_quats_mask, torch.ones_like(w), w)
+    y_safe = torch.where(singular_quats_mask, torch.zeros_like(y), y)
+
+    # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
+    twists = degeneracy_gate * (2 * torch.atan2(y_safe, w_safe))  # (BS, bn)
+    # print("   twists:", twists)
 
     gamma = twists / 2  # (BS, bn)
 

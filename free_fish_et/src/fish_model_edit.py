@@ -120,8 +120,25 @@ class fish_model:
             bone_angle_priors.extend([prior["swing_x"], prior["twist_y"], prior["swing_z"]])
         self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, n_bones, 3) (swing_x, twist_y, swing_z)
 
+        # CLAUDE FIX: warn about prior combinations that sit near a degeneracy of the swing-twist
+        # parametrization. A swing limit close to 180 degrees on one axis while the other axis is
+        # tightly limited is a legitimate thing to want (an animal that turns freely but does not
+        # pitch), but a 180 degree swing can be written either as a swing about one axis or as a
+        # swing about the perpendicular axis combined with a half turn of twist. `decompose_to_swing_twist`
+        # damps the twist near that configuration so the swing stays on the axis it belongs to;
+        # this notice just makes the situation visible if the fit ever looks odd at large turns.
+        for b_idx, bname in enumerate(template["bone_order"]):
+            sx, _, sz = [float(v) for v in self.bone_angle_priors[0, b_idx]]
+            wide, narrow = max(abs(sx), abs(sz)), min(abs(sx), abs(sz))
+            if wide > 0.9 * torch.pi and narrow < 0.5 * wide:
+                print(
+                    f"Note: bone '{bname}' has strongly anisotropic swing limits "
+                    f"(swing_x={sx:.3f}, swing_z={sz:.3f} rad) with one axis near 180 degrees. "
+                    f"Swing/twist separation is damped near 180 degree swings for this bone."
+                )
+
         # Body bone length limit
-        self.bone_length_min = [1.0] * (self.n_body_bones)
+        self.bone_length_min = [0.7] * (self.n_body_bones)
         self.bone_length_max = [1.5] * (self.n_body_bones)
 
         self.bone_length_min = torch.tensor(self.bone_length_min)
