@@ -127,15 +127,16 @@ class fish_model:
         # swing about the perpendicular axis combined with a half turn of twist. `decompose_to_swing_twist`
         # damps the twist near that configuration so the swing stays on the axis it belongs to;
         # this notice just makes the situation visible if the fit ever looks odd at large turns.
-        for b_idx, bname in enumerate(template["bone_order"]):
-            sx, _, sz = [float(v) for v in self.bone_angle_priors[0, b_idx]]
-            wide, narrow = max(abs(sx), abs(sz)), min(abs(sx), abs(sz))
-            if wide > 0.9 * torch.pi and narrow < 0.5 * wide:
-                print(
-                    f"Note: bone '{bname}' has strongly anisotropic swing limits "
-                    f"(swing_x={sx:.3f}, swing_z={sz:.3f} rad) with one axis near 180 degrees. "
-                    f"Swing/twist separation is damped near 180 degree swings for this bone."
-                )
+        # for b_idx, bname in enumerate(template["bone_order"]):
+        #     sx, _, sz = [float(v) for v in self.bone_angle_priors[0, b_idx]]
+        #     wide, narrow = max(abs(sx), abs(sz)), min(abs(sx), abs(sz))
+        #     if wide > 0.9 * torch.pi and narrow < 0.5 * wide:
+        #         print(
+        #             f"Note: bone '{bname}' has strongly anisotropic swing limits "
+        #             f"(swing_x={sx:.3f}, swing_z={sz:.3f} rad) with one axis near 180 degrees. "
+        #             f"Swing/twist separation is damped near 180 degree swings for this bone."
+        #         )
+        # TODO: Currently, the head bone prior is NOT checked against in the pose_optimizer because of singularity problems if the head bone prior is non-restrictive.
 
         # Body bone length limit
         self.bone_length_min = [0.7] * (self.n_body_bones)

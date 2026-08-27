@@ -364,43 +364,39 @@ class OptimizeMV:
 
         def bone_angle_quats(out, bone_group=None) -> torch.Tensor:
             """
-            CLAUDE FIX: assemble the per-bone rotations that the angle constraint is evaluated on.
+            CLAUDE FIX: assemble the body-bone rotations that the angle constraint is evaluated on.
 
-            Two things changed here. First, the model now reports each bone's *own* rotation rather
-            than the accumulated chain rotation, so the swing-twist limits mean what the template
-            says they mean. Second, index 0 -- the global orientation -- is always passed through
-            rather than being replaced by an identity rotation unless the root bone happened to be
-            listed in the current bone group. The root bone's priors in the template
-            (`bone_priors["Bone"]`) are real limits on how the animal may be oriented, and they are
-            now enforced in every stage, including the global stage. Bones outside the stage's bone
-            group are still replaced by an identity rotation so that they contribute nothing.
+            The model reports each bone's *own* rotation rather than the accumulated chain rotation,
+            so the swing-twist limits mean what the template says they mean. Index 0 -- the head/root
+            bone and global orientation -- is excluded from angle-prior checking entirely. Bones
+            outside the stage's bone group are replaced by an identity rotation so that they
+            contribute nothing.
             """
             bone_local_oris = out["global_ori_plus_body_pose_rest_bone_spaces"].to(self.device)
             identity = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device, dtype=bone_local_oris.dtype).view(1, 1, 4)
             if bone_group is None:
-                # global stage: only the root bone's orientation is being optimized
-                body_bone_quats = identity.expand(bone_local_oris.shape[0], bone_local_oris.shape[1] - 1, 4)
-            else:
-                in_group = torch.tensor(
-                    [(b_idx + 1) in bone_group for b_idx in range(body_pose.size(1))],
-                    dtype=torch.bool, device=self.device
-                )
-                body_bone_quats = torch.where(
-                    in_group.view(1, -1, 1),
-                    bone_local_oris[:, 1:],
-                    identity,
-                )
-            return torch.cat([bone_local_oris[:, :1], body_bone_quats], dim=1)
+                # global stage: no body-bone angle priors are active
+                return identity.expand(bone_local_oris.shape[0], bone_local_oris.shape[1] - 1, 4)
+
+            in_group = torch.tensor(
+                [(b_idx + 1) in bone_group for b_idx in range(body_pose.size(1))],
+                dtype=torch.bool, device=self.device
+            )
+            return torch.where(
+                in_group.view(1, -1, 1),
+                bone_local_oris[:, 1:],
+                identity,
+            )
 
         #******************************************************************************
-        # ============ Stage 1: optimize global_orient, translation, scale ============
+        # ============ Stage 1: optimize global_orient, translation, scale ("7D-stage") ============
         # loss: 
         # -----------------------------------
         # keypoint reprojection (GMoF robustified, weighted by keypoint confidence squared,
         #   keypoints_weight, view_weights, and normalized by the per-view detection box size),
         # silhouette loss: soft IoU plus a low-weight area-normalized L1 difference between the
         #   detected mask and the rendered projection (weighted by mask_weight and view_weights),
-        # swing-twist angle constraint on the global orientation (weighted by angle_constraint_weight),
+        # no angle prior is applied to the global orientation in this stage,
         # smoothness: 
         #   global_t smoothness prior vs init_t (weighted by smooth_weight)
         #   global_orient smoothness prior vs init_global_orient (weighted by smooth_weight)
@@ -443,7 +439,7 @@ class OptimizeMV:
             # this stage too, so the global stage can no longer settle on an orientation that the
             # template declares impossible and then hand it to stage 2 as a starting point.
             angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
-                bone_angle_priors=self.fish.bone_angle_priors,
+                bone_angle_priors=self.fish.bone_angle_priors[:, 1:],
                 global_ori_plus_body_pose_rest_head_spaces=bone_angle_quats(out, bone_group=None),
                 angle_constraint_weight=self.angle_constraint_weight,
             )
@@ -498,7 +494,7 @@ class OptimizeMV:
         # swing-twist angle constraint loss (weighted by angle_constraint_weight):
         #   - twist-limit violation (symmetric about the rest pose),
         #   - swing ellipse violation with locked-axis handling for zero swing priors,
-        #   - always includes the global orientation against the root bone's priors,
+        #   - excludes the head/root bone and global orientation from angle-prior checking,
         # bone-length min/max constraint loss (weighted by bone_length_constraint_weight),
         # smoothness:
         #   body pose smooth L1 and 
@@ -548,7 +544,7 @@ class OptimizeMV:
                 bbox_scales=bbox_scales,
             )
             angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
-                bone_angle_priors=self.fish.bone_angle_priors,
+                bone_angle_priors=self.fish.bone_angle_priors[:, 1:],
                 global_ori_plus_body_pose_rest_head_spaces=bone_angle_quats(out, bone_group=first_bone_group),
                 angle_constraint_weight=self.angle_constraint_weight,
             )
@@ -681,7 +677,7 @@ class OptimizeMV:
                         bbox_scales=bbox_scales,
                     )
                     angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
-                        bone_angle_priors=self.fish.bone_angle_priors,
+                        bone_angle_priors=self.fish.bone_angle_priors[:, 1:],
                         global_ori_plus_body_pose_rest_head_spaces=bone_angle_quats(out, bone_group=bone_group),
                         angle_constraint_weight=self.angle_constraint_weight,
                     )
@@ -763,8 +759,8 @@ class OptimizeMV:
             # orientation, so it describes the whole returned pose rather than one bone group.
             final_bone_local_oris = final_out["global_ori_plus_body_pose_rest_bone_spaces"].to(self.device)
             final_angle_loss = self.constant_factor_bone_angle_constraint_loss * bone_angle_constraint_loss(
-                bone_angle_priors=self.fish.bone_angle_priors,
-                global_ori_plus_body_pose_rest_head_spaces=final_bone_local_oris,
+                bone_angle_priors=self.fish.bone_angle_priors[:, 1:],
+                global_ori_plus_body_pose_rest_head_spaces=final_bone_local_oris[:, 1:],
                 angle_constraint_weight=self.angle_constraint_weight,
             )
             final_bone_length_loss = self.constant_factor_bone_length_constraint_loss * bone_length_constraint_loss(
