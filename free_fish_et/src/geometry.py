@@ -60,28 +60,51 @@ def quat_to_rotmat(quat):
                           2*xz - 2*wy, 2*wx + 2*yz, w2 - x2 - y2 + z2], dim=1).view(B, 3, 3)
     return rotMat
 
-def perspective_projection(points, proj_m):
+def perspective_projection(points, proj_m, return_validity=False, min_depth=1e-6):
     """
     This function computes the perspective projection of a set of points.
     Input:
         points (bs, N, 3): 3D points
         proj_m (bs, 3, 4): perspective projection matrix without distortion
+        return_validity (bool): if True, also return a (bs, N) bool mask that is True for points
+            lying strictly in front of the camera.
+        min_depth (float): magnitude floor applied to the homogeneous coordinate before dividing.
 
     Output:
         projected_points (bs, N, 2)
+        in_front_of_camera (bs, N)  [only if return_validity]
+
+    CLAUDE FIX: the perspective divide is guarded in two ways.
+      * The divisor's *magnitude* is clamped, so a point that lands on or very near the image plane
+        no longer produces inf/NaN coordinates that would propagate through the loss and abort the
+        whole reconstruction. The sign is preserved so that the geometry is unchanged wherever the
+        clamp is not active.
+      * Points behind the camera (negative depth) are reported as invalid. Such points still
+        project to a finite, mirrored location that looks like a legitimate observation, so callers
+        should exclude them rather than fit to them.
     """
 
     homogeneous_points = torch.cat([points, torch.ones(points.size(0), points.size(1), 1, device=points.device)], -1)
 
     out_points = []
+    validity = []
     for i in range(proj_m.size(0)):
         # p' = PI * p
         projected_points = torch.matmul(proj_m[i].to(points.device), homogeneous_points[i].permute(1,0)).permute(1,0)
-        projected_points = torch.div(projected_points , torch.stack([projected_points[:,-1]] * 3, -1))
-        out_points.append(projected_points)
 
-    out_points = torch.stack(out_points)
-    return out_points[:,:,:-1]
+        depth = projected_points[:, -1]
+        in_front = depth > min_depth
+        depth_sign = torch.where(depth < 0, -torch.ones_like(depth), torch.ones_like(depth))
+        safe_depth = depth_sign * depth.abs().clamp_min(min_depth)
+
+        projected_points = projected_points / safe_depth.unsqueeze(-1)
+        out_points.append(projected_points)
+        validity.append(in_front)
+
+    out_points = torch.stack(out_points)[:, :, :-1]
+    if return_validity:
+        return out_points, torch.stack(validity)
+    return out_points
 
 def perspective_projection_homo(points, proj_m):
     """

@@ -1,4 +1,7 @@
 bluegill_data/videos/*.mp4
+bluegill_data/*.png
+bluegill_data/*.jpeg
+bluegill_data/*.jpg
 bluegill_data/synthetic_data/*.png
 bluegill_data/synthetic_data/*.txt
 bluegill_data/reconstruction_data/*

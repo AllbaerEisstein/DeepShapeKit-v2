@@ -77,12 +77,14 @@ def _save_reconstruction_images(
     keypoint_names: List[str],
     view_names: List[str],
     mask_predictions: Optional[torch.Tensor] = None, # for calculating mask-reprojection IoU
+    mask_present_mask: Optional[List[bool]] = None,
     keypoint_predictions: Optional[torch.Tensor] = None, # for calculating keypoint L2 distance
     optimizer_losses: Optional[dict[str, Optional[float]]] = None,
     optimizer_loss_weights: Optional[dict[str, float]] = None,
     view_weights: Optional[List[float]] = None,
     silhouette_threshold: float = 0.01,  # tiny alpha cutoff
     blend_factor: float = 0.6,           # overlay opacity (60%)
+    also_draw_mask_detection: bool = True,
     show_metrics: bool = True,
     draw_verts: bool = False,
     draw_coordinate_axes: bool = False,
@@ -161,7 +163,7 @@ def _save_reconstruction_images(
         if view_weight is None:
             if (not np.isfinite(loss_value_f)) or (not np.isfinite(weight_f)) or abs(weight_f) < 1e-12:
                 return _fmt_metric_value(loss_value_f)
-            return f"{weight_f:.2f} * {loss_value_f / weight_f:.2f}"
+            return f"{weight_f:.5f} * {loss_value_f / weight_f:.5f}"
 
         try:
             view_weight_f = float(view_weight)
@@ -248,20 +250,20 @@ def _save_reconstruction_images(
                 font=font,
             )
             current_y += row_height
-
+    
     silhouettes = renderer(reconstructed_vertices_local, faces_from_vert_indices, global_t)
     silhouettes_np = silhouettes.detach().cpu().numpy()
     alpha = silhouettes_np  # (N, H, W)
     n_views, H, W = alpha.shape
 
     metrics = {
-        "mask_detection_IoU": {
+        "IoU_mask_detection_and_gt": {
             view_name: None for view_name in view_names
         },
-        "orig_IoU": {
+        "IoU_reconstruction_and_gt": {
             view_name: None for view_name in view_names
         },
-        "mask_IoU": {
+        "IoU_reconstruction_and_mask_detection": {
             view_name: None for view_name in view_names
         },
         "keypoint_L2_distance": {
@@ -274,6 +276,7 @@ def _save_reconstruction_images(
             "mask_fitting_loss": None,
             "bone_angle_constraint_loss": None,
             "bone_length_constraint_loss": None,
+            "final_deviation_from_prev_frame": None
         },
     }
     if optimizer_losses is not None:
@@ -465,7 +468,15 @@ def _save_reconstruction_images(
                 offset_y = extra_pad_top
 
         padded_gray = cv2.cvtColor(padded, cv2.COLOR_BGR2GRAY)
-        _, padded_binary = cv2.threshold(padded_gray, 0, 1, cv2.THRESH_BINARY)
+        # Low-pass filter to counteract compression/codec noise from the lossy video source:
+        # extracted frames come from cv2.VideoCapture on an .mp4, and H.264-style compression
+        # routinely leaves isolated non-zero speckle in otherwise pure-black background regions.
+        # A median blur removes this salt-and-pepper noise (without blurring the fish silhouette
+        # edges the way a Gaussian blur would), and a small threshold margin (instead of >0)
+        # absorbs any residual near-black noise that survives the blur.
+        padded_gray_denoised = cv2.medianBlur(padded_gray, 3)
+        _GT_MASK_NOISE_THRESHOLD = 10  # pixel values <= this are still treated as background
+        _, padded_binary = cv2.threshold(padded_gray_denoised, _GT_MASK_NOISE_THRESHOLD, 1, cv2.THRESH_BINARY)
 
         a = np.clip(alpha[view_idx], 0.0, 1.0)  # (H,W), float
         # threshold tiny values
@@ -482,40 +493,80 @@ def _save_reconstruction_images(
         reprojection_mask_binary = torch.tensor(cv2.threshold(a, 0, 1, cv2.THRESH_BINARY)[1], device=device)
         metric = BinaryJaccardIndex().to(device=device)
 
-        orig_iou = metric(
+        IoU_reconstruction_and_gt = metric(
             torch.tensor(padded_binary, device=device),
             reprojection_mask_binary
         )
         if mask_predictions is not None:
-            mask_pred_view = mask_predictions[view_idx].to(device=device)
-            if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
-                mask_pred_view = torch.nn.functional.pad(
-                    mask_pred_view,
-                    (extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom),
+            mask_is_present = True if mask_present_mask is None else bool(mask_present_mask[view_idx])
+            if mask_is_present:
+                mask_pred_view = mask_predictions[view_idx].to(device=device)
+                if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+                    mask_pred_view = torch.nn.functional.pad(
+                        mask_pred_view, (extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom),
+                    )
+                IoU_mask_detection_and_gt = metric(torch.tensor(padded_binary, device=device), mask_pred_view)
+                IoU_reconstruction_and_mask_detection = metric(mask_pred_view, reprojection_mask_binary)
+                metrics["IoU_mask_detection_and_gt"][view_names[view_idx]] = IoU_mask_detection_and_gt.item()
+                metrics["IoU_reconstruction_and_mask_detection"][view_names[view_idx]] = IoU_reconstruction_and_mask_detection.item()
+            else:
+                metrics["IoU_mask_detection_and_gt"][view_names[view_idx]] = float("nan")
+                metrics["IoU_reconstruction_and_mask_detection"][view_names[view_idx]] = float("nan")
+        metrics["IoU_reconstruction_and_gt"][view_names[view_idx]] = IoU_reconstruction_and_gt.item()
+
+
+        # Start from the padded original image.
+        blended = padded.astype(np.float32).copy()
+        # Optional mask-detection overlay
+        # White where mask_full is present, transparent elsewhere.
+        if also_draw_mask_detection and mask_predictions is not None:
+            mask_is_present = True if mask_present_mask is None else bool(mask_present_mask[view_idx])
+            if mask_is_present:
+                mask_view = mask_predictions[view_idx]
+                if isinstance(mask_view, torch.Tensor):
+                    mask_view = mask_view.detach().cpu().numpy()
+                mask_view = np.asarray(mask_view)
+                if mask_view.max(initial=0) > 1.0:
+                    mask_view = mask_view / 255.0
+                mask_view = np.clip(mask_view, 0.0, 1.0)
+                # Pad exactly like the reconstruction silhouette.
+                if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+                    mask_view = np.pad(
+                        mask_view,
+                        ((extra_pad_top, extra_pad_bottom), (extra_pad_left, extra_pad_right),),
+                        mode="constant",
+                    )
+                # Resize/validate shape if necessary.
+                if mask_view.shape != padded.shape[:2]:
+                    raise ValueError(
+                        f"mask_full[{view_idx}] has shape {mask_view.shape}, "
+                        f"but expected {padded.shape[:2]}"
+                    )
+                # Blue overlay.
+                blue_img = np.full_like(blended, (255.0,0.0,0.0))
+                # Only mask pixels contribute.
+                mask_alpha = mask_view[..., None]
+                # Alpha for mask visualization.
+                mask_overlay_alpha = 0.35
+                blended = (
+                    blended * (1.0 - mask_overlay_alpha * mask_alpha)
+                    + blue_img * (mask_overlay_alpha * mask_alpha)
                 )
-            mask_detection_iou = metric(
-                torch.tensor(padded_binary, device=device),
-                mask_pred_view
-            ) # to evaluate the quality of yolo mask detection, given we are working with synthetic data
-            mask_iou = metric(
-                mask_pred_view,
-                reprojection_mask_binary
-            )
-            metrics["mask_detection_IoU"][view_names[view_idx]] = mask_detection_iou.item()
-            metrics["mask_IoU"][view_names[view_idx]] = mask_iou.item()
-        metrics["orig_IoU"][view_names[view_idx]] = orig_iou.item()
-
-
-        # Build red overlay image (BGR) and blend: out = orig*(1 - bf * a) + red*(bf * a)
-        red_img = np.zeros_like(padded)
-        red_img[:, :, 2] = 255  # full red channel in BGR
-
-
-        a_exp = a[..., None] # add empty axis/dimension to a
-        blended = (padded.astype(np.float32) * (1.0 - blend_factor * a_exp) +
-                   red_img.astype(np.float32) * (blend_factor * a_exp))
+        # Reconstruction silhouette overlay
+        red_img = np.zeros_like(blended)
+        red_img[:, :, 2] = 255
+        a_exp = a[..., None]
+        blended = (
+            blended * (1.0 - blend_factor * a_exp)
+            + red_img * (blend_factor * a_exp)
+        )
+        blended = np.nan_to_num(
+            blended,
+            nan=0.0,
+            posinf=255.0,
+            neginf=0.0,
+        )
         blended = np.clip(blended, 0, 255).astype(np.uint8)
-
         blended_h, blended_w = blended.shape[:2]
 
         # Draw keypoints:
@@ -528,8 +579,8 @@ def _save_reconstruction_images(
             ui = int(round(kp_u.item())) + offset_x
             vi = int(round(kp_v.item())) + offset_y
             if 0 <= ui < blended_w and 0 <= vi < blended_h:
-                draw_circle(blended, (ui, vi), radius=5, color=(255, 150, 0))
-                draw_text(blended, name, (ui, vi + 15), color=(255, 150, 0))
+                draw_circle(blended, (ui, vi), radius=5, color=(0, 150, 255))
+                draw_text(blended, name, (ui, vi + 15), color=(0, 150, 255))
                 if annotate_keypoints_with_coords:
                     kp_coords = keypoints_world_np[kp_idx]
                     coord_text = f"({kp_coords[0]:.2f}, {kp_coords[1]:.2f}, {kp_coords[2]:.2f})"
@@ -542,21 +593,13 @@ def _save_reconstruction_images(
             if keypoint_predictions is not None:
                 pred_u = keypoint_predictions[view_idx, kp_idx, 0]
                 pred_v = keypoint_predictions[view_idx, kp_idx, 1]
-                if not (torch.isfinite(pred_u) and torch.isfinite(pred_v)):
-                    continue
-                ui_pred = int(round(pred_u.item())) + offset_x
-                vi_pred = int(round(pred_v.item())) + offset_y
                 ci_pred = keypoint_predictions[view_idx, kp_idx, 2].item()
-                if ci_pred > 0:
+                if ci_pred > 0 and torch.isfinite(pred_u) and torch.isfinite(pred_v):
+                    ui_pred = int(round(pred_u.item())) + offset_x
+                    vi_pred = int(round(pred_v.item())) + offset_y
                     conf_scaled_annot_radius = int(ci_pred*10)//2
                     cv2.circle(blended, (ui_pred, vi_pred), radius=1, color=(255,0,0), lineType=-1)
-                    cv2.circle(
-                        blended,
-                        (ui_pred, vi_pred),
-                        radius=conf_scaled_annot_radius,
-                        color=(255,0,0),
-                        lineType=-1
-                    )
+                    cv2.circle(blended, (ui_pred, vi_pred), radius=conf_scaled_annot_radius, color=(255,0,0), lineType=-1)
                     namelen = len(name)
                     draw_text(
                         blended,
@@ -564,9 +607,11 @@ def _save_reconstruction_images(
                         (ui_pred, vi_pred + conf_scaled_annot_radius - 20),
                         color=(255,0,0),
                     )
-                metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = (
-                    ( (ui - ui_pred)**2 + (vi - vi_pred)**2 )**0.5
-                )
+                    metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = (
+                        ( (ui - ui_pred)**2 + (vi - vi_pred)**2 )**0.5
+                    )
+                else:
+                    metrics["keypoint_L2_distance"][view_names[view_idx]][keypoint_names[kp_idx]] = float("nan")
 
         if draw_verts:
             for vert_idx in range(verts_proj.size(1)):
@@ -744,9 +789,9 @@ def _save_reconstruction_images(
             )
             metric_rows = [
                 ("view", view_name),
-                ("orig_IoU", metrics["orig_IoU"][view_name]),
-                ("mask_detection_IoU", metrics["mask_detection_IoU"][view_name]),
-                ("mask_IoU", metrics["mask_IoU"][view_name]),
+                ("IoU_reconstruction_and_gt", metrics["IoU_reconstruction_and_gt"][view_name]),
+                ("IoU_mask_detection_and_gt", metrics["IoU_mask_detection_and_gt"][view_name]),
+                ("IoU_reconstruction_and_mask_detection", metrics["IoU_reconstruction_and_mask_detection"][view_name]),
                 ("kpt_L2_mean", keypoint_mean_error),
                 ("kpt_valid", f"{len(view_kpt_errors)}/{len(keypoint_names)}"),
             ]
@@ -957,16 +1002,23 @@ def reconstruct(
     video_names: Optional[List[str]] = None,
     pause_event: Optional[Any] = None,
     num_iters: int = 100,
-    angle_constraint_weight: float = 200.0,
-    smooth_weight: float = 30.0,
-    big_artic_weight: float = 30.0,
-    bone_length_constraint_weight: float = 200.0,
-    mask_weight: float = 200.0,
+    angle_constraint_weight: float = 1.0,
+    smooth_weight: float = 1.0,
+    big_artic_weight: float = 1.0,
+    bone_length_constraint_weight: float = 1.0,
+    mask_weight: float = 1.0,
     keypoints_weight: float = 1.0,
     view_weights: Optional[List[float]] = None,
+    render_scale: float = 1.0,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
+
+    Args:
+        render_scale: CLAUDE FIX. Linear resolution factor for the differentiable silhouette
+            renderer used during fitting, relative to the calibrated image size (1.0 = full
+            resolution). Lowering it reduces rasterization time and GPU memory roughly with its
+            square. Images saved for inspection are always rendered at full resolution.
     """
 
     _ensure_dir(outdir)
@@ -995,6 +1047,7 @@ def reconstruct(
     print("     Bone angle constraint violation:  ", angle_constraint_weight)
     print("     Bone length constraint violation: ", bone_length_constraint_weight)
     print("     Bone group deviation:             ", big_artic_weight)
+    print("   Silhouette render scale:            ", render_scale)
     print("     Views:")
     for view_name, weight in zip(dataset.views, view_weights):
         print(f"          {view_name}: {weight}")
@@ -1004,6 +1057,7 @@ def reconstruct(
         "mask_fitting_loss": float(mask_weight),
         "bone_angle_constraint_loss": float(angle_constraint_weight),
         "bone_length_constraint_loss": float(bone_length_constraint_weight),
+        "final_deviation_from_prev_frame": float(smooth_weight)
     }
 
 
@@ -1011,7 +1065,13 @@ def reconstruct(
     camera_group_uniform_size_device = camera_group_uniform_size_cpu.to(device)
 
     fish = fish_model(mesh_json_path=mesh_path)
+    # CLAUDE FIX: the optimizer is told how large the capture volume is, in the calibration's own
+    # world units, so it can size its translation steps relative to the rig instead of using a
+    # fixed step that is meaningful only for one particular choice of units.
+    scene_scale = float(camera_group_uniform_size_cpu.scene_scale)
+    print(f"   Camera rig scale (mean baseline): {scene_scale:.4f} world units")
     optimizer = OptimizeMV(
+        scene_scale=scene_scale,
         num_iters=num_iters,
         angle_constraint_weight=angle_constraint_weight,
         smooth_weight=smooth_weight,
@@ -1023,7 +1083,19 @@ def reconstruct(
         device=torch.device(device),
         fish_model_obj=fish,
     )
-    renderer = Silhouette_Renderer(device, camera_group_uniform_size_device)
+    # CLAUDE FIX: the fitting renderer runs at the configured render_scale; the renderer used only
+    # for the saved inspection images stays at full resolution so the output is unaffected.
+    renderer_for_reconstrcution = Silhouette_Renderer(
+        device, camera_group_uniform_size_device, render_scale=render_scale
+    )
+    renderer_for_saving_images = Silhouette_Renderer(device, camera_group_uniform_size_device, sigma=0, gamma=0)
+
+    # CLAUDE FIX: verify once, before any frame is processed, that the renderer's camera model and
+    # the projection matrices driving the keypoint loss put the same 3D point in the same place.
+    # If they disagree, the silhouette term and the keypoint term pull the mesh towards different
+    # image positions and the fit quietly settles on a compromise between two inconsistent camera
+    # models -- a failure mode that produces no error and no obviously broken output.
+    renderer_for_reconstrcution.check_camera_consistency(tolerance_px=1.0)
 
     # --------------------------
     # load cache, if available
@@ -1042,6 +1114,7 @@ def reconstruct(
         "mask_fitting_loss",
         "bone_angle_constraint_loss",
         "bone_length_constraint_loss",
+        "final_deviation_from_prev_frame"
     ]
 
     def _normalize_path(path: Optional[str]) -> Optional[str]:
@@ -1098,9 +1171,9 @@ def reconstruct(
 
     def _fresh_metrics() -> dict:
         return {
-            "mask_detection_IoU": {view_name: [] for view_name in dataset.views},
-            "orig_IoU": {view_name: [] for view_name in dataset.views},
-            "mask_IoU": {view_name: [] for view_name in dataset.views},
+            "IoU_mask_detection_and_gt": {view_name: [] for view_name in dataset.views},
+            "IoU_reconstruction_and_gt": {view_name: [] for view_name in dataset.views},
+            "IoU_reconstruction_and_mask_detection": {view_name: [] for view_name in dataset.views},
             "keypoint_L2_distance": {
                 view_name: {kpt: [] for kpt in dataset.index_json["keypoint_list"]}
                 for view_name in dataset.views
@@ -1109,21 +1182,21 @@ def reconstruct(
         }
 
     def _ensure_metrics_schema(metrics_dict: dict) -> dict:
-        metrics_dict.setdefault("mask_detection_IoU", {})
-        metrics_dict.setdefault("orig_IoU", {})
-        metrics_dict.setdefault("mask_IoU", {})
+        metrics_dict.setdefault("IoU_mask_detection_and_gt", {})
+        metrics_dict.setdefault("IoU_reconstruction_and_gt", {})
+        metrics_dict.setdefault("IoU_reconstruction_and_mask_detection", {})
         metrics_dict.setdefault("keypoint_L2_distance", {})
         for view_name in dataset.views:
-            metrics_dict["mask_detection_IoU"].setdefault(view_name, [])
-            metrics_dict["orig_IoU"].setdefault(view_name, [])
-            metrics_dict["mask_IoU"].setdefault(view_name, [])
+            metrics_dict["IoU_mask_detection_and_gt"].setdefault(view_name, [])
+            metrics_dict["IoU_reconstruction_and_gt"].setdefault(view_name, [])
+            metrics_dict["IoU_reconstruction_and_mask_detection"].setdefault(view_name, [])
             metrics_dict["keypoint_L2_distance"].setdefault(view_name, {})
             for kpt_name in dataset.index_json["keypoint_list"]:
                 metrics_dict["keypoint_L2_distance"][view_name].setdefault(kpt_name, [])
 
         metrics_dict.setdefault("optimizer_losses", {})
         target_len = max(
-            [len(metrics_dict["orig_IoU"].get(view_name, [])) for view_name in dataset.views] or [0]
+            [len(metrics_dict["IoU_reconstruction_and_gt"].get(view_name, [])) for view_name in dataset.views] or [0]
         )
         for loss_name in optimizer_loss_names:
             if isinstance(metrics_dict["optimizer_losses"].get(loss_name), list):
@@ -1138,7 +1211,7 @@ def reconstruct(
     metrics = cached_metrics if cached_metrics is not None else _fresh_metrics()
 
     if cached_metrics is not None:
-        cached_views = set(cached_metrics.get("orig_IoU", {}).keys())
+        cached_views = set(cached_metrics.get("IoU_reconstruction_and_gt", {}).keys())
         if cached_views != set(dataset.views):
             print("Cached reconstruction metrics do not match current dataset views; restarting reconstruction run.")
             parameters = []
@@ -1168,8 +1241,11 @@ def reconstruct(
         # load from dataset
         try:
             instance_sample = dataset.__getitem__(idx, instance_number)
-        except IndexError:
-            print(f"Sample {idx} missing, skipping")
+        except (IndexError, KeyError) as exc:
+            # CLAUDE FIX: a frame that is absent from one view's index surfaces as a lookup failure
+            # rather than an out-of-range error, so both are treated as "this frame is unavailable"
+            # and skipped, with the reason reported instead of aborting the whole run.
+            print(f"Sample {idx} unavailable ({type(exc).__name__}: {exc}), skipping")
             pbar.update()
             continue
 
@@ -1217,11 +1293,12 @@ def reconstruct(
             camera_group_uniform_size_device,
             keypoints,
             masks,
-            renderer,
+            renderer_for_reconstrcution,
             device,
             *([] if init is None else init),
             index=idx,
             bboxs=bboxes,
+            seg_mask_present_mask=seg_mask_present_mask
         )
         (
             vertices_world_est,
@@ -1268,7 +1345,7 @@ def reconstruct(
         frame_metrics = _save_reconstruction_images(
             orig_image_paths=orig_img_paths,
             outdir=outdir,
-            renderer=renderer,
+            renderer=renderer_for_saving_images,
             instance_number=instance_number,
             cameras=camera_group_uniform_size_device,
             reconstructed_keypoints_local=reconstructed_keypoints_local,
@@ -1278,6 +1355,7 @@ def reconstruct(
             keypoint_names=dataset.index_json["keypoint_list"],
             view_names=dataset.views,
             mask_predictions=masks,
+            mask_present_mask=seg_mask_present_mask,
             keypoint_predictions=keypoints,
             optimizer_losses=final_losses,
             optimizer_loss_weights=optimizer_loss_weight_map,
@@ -1290,9 +1368,9 @@ def reconstruct(
 
         # cache quality metrics for this frame
         for view in dataset.views:
-            metrics["mask_detection_IoU"][view].append(frame_metrics["mask_detection_IoU"][view])
-            metrics["orig_IoU"][view].append(frame_metrics["orig_IoU"][view])
-            metrics["mask_IoU"][view].append(frame_metrics["mask_IoU"][view])
+            metrics["IoU_mask_detection_and_gt"][view].append(frame_metrics["IoU_mask_detection_and_gt"][view])
+            metrics["IoU_reconstruction_and_gt"][view].append(frame_metrics["IoU_reconstruction_and_gt"][view])
+            metrics["IoU_reconstruction_and_mask_detection"][view].append(frame_metrics["IoU_reconstruction_and_mask_detection"][view])
             for kpt in dataset.index_json["keypoint_list"]:
                 metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
         for loss_name in optimizer_loss_names:

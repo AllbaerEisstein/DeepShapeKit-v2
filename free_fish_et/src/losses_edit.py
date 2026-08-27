@@ -27,6 +27,46 @@ def gmof(x, sigma):
     return (sigma_squared * x_squared) / (sigma_squared + x_squared)
 
 
+def bbox_reference_scales(
+    bboxes: Optional[torch.Tensor],
+    min_diagonal_px: float = 1.0,
+) -> Optional[torch.Tensor]:
+    """
+    CLAUDE FIX: helper for view-size-normalized keypoint errors.
+
+    Args:
+        bboxes: (vn, 4) detection boxes as (x0, y0, x1, y1) in the same (padded, uniform) image
+            coordinates as the keypoints. Views without a detection are expected to carry a
+            degenerate box such as [0, 0, 0, 0].
+    Returns:
+        (vn,) per-view factors that rescale that view's pixel errors to a common reference size,
+        or None if no usable box was supplied. Views with a degenerate box get a factor of 1.0 so
+        that they simply keep their raw pixel error.
+
+    The reference size is the mean diagonal over the views that do have a valid box, so the overall
+    magnitude of the loss (and therefore the meaning of `sigma`) stays in the same pixel range as
+    before; only the *relative* contribution of near and far views changes.
+    """
+    if bboxes is None:
+        return None
+    boxes = torch.as_tensor(bboxes)
+    if boxes.ndim != 2 or boxes.shape[-1] != 4:
+        return None
+
+    widths = (boxes[:, 2] - boxes[:, 0]).abs().float()
+    heights = (boxes[:, 3] - boxes[:, 1]).abs().float()
+    diagonals = torch.sqrt(widths**2 + heights**2)
+
+    valid = diagonals > min_diagonal_px
+    if not bool(valid.any()):
+        return None
+
+    reference = diagonals[valid].mean()
+    scales = torch.ones_like(diagonals)
+    scales[valid] = reference / diagonals[valid].clamp_min(min_diagonal_px)
+    return scales
+
+
 def kpt_reprojection_loss(
     model_keypoints: torch.Tensor,
     proj_m: torch.Tensor,
@@ -35,20 +75,37 @@ def kpt_reprojection_loss(
     keypoints_weight: torch.Tensor | float = 1.0,
     view_weights: Optional[torch.Tensor] = None,
     sigma: float = 50,
-    #bboxes: Optional[torch.Tensor] = None
+    bbox_scales: Optional[torch.Tensor] = None,
 ):
-    # Project model keypoints
-    projected_keypoints = perspective_projection(model_keypoints, proj_m)
+    """
+    Args:
+        bbox_scales: optional (vn,) per-view factors from `bbox_reference_scales`. When given, each
+            view's pixel error is rescaled to a common apparent target size, so that a view in
+            which the fish appears small contributes as much as a close-up view instead of being
+            drowned out by it.
+    """
+    # CLAUDE FIX: `perspective_projection` now also reports which points lie in front of the camera.
+    # Points at or behind the image plane project to a mirrored, meaningless location, and fitting
+    # to them actively pulls the model in the wrong direction, so they are excluded from the loss.
+    projected_keypoints, in_front_of_camera = perspective_projection(
+        model_keypoints, proj_m, return_validity=True
+    )
     reprojection_diff = projected_keypoints - keypoints_2d
-    # TODO: keypoint errors should be calculated relative to the bounding box size so that far-away views contribute 
-    # equally as close-up views (those will have higher absolute keypoint error)
-    # However, it can be argued that detection quality of far-away views is lower and that they should indeed contribute less.
+
+    # CLAUDE FIX: keypoint errors are measured relative to the detected bounding box size, so that
+    # views observing the animal from far away contribute comparably to close-up views instead of
+    # being weighted down purely by their smaller apparent size. Detection quality per view remains
+    # expressible through `view_weights` and the per-keypoint confidences.
+    if bbox_scales is not None:
+        scales = bbox_scales.to(device=reprojection_diff.device, dtype=reprojection_diff.dtype)
+        reprojection_diff = reprojection_diff * scales.view(-1, 1, 1)
 
     # Weighted robust reprojection loss
     # this returns Geman-McClure rubustified x², y² for each kpt:
     reprojection_error = gmof(reprojection_diff, sigma) 
     # here, sum x² and y² and scale by conf -> squared L2-error per kpt:
-    reprojection_loss = (keypoints_conf**2) * reprojection_error.sum(dim=-1) 
+    effective_conf = (keypoints_conf**2) * in_front_of_camera.to(keypoints_conf.dtype)
+    reprojection_loss = effective_conf * reprojection_error.sum(dim=-1)
 
     # finally, sum error of each kpt -> we get a sum of squared, Geman-McClure robustified L2-errors per view
     total_loss = reprojection_loss.sum(dim=-1)
@@ -71,6 +128,13 @@ def decompose_to_swing_twist(quats):
     Returns:
         swing_twist: (BS, bn, 3) = (swing_x, twist_y, swing_z)
     """
+    # CLAUDE FIX: q and -q describe the same rotation, but `2 * atan2(y, w)` below reads them as
+    # twist angles that differ by 2*pi. Nothing upstream guarantees a consistent sign, so the same
+    # physical pose could score as compliant on one iteration and as a large violation on the next.
+    # Canonicalizing to w >= 0 makes the decomposition a single-valued function of the rotation and
+    # keeps the constraint loss continuous across optimization steps.
+    quats = torch.where(quats[:, :, :1] < 0, -quats, quats)
+
     # Extract quaternion components
     w = quats[:, :, 0]  # (BS, bn)
     x = quats[:, :, 1]  # (BS, bn)
@@ -79,23 +143,42 @@ def decompose_to_swing_twist(quats):
 
     # print("swing-twist")
     # print("   quats:", quats)
-    # Singular when both w and y are ~0
-    singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
-
-    # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
-    twists = torch.where(
-        singular_quats_mask,
-        torch.zeros_like(w),
-        2 * torch.atan2(y, w)
-    )  # (BS, bn)
-    # print("   twists:", twists)
-
     # sqrt(r^2) has undefined gradient at r=0; add epsilon to keep gradients finite
     # for identity/near-identity quaternions where x=z=0 (and similarly y=w=0 edge cases).
     eps = 1e-12
     xz_norm = torch.sqrt(x**2 + z**2 + eps)
     yw_norm = torch.sqrt(y**2 + w**2 + eps)
-    beta = torch.atan2(xz_norm, yw_norm)  # (BS, bn)
+    beta = torch.atan2(xz_norm, yw_norm)  # (BS, bn) half of the swing angle
+
+    # CLAUDE FIX: `yw_norm` equals |cos(swing_angle / 2)|, so it measures how well swing and twist
+    # can be told apart. It goes to zero as the swing approaches 180 degrees, and there a rotation
+    # can be written *either* as a swing about one axis *or* as a swing about the perpendicular axis
+    # combined with a half turn of twist -- the two are the same rotation. Reading the twist from
+    # `atan2(y, w)` in that region returns an arbitrary value (typically near +/-pi), which then
+    # rotates the swing off the axis it actually belongs to. For a bone whose swing limits differ
+    # per axis, that turns a legal turn about the permitted axis into a large apparent violation of
+    # the restricted one, and the resulting penalty wall stops the bone from turning any further.
+    #
+    # Of the equivalent representations, the one with the least twist is the meaningful choice, so
+    # the twist is faded out smoothly as the decomposition degenerates. The gate is 1 (no change at
+    # all) for swings up to `SWING_GATE_START` and reaches 0 at a 180 degree swing, so ordinary
+    # articulation is unaffected and only the ambiguous region is stabilized.
+    SWING_GATE_START = 150.0 * torch.pi / 180.0
+    gate_ref = torch.cos(torch.tensor(SWING_GATE_START / 2.0, device=w.device, dtype=w.dtype))
+    t = (yw_norm / gate_ref).clamp(0.0, 1.0)
+    degeneracy_gate = t * t * (3.0 - 2.0 * t)  # smoothstep: C1-continuous, no kink at the ends
+
+    # CLAUDE FIX: mask the *inputs* to atan2 rather than its output. `torch.where` evaluates both
+    # branches and backpropagates through both, and the derivative of atan2(y, w) at y = w = 0 is
+    # 0/0, so selecting a safe branch after the fact still lets a NaN gradient through from the
+    # branch that was not selected -- precisely in the case the mask exists to handle.
+    singular_quats_mask = (w.abs() < 1e-6) & (y.abs() < 1e-6)  # (BS, bn)
+    w_safe = torch.where(singular_quats_mask, torch.ones_like(w), w)
+    y_safe = torch.where(singular_quats_mask, torch.zeros_like(y), y)
+
+    # atan2(y, w) gives the twist angle around the y-axis (twist axis) for non-singular quaternions
+    twists = degeneracy_gate * (2 * torch.atan2(y_safe, w_safe))  # (BS, bn)
+    # print("   twists:", twists)
 
     gamma = twists / 2  # (BS, bn)
 
@@ -141,7 +224,13 @@ def bone_angle_constraint_loss(
     # Add a loss according to the amount of violation of the angle limits
     # 0 twist loss if within limits, otherwise proportional to the squared distance to the limit
     eps = 1e-8
-    twist_loss = ((swing_twist[:, :, 1] - bone_angle_priors_batch[:, :, 1]).clamp_min(eps))**2 # (BS, bn)
+    # CLAUDE FIX: the twist limit is a symmetric bound of +/- prior around the rest pose, matching
+    # how the swing limits are already treated (they use `.abs()` on the priors below). Comparing
+    # magnitudes penalizes twisting in either direction; previously only twist beyond the positive
+    # limit cost anything, so a bone whose prior is 0 (i.e. "twist is locked") could rotate freely
+    # in the negative direction at no cost.
+    twist_limit = bone_angle_priors_batch[:, :, 1].abs()
+    twist_loss = ((swing_twist[:, :, 1].abs() - twist_limit).clamp_min(0.0))**2 # (BS, bn)
     
     # this function checks if swing_x,swing_z are within an ellipse with the priors as radii.
     # If a prior is exactly zero, that axis is treated as locked and penalized directly without division.
@@ -201,29 +290,69 @@ def bone_length_constraint_loss(
 
 
 def init_deviation_loss(
-    body_pose: torch.Tensor,
-    bone_length: torch.Tensor,
-    smooth_weight: float,
-    pose_init: torch.Tensor,
-    bone_init: torch.Tensor,
+    body_pose: Optional[torch.Tensor] = None,
+    bone_length: Optional[torch.Tensor] = None,
+    smooth_weight: Optional[float] = None,
+    pose_init: Optional[torch.Tensor] = None,
+    bone_init: Optional[torch.Tensor] = None,
+    translation_init: Optional[torch.Tensor] = None,
+    orientation_init: Optional[torch.Tensor] = None,
+    scale_init: Optional[torch.Tensor] = None,
+    translation: Optional[torch.Tensor] = None,
+    orientation: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    scale_weight: Optional[float] = None,
 ):
     """
-    L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
+    Smooth L1 difference to initialization paramaters (either from prior frame or from prior optimization stage)
     """
     init_prior_loss = (
-        (body_pose - pose_init).abs().sum()
-        + (bone_length - bone_init).abs().sum()
+        (F.smooth_l1_loss(body_pose, pose_init, reduction="sum")
+            if body_pose is not None else 0.0)
+        + (F.smooth_l1_loss(bone_length, bone_init, reduction="sum")
+            if bone_length is not None else 0.0)
+        + (F.smooth_l1_loss(translation, translation_init, reduction="sum")
+            if translation is not None else 0.0)
+        + (F.smooth_l1_loss(orientation, orientation_init, reduction="sum")
+            if orientation is not None else 0.0)
+        + (F.smooth_l1_loss(scale, scale_init, reduction="sum") * scale_weight
+            if scale is not None else 0.0)
     )
     init_prior_loss = smooth_weight * init_prior_loss
     return init_prior_loss.sum()
 
 
 def mask_fitting_loss(proj_masks, masks, mask_weight, view_weights):
-    # L1 mask loss
-    total_loss = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
-    total_loss = mask_weight * view_weights * total_loss
+    """
+    Area-normalized smooth-L1 difference between the detected segmentation mask and the rendered
+    silhouette of the template's projection, summed over weighted views.
+
+    CLAUDE FIX: the per-pixel residuals are normalized by the detected mask's foreground area
+    rather than summed raw. Two consequences:
+      * the value is a fraction of the target's own size, so it is comparable in magnitude to the
+        soft-IoU term and independent of image resolution and of how large the animal appears in a
+        given view. This is what makes it safe to add at a fixed low weight.
+      * unlike an overlap-based term, this one keeps a non-zero gradient when the rendered
+        silhouette and the detected mask do not overlap at all, which is exactly the situation from
+        which an overlap-based term cannot recover on its own.
+    """
+    per_view_residual = F.smooth_l1_loss(proj_masks, masks, reduction="none").sum(dim=[1, 2])
+    target_area = masks.sum(dim=[1, 2]).clamp_min(1.0)
+    total_loss = mask_weight * view_weights * (per_view_residual / target_area)
 
     return total_loss.sum()
+
+
+def soft_iou_loss(proj_masks, masks, mask_weight, view_weights):
+    """
+    1 - soft IoU between the rendered silhouette and the detected segmentation mask, summed over
+    weighted views. Scale-invariant per view, but its gradient vanishes where the two do not
+    overlap; `mask_fitting_loss` is added alongside it to cover that case.
+    """
+    intersection = (proj_masks * masks).sum(dim=[1, 2])
+    union = (proj_masks + masks - proj_masks * masks).sum(dim=[1, 2])
+    iou_loss = 1.0 - intersection / union.clamp_min(1e-6)
+    return (mask_weight * view_weights * iou_loss).sum()
 
 
 def mask_jaccard_index(proj_masks, masks, mask_weight):

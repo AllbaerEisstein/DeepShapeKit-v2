@@ -71,6 +71,11 @@ class PipelineConfig:
     mask_weight: float = 200.0
     keypoints_weight: float = 1.0
     view_weights: str = "1"
+    # CLAUDE FIX: linear resolution factor for the differentiable silhouette renderer used during
+    # fitting, relative to the calibrated camera resolution. 1.0 renders at full resolution; 0.5
+    # rasterizes a quarter of the pixels. Lower values trade silhouette detail for a large drop in
+    # per-iteration render cost and GPU memory. Inspection images are always saved at full size.
+    render_scale: float = 1.0
 
     def dataset_folder(self) -> Path:
         return Path(self.out_path) / self.dataset_folder_name
@@ -332,13 +337,19 @@ def run_pipeline(
             mask_weight=config.mask_weight,
             keypoints_weight=config.keypoints_weight,
             view_weights=parsed_view_weights,
+            render_scale=config.render_scale,
         )
 
+
+import math
 
 def _mean_median(values: List[float], metric_name: str) -> Dict[str, float]:
     if not values:
         raise ValueError(f"No values provided for metric '{metric_name}'.")
-    return {"mean": float(mean(values)), "median": float(median(values))}
+    finite_values = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not finite_values:
+        return {"mean": float("nan"), "median": float("nan")}
+    return {"mean": float(mean(finite_values)), "median": float(median(finite_values))}
 
 
 def _summarize_scalar_metric(metric_name: str, metric_data: Dict[str, List[float]]) -> Dict[str, Any]:
@@ -419,7 +430,7 @@ def _summarize_keypoint_metric(metric_name: str, metric_data: Dict[str, Dict[str
 
 def compute_metrics_summary(metrics_data: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
-    scalar_metrics = ["orig_IoU", "mask_IoU"]
+    scalar_metrics = ["IoU_mask_detection_and_gt", "IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection"]
 
     for metric_name in scalar_metrics:
         metric_values = metrics_data.get(metric_name)
@@ -442,12 +453,12 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
     def fmt(stats: Dict[str, Optional[float]]) -> str:
         mean_val = stats.get("mean")
         median_val = stats.get("median")
-        if mean_val is None or median_val is None:
+        if mean_val is None or median_val is None or math.isnan(mean_val) or math.isnan(median_val):
             return "mean=NA, median=NA"
         return f"mean={mean_val:.4f}, median={median_val:.4f}"
 
     sections: List[str] = []
-    metric_order = ["orig_IoU", "mask_IoU", "keypoint_L2_distance"]
+    metric_order = ["IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection", "keypoint_L2_distance"]
 
     sections.append("Overall metrics")
     for metric_name in metric_order:
@@ -682,6 +693,7 @@ class PipelineGUI:
         self.mask_weight_var = tk.StringVar(value=str(self.config.mask_weight))
         self.keypoints_weight_var = tk.StringVar(value=str(self.config.keypoints_weight))
         self.view_weights_var = tk.StringVar(value=str(self.config.view_weights))
+        self.render_scale_var = tk.StringVar(value=str(self.config.render_scale))
         self.advanced_visible = tk.BooleanVar(value=False)
         self.step_vars: Dict[str, "tk.BooleanVar"] = {
             "extract": tk.BooleanVar(value="extract" in self.steps),
@@ -873,6 +885,11 @@ class PipelineGUI:
 
         ttk.Label(optimization_frame, text="view_weights").grid(row=7, column=0, sticky="w", pady=2, padx=(6, 4))
         ttk.Entry(optimization_frame, textvariable=self.view_weights_var).grid(row=7, column=1, sticky="ew", pady=2, padx=(0, 6))
+
+        # CLAUDE FIX: silhouette renderer resolution, exposed so the render cost of the fitting
+        # loop can be traded against silhouette detail without editing code.
+        ttk.Label(optimization_frame, text="render_scale (0-1)").grid(row=8, column=0, sticky="w", pady=2, padx=(6, 4))
+        ttk.Entry(optimization_frame, textvariable=self.render_scale_var).grid(row=8, column=1, sticky="ew", pady=2, padx=(0, 6))
         ttk.Label(
             optimization_frame,
             text="Comma-separated by view index (single value broadcasts).",
@@ -1026,6 +1043,15 @@ class PipelineGUI:
             config.keypoints_weight = float(self.keypoints_weight_var.get().strip())
         except ValueError as exc:
             raise ConfigError("Optimization weights must be numeric.") from exc
+        # CLAUDE FIX: render_scale must be a fraction of the calibrated resolution; anything above 1
+        # would rasterize finer than the cameras were calibrated for and buys nothing.
+        try:
+            config.render_scale = float(self.render_scale_var.get().strip())
+        except ValueError as exc:
+            raise ConfigError("render_scale must be numeric.") from exc
+        if not (0.0 < config.render_scale <= 1.0):
+            raise ConfigError("render_scale must be greater than 0 and at most 1.")
+
         view_weights_text = self.view_weights_var.get().strip()
         config.view_weights = view_weights_text if view_weights_text else "1"
         # validate numeric formatting early; view-count validation happens in reconstruct()
@@ -1095,6 +1121,7 @@ class PipelineGUI:
         self.mask_weight_var.set(str(config.mask_weight))
         self.keypoints_weight_var.set(str(config.keypoints_weight))
         self.view_weights_var.set(str(config.view_weights))
+        self.render_scale_var.set(str(config.render_scale))
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
@@ -1445,6 +1472,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="num_iters",
         help="Number of optimizer iterations per stage.",
     )
+    # CLAUDE FIX: expose the silhouette renderer resolution on the CLI as well as in the GUI.
+    parser.add_argument(
+        "--render-scale",
+        type=float,
+        dest="render_scale",
+        help=(
+            "Resolution factor (0-1] for the differentiable silhouette renderer used during "
+            "fitting, relative to the calibrated camera resolution. Lower values cut render time "
+            "and GPU memory roughly with the square of the factor."
+        ),
+    )
     parser.add_argument(
         "--angle-constraint-weight",
         type=float,
@@ -1532,6 +1570,10 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.conf_threshold = args.conf_threshold
     if getattr(args, "num_iters", None) is not None:
         config.num_iters = args.num_iters
+    if getattr(args, "render_scale", None) is not None:
+        if not (0.0 < args.render_scale <= 1.0):
+            raise ConfigError("render_scale must be greater than 0 and at most 1.")
+        config.render_scale = args.render_scale
     if getattr(args, "angle_constraint_weight", None) is not None:
         config.angle_constraint_weight = args.angle_constraint_weight
     if getattr(args, "smooth_weight", None) is not None:

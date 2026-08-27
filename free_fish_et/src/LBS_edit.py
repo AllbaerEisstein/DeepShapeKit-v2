@@ -38,14 +38,70 @@ class LBS():
         # the head joint is just the origin of the mesh. it is excluded
         self.n_body_joints = J.shape[1] - 1
 
-        self.joints_homog = F.pad((J[:, parent_indices[1:]]).unsqueeze(-1), [0, 0, 0, 1], value=0)
+        # CLAUDE FIX: `joints_homog` holds the rest position of *the joint each transform belongs to*.
+        # Entry k of the transform chain describes joint k+1 (the head joint is excluded), so the
+        # rest-pose reference for entry k must be J[k+1] -- i.e. `J[:, 1:]`. This is what makes the
+        # skinning transform reduce to the identity at zero pose, so that calling the model with a
+        # zero pose, unit bone lengths and unit scale returns the template mesh unchanged.
+        # (See `assert_rest_pose_is_identity()` below, which asserts exactly that.)
+        self.joints_homog = F.pad((J[:, 1:]).unsqueeze(-1), [0, 0, 0, 1], value=0)
         # body_joint_locs_rel_to_parents: positions of the body joints (first joint excluded!) relative to their parents
         # ---> len(locs_rel_to_parents) = n_joints-1 = n_bones
         self.body_joint_locs_rel_to_parents = (J[:, 1:] - J[:, parent_indices[1:]]).unsqueeze(-1)
 
         self.parent_indices = parent_indices
+
+        # CLAUDE FIX: the kinematic tree is walked in index order, so every joint must appear after
+        # its parent. Validate this once here instead of silently producing a garbled skeleton.
+        for joint_idx in range(1, J.shape[1]):
+            parent = int(parent_indices[joint_idx])
+            if parent >= joint_idx or parent < 0:
+                raise ValueError(
+                    f"kintree_table is not topologically ordered: joint {joint_idx} has parent "
+                    f"{parent}. Every joint must be listed after its parent, and only joint 0 "
+                    f"(the head) may have parent -1."
+                )
+
         self.weights = weights[None].float()
+
+        # CLAUDE FIX: the homogeneous divide at the end of the skinning pass normalizes each vertex
+        # by the sum of its skinning weights, so unnormalized weights are fine -- but a vertex with
+        # a total weight of zero would divide by zero and poison the whole optimization with NaNs.
+        # Reject such templates at load time with an actionable message.
+        weight_sums = self.weights[0].sum(dim=1)
+        if not torch.isfinite(weight_sums).all() or (weight_sums.abs() < 1e-8).any():
+            bad = int((weight_sums.abs() < 1e-8).sum())
+            raise ValueError(
+                f"{bad} vertex/vertices in the template have a total skinning weight of ~0. "
+                f"Every vertex must be influenced by at least one bone; re-export the template "
+                f"with complete skinning weights."
+            )
+
         self.virtual_bone_mask = virtual_bone_mask
+
+    def assert_rest_pose_is_identity(self, V: torch.Tensor, tol: float = 1e-4) -> float:
+        """
+        CLAUDE FIX: regression guard for the skinning transform.
+
+        Skinning with a zero pose, unit bone lengths and unit scale must return the template mesh
+        unchanged. If this does not hold, every keypoint and mask residual is being fitted against a
+        distorted forward model, which is silent and hard to spot in rendered output.
+
+        Returns the maximum per-vertex deviation and raises if it exceeds `tol`.
+        """
+        n_bones = self.weights.shape[-1]
+        with torch.no_grad():
+            zero_pose = torch.zeros(V.shape[0], n_bones * 3, device=V.device, dtype=V.dtype)
+            unit_lengths = torch.ones(V.shape[0], n_bones, device=V.device, dtype=V.dtype)
+            unit_scale = torch.ones(1, device=V.device, dtype=V.dtype)
+            verts, _ = self(V, zero_pose, unit_lengths, unit_scale)
+            max_dev = float((verts - V).abs().max())
+        if max_dev > tol:
+            raise ValueError(
+                f"LBS does not reproduce the rest pose: max vertex deviation {max_dev:.6f} > {tol}. "
+                f"The skinning transform and the template are inconsistent."
+            )
+        return max_dev
 
     def __call__(self, V, global_ori_plus_body_pose, all_bone_length, scale, to_rotmats=True):
         """
@@ -104,9 +160,24 @@ class LBS():
         # ---> so T_rel_chained will have transformations relative to the head joint for each joint
         #      (because every transformation will build on the transformation of the first body joint and 
         #      that transf is relative to the head joint)
+        # CLAUDE FIX: two index spaces meet here and must be converted between explicitly.
+        # `parent_indices` is indexed by *joint* index (0 = head), while this list is indexed by
+        # *body-joint* index, where entry k describes joint k+1. So the parent of the joint at list
+        # position i is joint `parent_indices[i + 1]`, which lives at list position
+        # `parent_indices[i + 1] - 1`. A parent of joint 0 (the head) has no list entry and means the
+        # joint hangs directly off the root, so its chained transform is its own relative transform.
+        # For a straight chain both index spaces happen to agree; for any branching rig (fins,
+        # limbs) they do not, so subtrees would otherwise be attached to the wrong parent.
         for i in range(1, self.n_body_joints):
-            parent_idx = int(self.parent_indices[i].item()) if torch.is_tensor(self.parent_indices[i]) else int(self.parent_indices[i])
-            T_for_joints_rel_to_head.append(T_for_joints_rel_to_head[parent_idx] @ T_for_joints_rel_to_parent[:, i]) # self.parent_indices[i] retrieves current joint's parent, means we get the transformation matrix of this joint's parent
+            parent_joint_idx = int(self.parent_indices[i + 1])
+            parent_list_idx = parent_joint_idx - 1
+            if parent_list_idx < 0:
+                # joint (i+1) is a direct child of the head joint
+                T_for_joints_rel_to_head.append(T_for_joints_rel_to_parent[:, i])
+            else:
+                T_for_joints_rel_to_head.append(
+                    T_for_joints_rel_to_head[parent_list_idx] @ T_for_joints_rel_to_parent[:, i]
+                )
         T_for_joints_rel_to_head = torch.stack(T_for_joints_rel_to_head, dim=1)
         T_for_joints_rel_to_head[:, :, :, [-1]] -= T_for_joints_rel_to_head.clone() @ (self.joints_homog * scale)
         #   compound_rotmat(0,0) compound_rotmat(0,1) compound_rotmat(0,2) transformed_joint[0]
@@ -116,8 +187,15 @@ class LBS():
         # ---> the translation of each joint is now offset by the position of this joint.
         #      future vertex translation depends on associated joint position.
 
-        # extract the body pose (relative to fish head) for each joint for bone angle prior checking
-        global_ori_plus_body_pose_template_space = T_for_joints_rel_to_head[:, :, :3, :3] # (BS, n_bones, 3, 3)
+        # CLAUDE FIX: the bone-angle (swing-twist) priors are per-joint articulation limits, so they
+        # must be evaluated on each bone's *own* rotation relative to its parent -- not on the
+        # accumulated rotation of the whole chain up to that bone, which is what
+        # `T_for_joints_rel_to_head[..., :3, :3]` contains. Returning the local rotations means a
+        # long spine of individually legal bends is no longer reported as a large violation, and
+        # equal-and-opposite bends no longer cancel out and escape the limits.
+        # Index 0 of this tensor is the global orientation (the root bone's own rotation), which is
+        # applied separately below; indices 1.. are the body bones, in bone order.
+        local_bone_rotations = global_ori_plus_body_pose  # (BS, n_bones, 3, 3)
 
         T_for_vertices = self.weights @ T_for_joints_rel_to_head.view(batch_size, self.n_body_joints, -1)
         T_for_vertices = T_for_vertices.view(batch_size, -1, 4, 4)
@@ -130,5 +208,14 @@ class LBS():
         R[:, :, -1, -1] = 1
         V_homog = R @ V_homog
 
-        # return vertices in local space (relative to head joint) and the rotations of joints in template space (for bone angle prior checking)
-        return V_homog[:, :, :3, 0] / V_homog[:, :, [3], 0], global_ori_plus_body_pose_template_space
+        # CLAUDE FIX: the homogeneous coordinate here is the sum of each vertex's skinning weights,
+        # so this divide is what normalizes unnormalized weights. Clamp its magnitude so a
+        # near-degenerate vertex degrades gracefully instead of producing NaNs that propagate into
+        # every loss term. (Exactly-zero weight sums are rejected in __init__.)
+        w_homog = V_homog[:, :, [3], 0]
+        w_sign = torch.where(w_homog < 0, -torch.ones_like(w_homog), torch.ones_like(w_homog))
+        w_homog = w_sign * w_homog.abs().clamp_min(1e-8)
+
+        # return vertices in local space (relative to head joint) and each bone's own (local)
+        # rotation in template space (for bone angle prior checking)
+        return V_homog[:, :, :3, 0] / w_homog, local_bone_rotations

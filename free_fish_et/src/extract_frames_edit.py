@@ -20,7 +20,7 @@ from src.parse_cams_json import (
     #_parse_focal,
     _parse_K,
 )
-from src.types import *
+from src.dsk_types import *
 
 
 def dynamic_print(msg):
@@ -78,7 +78,9 @@ def extract_from_video(
     json_index = {
         'frame_folders': [],
         'index_files': {},
-        'image_sizes': {}
+        'image_sizes': {},
+        # CLAUDE FIX: number of extracted frames per view, keyed by view name.
+        'image_counts': {}
     }
 
     with open(cam_matrices_json_path) as jf:
@@ -200,6 +202,21 @@ def extract_from_video(
                 cam_matrices[video_name] = updated_entry
                 needs_undistortion = True
 
+                # CLAUDE FIX: the pixel remapping produced by the intrinsics and distortion
+                # coefficients is identical for every frame of a view, so it is computed once here
+                # and reused. cv2.undistort() rebuilds it internally on every call, which for a
+                # multi-thousand-frame video is by far the dominant cost of this step. The
+                # resampling itself is unchanged (the same bilinear interpolation cv2.undistort
+                # uses), so the output frames are identical.
+                undistort_map_x, undistort_map_y = cv2.initUndistortRectifyMap(
+                    np.array(K, dtype=float),
+                    np.array(distortions, dtype=float),
+                    None,
+                    np.array(newK, dtype=float),
+                    (int(vwidth), int(vheight)),
+                    cv2.CV_32FC1,
+                )
+
 
         video_folder    = destination / video_name
         origin_folder   = video_folder / 'origin'
@@ -215,6 +232,7 @@ def extract_from_video(
             image_count = 0
             frame_number = 0
             success = True
+            extracted_frame_numbers: list[int] = []
 
             try:
                 if not capture.isOpened():
@@ -230,7 +248,13 @@ def extract_from_video(
                             frame_number += 1
                             continue
                     if undistort and needs_undistortion:
-                        frame = cv2.undistort(frame, np.array(K), undistort_coeffs, None, np.array(newK))
+                        # CLAUDE FIX: apply the maps precomputed once for this view (see above).
+                        frame = cv2.remap(
+                            frame,
+                            undistort_map_x,
+                            undistort_map_y,
+                            interpolation=cv2.INTER_LINEAR,
+                        )
                     
                     filename = f"{video_name}_{frame_number}.png"
                     abs_file_path = origin_folder / filename
@@ -245,6 +269,9 @@ def extract_from_video(
                         video_name
                     ])
                     image_count += 1
+                    # CLAUDE FIX: remember exactly which frame numbers made it to disk for this
+                    # view, so the frame map written below can list only those.
+                    extracted_frame_numbers.append(frame_number)
 
                     frame_number += 1
                     dynamic_print(f'frame out: {frame_number}, total image: {image_count}')
@@ -254,24 +281,42 @@ def extract_from_video(
                 json_index['frame_folders'].append(video_name)
                 json_index['index_files'][video_name] = str(files_csv_path)
                 json_index['image_sizes'][video_name] = [int(vwidth), int(vheight)]
+                # CLAUDE FIX: the number of extracted frames is recorded per view rather than as a
+                # single value that ends up holding whichever view happened to be processed last.
+                # The dataset loader compares these across views to catch de-synchronized inputs.
+                json_index['image_counts'][video_name] = image_count
             finally:
                 capture.release()
     
         if also_create_frame2video_csv:
             # create a mapping 1:1 from original frame numbers to new frame numbers 
-            # NOTE: this is a stub in case frame selection is implemented later
+            # NOTE: this is a stub in case per-view synchronization offsets are implemented later
             frame2video_csv_path = video_folder / 'frame2video_1.csv'
             with frame2video_csv_path.open('w', newline='') as csv_out_file:
                 csvwriter = csv.writer(csv_out_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
                 csvwriter.writerow(['origin_frame', 'new_frame'])
 
-                for i in range(frame_indices[-1] + 1 if frame_indices is not None else image_count):
+                # CLAUDE FIX: only the frames that were actually written out are listed. Emitting a
+                # dense range up to the highest requested index made the map claim frames that were
+                # never extracted, so a later lookup would resolve successfully and then fail when
+                # the image file was needed.
+                for i in extracted_frame_numbers:
                     csvwriter.writerow([i, i])
 
     json_index['camera_matrices'] = cam_matrices
 
     json_index['status'] = 'origin'
-    json_index['image_count'] = image_count
+    # CLAUDE FIX: per-view frame counts are the authoritative record. `image_count` is kept as the
+    # common count (or None when the views disagree) purely so older configs keep loading.
+    distinct_counts = set(json_index['image_counts'].values())
+    json_index['image_count'] = next(iter(distinct_counts)) if len(distinct_counts) == 1 else None
+    if len(distinct_counts) > 1:
+        print(
+            "\nWarning: the views did not yield the same number of extracted frames: "
+            + ", ".join(f"{view}={count}" for view, count in json_index['image_counts'].items())
+            + "\nThe views are assumed to be frame-synchronized, so reconstruction will refuse to "
+              "run until the inputs are trimmed to a common range.\n"
+        )
 
     with json_out_path.open("w") as f:
         json.dump(json_index, f, indent=2)

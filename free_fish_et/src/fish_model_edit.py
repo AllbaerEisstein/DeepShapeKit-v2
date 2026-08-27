@@ -104,6 +104,11 @@ class fish_model:
 
         self.LBS = LBS(self.J, self.parent_indices, self.weights, self.virtual_bone_mask)
 
+        # CLAUDE FIX: verify at load time that skinning the template with a zero pose returns the
+        # template itself. This catches an inconsistent template or a regression in the skinning
+        # transform immediately, instead of letting the optimizer silently fit a distorted mesh.
+        self.LBS.assert_rest_pose_is_identity(self.V)
+
         # global_ori and body_pose angle limits (import priors from fish template json)
         # angle limits are specified for each component in swing-twist representation (swing_x, twist_y, swing_z) (in radian) for each bone
         # where swing_x and swing_z are x- and y- radii of an ellipse that bounds the swing rotation, and twist_y is the maximum allowed twist rotation around the y-axis.
@@ -115,9 +120,27 @@ class fish_model:
             bone_angle_priors.extend([prior["swing_x"], prior["twist_y"], prior["swing_z"]])
         self.bone_angle_priors = torch.tensor(bone_angle_priors).view(1, -1, 3) # (1, n_bones, 3) (swing_x, twist_y, swing_z)
 
-        # Body bone length factor limits
+        # CLAUDE FIX: warn about prior combinations that sit near a degeneracy of the swing-twist
+        # parametrization. A swing limit close to 180 degrees on one axis while the other axis is
+        # tightly limited is a legitimate thing to want (an animal that turns freely but does not
+        # pitch), but a 180 degree swing can be written either as a swing about one axis or as a
+        # swing about the perpendicular axis combined with a half turn of twist. `decompose_to_swing_twist`
+        # damps the twist near that configuration so the swing stays on the axis it belongs to;
+        # this notice just makes the situation visible if the fit ever looks odd at large turns.
+        # for b_idx, bname in enumerate(template["bone_order"]):
+        #     sx, _, sz = [float(v) for v in self.bone_angle_priors[0, b_idx]]
+        #     wide, narrow = max(abs(sx), abs(sz)), min(abs(sx), abs(sz))
+        #     if wide > 0.9 * torch.pi and narrow < 0.5 * wide:
+        #         print(
+        #             f"Note: bone '{bname}' has strongly anisotropic swing limits "
+        #             f"(swing_x={sx:.3f}, swing_z={sz:.3f} rad) with one axis near 180 degrees. "
+        #             f"Swing/twist separation is damped near 180 degree swings for this bone."
+        #         )
+        # TODO: Currently, the head bone prior is NOT checked against in the pose_optimizer because of singularity problems if the head bone prior is non-restrictive.
+
+        # Body bone length limit
         self.bone_length_min = [0.7] * (self.n_body_bones)
-        self.bone_length_max = [1.2] * (self.n_body_bones)
+        self.bone_length_max = [1.5] * (self.n_body_bones)
 
         self.bone_length_min = torch.tensor(self.bone_length_min)
         self.bone_length_max = torch.tensor(self.bone_length_max)
@@ -147,7 +170,7 @@ class fish_model:
         self.device_active = True
 
 
-    def __call__(self, global_ori, body_pose, body_bone_length, scale=torch.tensor(1), pose2rot=True, deform=True):
+    def __call__(self, global_ori, body_pose, body_bone_length, scale=torch.tensor(1), pose2rot=True, deform=True, output_device=None):
         """
         Args:
             global_ori (BS, 3): BS (batch-size) different exponential map representations of global rotation
@@ -156,14 +179,25 @@ class fish_model:
             scale (BS, 1): scale factor
             pose2rot: if True, convert exponential map to rotation matrix inside LBS
             deform (bool): toggle if linear blend skinning should be applied. If not, just return rest-pose vertices and keypoints in local (model) space.
+            output_device: device the returned tensors should live on. Defaults to the model's own
+                device, which avoids a host round-trip in the optimizer's inner loop. Pass
+                torch.device("cpu") (or "cpu") to get CPU tensors back.
         Returns:
-            keypoints (BS, kn, 3): coordinates of the kn keypoints (unsqueezed(0)) after LBS in local (model) space
-            vertices (BS, vn, 3): coordinates of the vn vertices (unsqueezed(0)) after LBS in local (model) space
+            dict with (at least) the following entries. Callers should index by key rather than
+            unpack positionally, so that additional outputs can be added without breaking them:
+            keypoints (BS, kn, 3): coordinates of the kn keypoints after LBS in local (model) space
+            vertices (BS, vn, 3): coordinates of the vn vertices after LBS in local (model) space
+            global_ori_plus_body_pose_rest_bone_spaces (BS, n_bones, 4): each bone's own rotation,
+                expressed as a quaternion (w, x, y, z) in that bone's rest frame. Index 0 is the
+                global orientation; indices 1.. are the body bones in bone order.
         """
         assert body_bone_length.size(1) == self.n_body_bones, f"body_bone_length must have size (batch_size, n_bones_total-1) but has size {body_bone_length.size()} instead of ({global_ori.size(0), self.n_body_bones})"
         assert global_ori.size(1) == 3, f"global_ori must have size (batch_size, 3) but has size {global_ori.size()} instead of ({global_ori.size(0), 3}) and must supply world space orientation in exponential map representation"
         assert body_pose.size(1) == self.n_body_bones*3, f"body_pose must have size (batch_size, (n_bones_total-1)*3) but has size {body_pose.size()} instead of ({global_ori.size(0), self.n_body_bones*3})"
         
+        # CLAUDE FIX: `scale` is moved to the model device alongside the other inputs. It used to be
+        # left untouched, which happened to work only because it is a 0-dim CPU tensor (PyTorch
+        # promotes those); a shaped CPU scale tensor would have raised a device mismatch.
         if not all(
             self.device == attr.device
             for attr in [self.faces, global_ori, body_pose, body_bone_length]
@@ -171,7 +205,8 @@ class fish_model:
             global_ori = global_ori.to(self.device)
             body_pose = body_pose.to(self.device)
             body_bone_length = body_bone_length.to(self.device)
-
+        if torch.is_tensor(scale) and scale.device != self.device:
+            scale = scale.to(self.device)
 
         batch_size = global_ori.shape[0]
         V = self.V.repeat([batch_size, 1, 1]) * scale
@@ -196,32 +231,47 @@ class fish_model:
 
 
         # LBS
+        global_ori_plus_body_pose_rest_bone_spaces = None
         if deform:
-            verts, global_ori_plus_body_pose_template_space = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
+            # CLAUDE FIX: LBS now returns each bone's own (local) rotation rather than the
+            # accumulated chain rotation, which is what the per-joint swing-twist priors are
+            # defined against. Index 0 is the global orientation, so the root bone's priors are
+            # now enforceable just like every other bone's.
+            verts, local_bone_rotations_template_space = self.LBS(V, global_ori_plus_body_pose, all_bone_lengths, scale, to_rotmats=pose2rot)
             # transform each bone ori from template space to its own rest space
-            global_ori_plus_body_pose_rest_bone_local_space = (
-                self.template_to_bone_spaces @ global_ori_plus_body_pose_template_space @ self.template_to_bone_spaces.transpose(-1,-2)
-            ) # (1, n_body_bones, 3, 3)
-
-            # print("LBS output:")
-            # print(f"   body_pose_template_space: {body_pose_template_space}")
-            # print(f"   body_bone_poses_rest_bone_spaces: {body_bone_poses_rest_bone_spaces}")
+            local_bone_rotations_rest_bone_space = (
+                self.template_to_bone_spaces @ local_bone_rotations_template_space @ self.template_to_bone_spaces.transpose(-1,-2)
+            ) # (BS, n_bones, 3, 3)
 
             # PyTorch3D's matrix_to_quaternion returns quaternions with real part first, as tensor of shape (…, 4).
+            # CLAUDE FIX: matrix_to_quaternion is applied to the (BS, n_bones, 3, 3) tensor directly.
+            # The previous `.squeeze()` collapsed *every* size-1 dimension, so it only produced the
+            # right shape for a batch size of exactly 1. It also no longer moves the result to the
+            # host: keeping it on the model device avoids a device synchronization on every
+            # iteration of every optimization stage.
             global_ori_plus_body_pose_rest_bone_spaces = matrix_to_quaternion(
-                global_ori_plus_body_pose_rest_bone_local_space.squeeze()
-            ).unsqueeze(0).cpu() # (1, n_bones, 4) (w, x, y, z)
+                local_bone_rotations_rest_bone_space
+            ) # (BS, n_bones, 4) (w, x, y, z)
         else:
-            verts, global_ori_plus_body_pose_template_space = V, None
+            verts = V
 
         # Calculate 3d keypoint from new vertices resulted from pose
-        keypoints = []
-        for i in range(verts.shape[0]):
-            kpt = torch.matmul(self.vert2kpt, verts[i])
-            keypoints.append(kpt)
-        keypoints = torch.stack(keypoints)
+        keypoints = torch.matmul(self.vert2kpt.unsqueeze(0), verts)
 
-        # Final output after articulation
-        output = {"vertices": verts.cpu(), "keypoints": keypoints.cpu(), "global_ori_plus_body_pose_rest_bone_spaces": global_ori_plus_body_pose_rest_bone_spaces}
+        # Final output after articulation.
+        # CLAUDE FIX: outputs stay on the model device by default. Callers that want host tensors
+        # ask for them explicitly via `output_device`, so the return contract stays a dict and can
+        # grow new entries without changing any call site.
+        output = {
+            "vertices": verts,
+            "keypoints": keypoints,
+            "global_ori_plus_body_pose_rest_bone_spaces": global_ori_plus_body_pose_rest_bone_spaces,
+        }
+        if output_device is not None:
+            target = torch.device(output_device)
+            output = {
+                key: (value.to(target) if torch.is_tensor(value) else value)
+                for key, value in output.items()
+            }
 
         return output
