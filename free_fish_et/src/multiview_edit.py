@@ -179,7 +179,7 @@ def fit_mesh(
     ), "All inputs must reside on the target device"
 
     ### Mesh fitting
-    vertices, global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est, losses, global_ori_plus_body_pose_rest_bone_spaces, swing_twist = optimizer(
+    vertices, global_ori_plus_pose_est, body_bone_est, scale_est, global_t_est, losses = optimizer(
         init_ori_plus_pose,
         init_body_bone_length,
         init_t,
@@ -209,14 +209,7 @@ def fit_mesh(
     vertices_world_est = fish_output["vertices"] + global_t_est
     keypoints_world_est = fish_output["keypoints"] + global_t_est
 
-    return (
-        vertices_world_est, 
-        keypoints_world_est, 
-        global_t_est, global_ori_plus_pose_est, 
-        body_bone_est, scale_est, losses, 
-        global_ori_plus_body_pose_rest_bone_spaces, 
-        swing_twist
-    )
+    return vertices_world_est, keypoints_world_est, global_t_est, global_ori_plus_pose_est, body_bone_est, scale_est, losses
     
     # # sanity-checking code; this is meant for skipping reconstruction
     # fish_output = fish(init_ori_plus_pose[:, 0:3], init_ori_plus_pose[:, 3:], init_body_bone_length, init_s, deform=True)

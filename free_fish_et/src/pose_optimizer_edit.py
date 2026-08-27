@@ -803,7 +803,4 @@ class OptimizeMV:
         bone = body_bone_length.detach().cpu()
         scale = scale.detach().cpu()
         translation = global_t.detach().cpu()
-        global_ori_plus_body_pose_rest_bone_spaces = out["global_ori_plus_body_pose_rest_bone_spaces"]
-        swing_twist = decompose_to_swing_twist(global_ori_plus_body_pose_rest_bone_spaces).detach().cpu()
-        global_ori_plus_body_pose_rest_bone_spaces = global_ori_plus_body_pose_rest_bone_spaces.detach().cpu()
-        return vertices, pose, bone, scale, translation, final_losses, global_ori_plus_body_pose_rest_bone_spaces, swing_twist
+        return vertices, pose, bone, scale, translation, final_losses

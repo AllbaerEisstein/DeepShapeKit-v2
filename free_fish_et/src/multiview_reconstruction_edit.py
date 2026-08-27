@@ -934,25 +934,39 @@ def _save_pose_time_series_json(
             fps = float(fps)
         except (TypeError, ValueError):
             fps = None
-    
-    bone_rest_rot_world = {}
-    for bone_name in fish.template["bone_order"]:
-        bone_rest_rot_world[bone_name] = fish.template["bone_names_tree"][bone_name]["rest_rot_world"]
 
+    # CLAUDE FIX (pose_time_series schema v2): declare the schema and the orderings explicitly so
+    # that the Blender importer can validate instead of guessing. `global_ori` and `body_pose` as
+    # produced by the optimizer are already delta-from-rest rotations in template axes -- exactly
+    # what v2 specifies -- so only the meta block needed to change here.
+    bone_order = fish.template.get("bone_order", [])
     meta = {
+        "schema": "pose_time_series/2",
+        "producer": "multiview_reconstruction_edit.py",
         "source": "multiview_reconstruction_edit.py",
         "dataset_dir": dataset_dir,
         "dataset_name": dataset_name,
         "instance": int(instance_number),
-        "bone_order": fish.template.get("bone_order", []),
+        "bone_order": bone_order,
+        "body_pose_bone_order": bone_order[1:],
         "virtual_bone_names": fish.template.get("virtual_bone_names", []),
-        "bone_rest_rot_world": bone_rest_rot_world,
-        "swing_twist_order": ["swing_x", "twist_y", "swing_z"],
+        "virtual_bone_mask": fish.template.get("virtual_bone_mask", []),
+        "rotation": "axis_angle_exponential_map",
+        "space": ("global_t/global_ori in world; body_pose in template axes, delta from rest"),
+        "units": "meters",
         "frame_start": int(frame_start),
         "frame_end": int(frame_end),
         "frame_indices": processed_frames,
         "mesh_file": mesh_path,
     }
+
+    for payload in frame_payloads:
+        if len(payload["body_pose"]) != len(bone_order) - 1:
+            raise ValueError(
+                f"pose_time_series frame {payload['frame']}: body_pose has "
+                f"{len(payload['body_pose'])} entries but bone_order has {len(bone_order)} bones. "
+                f"body_pose must be parallel to bone_order[1:]."
+            )
 
     if fps is not None:
         meta["fps"] = fps
@@ -970,7 +984,6 @@ def _save_pose_time_series_json(
             "frame": int(payload["frame"]),
             "global_t": payload["global_t"],
             "global_ori": payload["global_ori"],
-            "swing_twist": payload["swing_twist"],
             "body_pose": payload["body_pose"],
             "body_bone_length": payload["body_bone_length"],
         }
@@ -1308,8 +1321,6 @@ def reconstruct(
             body_bone_est,
             scale_est,
             final_losses,
-            global_ori_plus_body_pose_rest_bone_spaces,
-            swing_twist
         ) = result
 
         # --------------------------
@@ -1333,9 +1344,8 @@ def reconstruct(
         pose_time_series_frames.append(
             {
                 "frame": int(idx),
-                "global_ori": [float(x) for x in global_ori_plus_body_pose_rest_bone_spaces[0][0].tolist()],
-                "body_pose": [[float(v) for v in quat] for quat in global_ori_plus_body_pose_rest_bone_spaces[0][1:].tolist()],
-                "swing_twist": [[float(v) for v in quat] for quat in swing_twist[0].tolist()],
+                "global_ori": [float(x) for x in global_ori_cpu],
+                "body_pose": [[float(v) for v in triple] for triple in body_pose_triplets],
                 "body_bone_length": [float(v) for v in body_bone_lengths],
                 "global_t": [float(v) for v in global_t_list],
                 "scale": float(scale_list[0]) if scale_list else None,
@@ -1465,7 +1475,9 @@ def render_pose_time_series(
     dataset_dir: str,
     pose_time_series_file_path: str,
     outdir: str,
-    deform: bool = False,
+    # CLAUDE FIX (BUGREPORT A12): defaulted to False, which skipped linear blend skinning entirely
+    # and rendered the rest-pose template for every frame.
+    deform: bool = True,
     frame_range: Optional[List[int]] = None,
     offset_by_frame_range_start: bool = False,
 ):
@@ -1510,10 +1522,21 @@ def render_pose_time_series(
         global_ori = torch.tensor(frame["global_ori"], device=device)
         body_pose = torch.tensor(frame["body_pose"], device=device)
         bone_length = torch.tensor(frame["body_bone_length"], device=device)
+        # CLAUDE FIX (BUGREPORT A12): `scale` is written by _save_pose_time_series_json but was
+        # never read back, so every series was rendered at scale 1.
+        scale = torch.tensor(float(frame.get("scale") or 1.0), device=device)
 
-        # articulated_verts_kpts = fish(global_ori.unsqueeze(0), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
-        # articulated_verts_kpts = fish(torch.zeros_like(global_ori.unsqueeze(0), device=device), body_pose.unsqueeze(0).flatten(1), bone_length.unsqueeze(0), deform=deform)
-        articulated_verts_kpts = fish(global_ori.unsqueeze(0), torch.zeros_like(body_pose.unsqueeze(0).flatten(1), device=device), bone_length.unsqueeze(0), deform=deform)
+        # CLAUDE FIX (BUGREPORT A12): this call used to pass
+        # `torch.zeros_like(body_pose.unsqueeze(0).flatten(1))` in place of the loaded body pose --
+        # leftover debug code that discarded ALL articulation, so every pose_time_series rendered
+        # as the rigidly-rotated rest template and looked plausible while showing nothing.
+        articulated_verts_kpts = fish(
+            global_ori.unsqueeze(0),
+            body_pose.unsqueeze(0).flatten(1),
+            bone_length.unsqueeze(0),
+            scale=scale,
+            deform=deform,
+        )
         keypoints = articulated_verts_kpts["keypoints"].to(device)
         vertices = articulated_verts_kpts["vertices"].to(device)
 

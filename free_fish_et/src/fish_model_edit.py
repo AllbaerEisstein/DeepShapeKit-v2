@@ -91,11 +91,25 @@ class fish_model:
 
         # when calculating the swing-twist of each bone, we need to express each articulated bone tail 
         # in the local space of the rest bone head because the twist axis is required to be one of x,y, or z.
+        # CLAUDE FIX (BUGREPORT A15): `rest_rot` is the bone's rest orientation in ARMATURE space,
+        # i.e. the same space as J and V. The older `rest_rot_world` key was pre-multiplied by the
+        # armature object's world matrix, so it only agreed with J when that matrix was the
+        # identity. Prefer `rest_rot`, fall back to `rest_rot_world` for legacy templates.
         template_to_bone_spaces = []
+        legacy_rest_rot = False
         for bone_name in template["bone_order"]:
-            bone_to_template = torch.tensor(template["bone_names_tree"][bone_name]["rest_rot_world"])
+            tree_entry = template["bone_names_tree"][bone_name]
+            rows = tree_entry.get("rest_rot")
+            if not rows:
+                rows = tree_entry["rest_rot_world"]
+                legacy_rest_rot = True
+            bone_to_template = torch.tensor(rows, dtype=torch.float32)
             template_to_bone = bone_to_template.T
             template_to_bone_spaces.append(template_to_bone)
+        if legacy_rest_rot:
+            print("fish_model warning: this template predates the 'rest_rot' key and falls back to "
+                  "'rest_rot_world'. Swing-twist priors will be wrong unless the armature's world "
+                  "matrix was the identity at export time. Re-export the template.")
         self.template_to_bone_spaces = torch.stack(template_to_bone_spaces, dim=0).unsqueeze(0) # (1, n_bones, 3, 3)
 
         # # scaling, unit conversion
@@ -108,6 +122,11 @@ class fish_model:
         # template itself. This catches an inconsistent template or a regression in the skinning
         # transform immediately, instead of letting the optimizer silently fit a distorted mesh.
         self.LBS.assert_rest_pose_is_identity(self.V)
+        # CLAUDE FIX (BUGREPORT A10): the rest-pose guard passes for both the head-pivot and the
+        # SMPL joint variant of the skinning chain, so it cannot tell them apart. This one can: it
+        # verifies that a bone's own rotation actually displaces that bone's tail, which is what
+        # the Blender vertex groups, the per-bone swing-twist priors and pose_time_series/2 assume.
+        self.LBS.assert_bone_rotates_its_own_segment()
 
         # global_ori and body_pose angle limits (import priors from fish template json)
         # angle limits are specified for each component in swing-twist representation (swing_x, twist_y, swing_z) (in radian) for each bone

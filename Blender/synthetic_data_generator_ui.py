@@ -20,7 +20,7 @@ import re
 import glob
 import math
 from collections import defaultdict
-from mathutils import Vector, Matrix, Quaternion
+from mathutils import Vector, Matrix
 from bpy.props import (
     StringProperty, BoolProperty, FloatProperty, IntProperty,
     PointerProperty, CollectionProperty,
@@ -450,7 +450,10 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
                 face_list.append({"coords": coords, "area": face["area"]})
         kpt_2_faces_worldco[kpt] = face_list
 
-    bm.free()
+    # CLAUDE FIX (B1): `bm.free()` was called a second time here on a BMesh that had already been
+    # freed a few lines above. The duplicate call raises ReferenceError, which propagated out of
+    # this function and was swallowed by the broad `except` in TimedRender.handle_render_item --
+    # silently dropping every keypoint label for every frame.
     # docs: The object owns the mesh data-block. To force free it use to_mesh_clear(). 
     obj_eval.to_mesh_clear()
     
@@ -499,13 +502,37 @@ def get_mesh_json(context):
     roots = [b for b in bone_list if b.parent is None]
     if not roots:
         raise ValueError("No root bones found in armature")
-    
+    # CLAUDE FIX (A9): everything downstream -- the kintree, `body_pose` indexing in the
+    # pose_time_series exporter/importer, and LBS's chain, which now rejects a second joint with
+    # parent -1 -- assumes a single kinematic root. With two roots the pose arrays are one entry
+    # short and every bone index silently shifts. Refuse here instead.
+    if len(roots) > 1:
+        raise ValueError(
+            f"The armature '{arm.name}' has {len(roots)} root bones "
+            f"({', '.join(sorted(b.name for b in roots))}). The template format supports exactly "
+            f"one root; parent the extra roots under a single root bone and re-export."
+        )
+
     # head/tail helpers (armature-space local coordinates)
     def head_pos(b): return b.head_local.copy()
     def tail_pos(b): return b.tail_local.copy()
 
+    # CLAUDE FIX (A15): J (head_local/tail_local) is ARMATURE space, `rest_rot_world` was WORLD
+    # space and V came from obj.data.vertices, i.e. MESH-OBJECT space -- three different spaces in
+    # one template file, which only ever agreed because the demo scene has identity object
+    # transforms. `rest_rot` is now emitted in armature space (the same space as J), the mesh is
+    # baked into armature space, and the armature's own world matrix is recorded separately.
+    # `rest_rot_world` is still written so that older consumers keep working.
+    arm_world = arm.matrix_world.copy()
+    arm_world_3 = arm_world.to_3x3()
+    obj_to_armature = arm_world.inverted() @ obj.matrix_world
+
     # BFS traversal to preserve topology order
-    bone_names_tree = {b.name: {'p': str, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot_world': [], 'rest_rot_local': []} for b in bone_list} # very inefficient way to store a tree
+    # CLAUDE FIX (B13): the placeholder for 'p' used to be the *type* `str`, which is truthy, so a
+    # bone that the BFS never reaches was treated as a non-root, never entered `bone_order`, and
+    # still consumed a weights column index derived from `bone_order`. Use None and verify that
+    # every bone was visited.
+    bone_names_tree = {b.name: {'p': None, 'c': [], 'joints': [], 'joints_idx': [-1,-1], 'rest_rot': [], 'rest_rot_world': []} for b in bone_list}
     ordered_bones = []
     queue = roots[:]
     while queue:
@@ -513,12 +540,16 @@ def get_mesh_json(context):
         ordered_bones.append(b)
         bone_names_tree[b.name]['p'] = b.parent.name if b.parent is not None else ''
         bone_names_tree[b.name]['joints'] = [head_pos(b), tail_pos(b)]
-        rest_mat_world = (arm.matrix_world.to_3x3() @ b.matrix_local.to_3x3()).normalized()   # bone rest->world (armature-space -> world)
-        bone_names_tree[b.name]['rest_rot_world'] = rest_mat_world  # 3x3 rotation matrix
-        #bone_names_tree[b.name]['rest_rot_local'] = b.matrix_local.to_3x3()  # 3x3 rotation matrix
+        rest_rot_armature = b.matrix_local.to_3x3().normalized()      # bone rest -> armature space
+        bone_names_tree[b.name]['rest_rot'] = rest_rot_armature
+        bone_names_tree[b.name]['rest_rot_world'] = (arm_world_3 @ rest_rot_armature).normalized()
         for ch in b.children:
             queue.append(ch)
             bone_names_tree[b.name]['c'].append(ch.name)
+
+    unvisited = [b.name for b in bone_list if bone_names_tree[b.name]['p'] is None]
+    if unvisited:
+        raise ValueError(f"Bones not reachable from the root bone: {sorted(unvisited)}")
 
     pos_to_joint_idx = {}
     joint_positions = []
@@ -526,34 +557,42 @@ def get_mesh_json(context):
     parent_indices = []
 
     # NOTE: Logic needs to be checked again
-    def get_virtual_bone_world_space_matrix_from_bones(parentb, childb):
-        parent_world_tail = arm.matrix_world @ tail_pos(parentb)   # world-space parent tail
-        child_world_head  = arm.matrix_world @ head_pos(childb)          # world-space child head
-        dir_world = child_world_head - parent_world_tail
-        y = dir_world.normalized()   # virtual bone +Y in world
-        # choose a stable roll reference in world space using parent's REST axes:
-        parent_rest_R_world = bone_names_tree[parentb.name]['rest_rot_world']  # 3x3
+    def get_virtual_bone_rest_matrix_from_bones(parentb, childb):
+        # CLAUDE FIX (A15): built in ARMATURE space so that it matches J and `rest_rot`.
+        # CLAUDE FIX (B15): a zero-length gap used to reach `.normalized()` on a zero vector and
+        # only failed later, in a confusing place. Reject it here, matching the exporter.
+        parent_tail = tail_pos(parentb)
+        child_head = head_pos(childb)
+        dir_arm = child_head - parent_tail
+        if dir_arm.length < 1e-8:
+            raise Exception(
+                f"virtual bone between '{parentb.name}' and '{childb.name}' has zero length; "
+                f"the child's head coincides with the parent's tail, so no virtual bone is needed."
+            )
+        y = dir_arm.normalized()   # virtual bone +Y in armature space
+        # choose a stable roll reference using parent's REST axes:
+        parent_rest_R = bone_names_tree[parentb.name]['rest_rot']  # 3x3, armature space
         # try parent's rest Z (local +Z) first:
-        parent_z = parent_rest_R_world @ Vector((0.0, 0.0, 1.0))
+        parent_z = parent_rest_R @ Vector((0.0, 0.0, 1.0))
         # if nearly parallel to y, try parent local X
         if abs(parent_z.normalized().dot(y)) > 0.999:
-            parent_x = parent_rest_R_world @ Vector((1.0, 0.0, 0.0))
+            parent_x = parent_rest_R @ Vector((1.0, 0.0, 0.0))
             # compute Z = parent_x × Y (ensure orthogonality). error out if Z is degenerate
             z = parent_x.cross(y)
             if z.length < 1e-8:
-                raise Exception(f"z-axis is degenerate while constructing rest_rot_world for bone {childb.name}")
+                raise Exception(f"z-axis is degenerate while constructing rest_rot for bone {childb.name}")
             z.normalize()
             x = y.cross(z)
-            virtual_rest_R_world = Matrix((x, y, z)).transposed()
+            virtual_rest_R = Matrix((x, y, z)).transposed()
         else:
             # compute X = parent_z × Y (ensure orthogonality). error out if X is degenerate
             x = parent_z.cross(y)
             if x.length < 1e-8:
-                raise Exception(f"x-axis is degenerate while constructing rest_rot_world for bone {childb.name}")
+                raise Exception(f"x-axis is degenerate while constructing rest_rot for bone {childb.name}")
             x.normalize()
             z = y.cross(x)
-            virtual_rest_R_world = Matrix((x, y, z)).transposed()
-        return virtual_rest_R_world
+            virtual_rest_R = Matrix((x, y, z)).transposed()
+        return virtual_rest_R
 
 
     def key_from_vec(v, prec=6):
@@ -589,20 +628,22 @@ def get_mesh_json(context):
             virtual_bone_names.append(vname)
             # in bone-tree, replace entry for original child bone with entry for virtual bone (insert node and edge into tree)
             bone_names_tree[vname] = {
-                    'p': b.parent.name, 'c': [b.name], 
-                    'joints': [tail_pos(b.parent), head_pos(b)], 
+                    'p': b.parent.name, 'c': [b.name],
+                    'joints': [tail_pos(b.parent), head_pos(b)],
                     'joints_idx': [-1,-1],
+                    'rest_rot': [], 'rest_rot_world': [],
                 }
             bone_names_tree[b.name]['p'] = vname
             bone_names_tree[b.parent.name]['c'] = [vname if c == b.name else c for c in bone_names_tree[b.parent.name]['c']]
 
-            virtual_rest_R_world = get_virtual_bone_world_space_matrix_from_bones(b.parent, b)
-            bone_names_tree[vname]['rest_rot_world'] = virtual_rest_R_world
+            virtual_rest_R = get_virtual_bone_rest_matrix_from_bones(b.parent, b)
+            bone_names_tree[vname]['rest_rot'] = virtual_rest_R
+            bone_names_tree[vname]['rest_rot_world'] = (arm_world_3 @ virtual_rest_R).normalized()
     
     # topo-sort the tree and add joint information, in the same go create joint indexing and joint parent information
     # this ensures indexing of joints that corresponds to the bone hierarchy
     bone_names_ordered = []
-    queue = [node for node, p_c_dict in bone_names_tree.items() if not p_c_dict['p']]
+    queue = [node for node, p_c_dict in bone_names_tree.items() if p_c_dict['p'] == '']
     while queue:
         n = queue.pop(0)
         bone_names_ordered.append(n)
@@ -696,7 +737,8 @@ def get_mesh_json(context):
     kintree_unique_joints = [parent_indices, joint_indices]
 
     # -- geometry
-    verts = [[float(c) for c in v.co] for v in obj.data.vertices]
+    # CLAUDE FIX (A15): express the mesh in the same (armature) space as J and rest_rot.
+    verts = [[float(c) for c in (obj_to_armature @ v.co)] for v in obj.data.vertices]
     faces = [list(p.vertices) for p in obj.data.polygons]
 
     # -- weights: include columns for virtual bones (zeros)
@@ -768,12 +810,16 @@ def get_mesh_json(context):
                 'p': data['p'],
                 'c': data['c'],
                 'joints': data['joints_idx'],
+                # 'rest_rot' is the authoritative one (armature space, same space as J and V);
+                # 'rest_rot_world' is kept for backwards compatibility with older consumers.
+                'rest_rot': [[float(c) for c in row] for row in data['rest_rot']],
                 'rest_rot_world': [[float(c) for c in row] for row in data['rest_rot_world']],
-                #'rest_rot_local': [[float(c) for c in row] for row in data['rest_rot_local']],
                 'priors': bone_name_2_prior[bone_name] if bone_name in bone_name_2_prior else None,
             }
             for bone_name, data in bone_names_tree.items()
         },                                       # a tree-dict of parents, children and joint indices of bones
+        'space': 'armature',                     # V, J and rest_rot all live in armature space
+        'armature_matrix_world': [[float(c) for c in row] for row in arm_world],
         'virtual_bone_names': virtual_bone_names, # for identifying virtual bones
         'virtual_bone_mask': [1 if name in virtual_bone_names else 0 for name in bone_names_ordered], # 1 for virtual bones, 0 for physical bones
         'bone_groups': bone_groups_out,
@@ -849,10 +895,15 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
             total_area += area
 
             # 2) test all vertices for visibility
-            all_visible = False
+            # CLAUDE FIX (B2): this loop was named `all_visible` and documented as "faces fully
+            # visible", but it broke out on the FIRST unoccluded vertex, i.e. it implemented
+            # *any*-visible. A face with a single visible corner contributed its whole area, so
+            # `keypoint_visible_threshold` was far more permissive than intended and occluded
+            # keypoints were labelled as fully visible.
+            all_visible = True
             for coord in face_coords:
-                if not is_vertex_occluded(deps, cam_obj, Vector(coord)):
-                    all_visible = True
+                if is_vertex_occluded(deps, cam_obj, Vector(coord)):
+                    all_visible = False
                     break
 
             if all_visible:
@@ -976,11 +1027,19 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
     except Exception:
         orig_film_transparent = False
 
-    # Save original materials per object (list of materials, may be empty)
-    orig_materials = {}
+    # CLAUDE FIX (B14): materials live on the MESH DATA, not on the object. The old code iterated
+    # objects while mutating `o.data.materials`, so two objects sharing one mesh had that mesh's
+    # slot list cleared and re-appended twice -- duplicating slots and, because clearing resets
+    # every polygon's material_index to 0, destroying per-face material assignments. Snapshot and
+    # restore per unique mesh datablock, including material_index.
     all_mesh_objects = [o for o in bpy.data.objects if o.type == 'MESH']
+    mesh_to_objects = defaultdict(list)
     for o in all_mesh_objects:
-        orig_materials[o.name] = [slot.material for slot in o.material_slots]
+        mesh_to_objects[o.data].append(o)
+    orig_materials = {
+        me: ([slot for slot in me.materials], [poly.material_index for poly in me.polygons])
+        for me in mesh_to_objects
+    }
 
     # Save world and set black background (optional but ensures no stray background)
     orig_world = scene.world
@@ -989,8 +1048,8 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
         black_world = bpy.data.worlds.new(name="SYNTH_tmp_black_world")
         black_world.use_nodes = True
         # clear nodes
-        for n in list(black_world.node_tree.nodes):
-            black_world.node_tree.nodes.remove(n)
+        for nd in list(black_world.node_tree.nodes):
+            black_world.node_tree.nodes.remove(nd)
         bg = black_world.node_tree.nodes.new('ShaderNodeBackground')
         bg.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
         outw = black_world.node_tree.nodes.new('ShaderNodeOutputWorld')
@@ -1002,20 +1061,13 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
 
     # --- assign materials: target -> white, others -> black --------------------
     try:
-        for o in all_mesh_objects:
-            # ensure we have material slots to assign into
-            if len(o.data.materials) == 0:
-                o.data.materials.append(None)  # create 1 slot
-
-            # prepare a clean material slot array
-            o.data.materials.clear()
-
-            if o.name == target_obj.name:
-                # assign white emission to all slots (1 slot is enough)
-                o.data.materials.append(white_em)
-            else:
-                # assign black emission
-                o.data.materials.append(black_em)
+        for me, objs in mesh_to_objects.items():
+            is_target = any(o.name == target_obj.name for o in objs)
+            if is_target and len(objs) > 1:
+                print(f"SYNTH warning: mesh '{me.name}' is shared by the target object and "
+                      f"{len(objs) - 1} other object(s); they cannot be masked separately.")
+            me.materials.clear()
+            me.materials.append(white_em if is_target else black_em)
 
         # ensure output dir exists
         os.makedirs(os.path.dirname(out_abspath), exist_ok=True)
@@ -1031,20 +1083,16 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
 
     finally:
         # --- restore materials ------------------------------------------------
-        for o in all_mesh_objects:
-            orig = orig_materials.get(o.name, [])
-            # clear then restore original materials
+        for me, (mats, face_indices) in orig_materials.items():
             try:
-                o.data.materials.clear()
+                me.materials.clear()
+                for m in mats:
+                    me.materials.append(m)
+                # materials.clear() resets every polygon's material_index to 0
+                for poly, idx in zip(me.polygons, face_indices):
+                    poly.material_index = idx
             except Exception:
-                # fallback: attempt to set each slot if clear is unsupported
                 pass
-            for m in orig:
-                if m is None:
-                    # append an empty slot
-                    o.data.materials.append(None)
-                else:
-                    o.data.materials.append(m)
 
         # restore world, filepath, film transparency
         try:
@@ -1061,21 +1109,14 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
             pass
 
         # cleanup temporary materials/world if unused
-        try:
-            if white_em.users == 0:
-                bpy.data.materials.remove(white_em, do_unlink=True)
-        except Exception:
-            pass
-        try:
-            if black_em.users == 0:
-                bpy.data.materials.remove(black_em, do_unlink=True)
-        except Exception:
-            pass
-        try:
-            if black_world is not None and black_world.users == 0:
-                bpy.data.worlds.remove(black_world, do_unlink=True)
-        except Exception:
-            pass
+        for datablock, collection in ((white_em, bpy.data.materials),
+                                      (black_em, bpy.data.materials),
+                                      (black_world, bpy.data.worlds)):
+            try:
+                if datablock is not None and datablock.users == 0:
+                    collection.remove(datablock, do_unlink=True)
+            except Exception:
+                pass
 
 
 def get_mask_polygons_from_binary_image(img_path):
@@ -1099,14 +1140,21 @@ def draw_polygons(img_path, out_path, polygons, color=(255,255,255)):
     cv2.imwrite(out_path, img)
 
 
-def write_polygons_to_yolo(polygons, image_width, image_height, out_path):
+def write_polygons_to_yolo(polygons, image_width, image_height, out_path, class_index: int = 0):
+    """Write one YOLO-seg line per polygon.
+
+    CLAUDE FIX (B3): the leading field of a YOLO-seg line is the CLASS index, but this function
+    used to write the polygon's position in the list. A mask that yields three contours therefore
+    declared classes 0, 1 and 2 while create_dataset_yaml() declares a single class, so training
+    either failed or learned nonsense labels. The class is now passed in explicitly.
+    """
     lines = []
-    for idx, polygon in enumerate(polygons):
+    for polygon in polygons:
         norm_pts = []
         for x, y in polygon:
             norm_pts.append(f"{(x / image_width):.3f}")
             norm_pts.append(f"{(y / image_height):.3f}")
-        lines.append(f"{idx} " + " ".join(norm_pts))
+        lines.append(f"{int(class_index)} " + " ".join(norm_pts))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as f:
         f.write("\n".join(lines) + "\n")
@@ -1116,7 +1164,9 @@ def write_polygons_to_yolo(polygons, image_width, image_height, out_path):
 def draw_points_on_img(points, img_path, out_path, annot_radius = 1):
     img = cv2.imread(str(img_path))
     for point in points:
-        cv2.circle(img=img, center=(int(point[0]),int(point[1])), radius=annot_radius, color=(255, 255, 255), lineType=-1)
+        # CLAUDE FIX (B4): filled circles are requested with thickness=-1; lineType=-1 is not a
+        # valid line type and the marker was drawn as a 1-px outline.
+        cv2.circle(img=img, center=(int(point[0]),int(point[1])), radius=annot_radius, color=(255, 255, 255), thickness=-1)
     cv2.imwrite(str(out_path), img)
 
 
@@ -1139,8 +1189,9 @@ def draw_kpts_on_img(kpt2coords, kpt_2_vis_status, kpt_2_vis_ptg, img_path, out_
             int(conf*10)/10   # will cut off second decimal (e.g 0.72 -> 0.7)
             *annot_radius  # if annot_radius is k*10 with k in N, this will yield an int
         )
-        cv2.circle(img=img, center=(int(x),int(y)), radius=1, color=color, lineType=-1) # center
-        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=color, lineType=-1)
+        # CLAUDE FIX (B4): thickness=-1 fills the circle; lineType=-1 is not a valid line type.
+        cv2.circle(img=img, center=(int(x),int(y)), radius=1, color=color, thickness=-1) # center
+        cv2.circle(img=img, center=(int(x),int(y)), radius=conf_scaled_annot_radius, color=color, thickness=-1)
         cv2.putText(img, f"{int(conf*100)/100}: {name}", (int(x),int(y+conf_scaled_annot_radius+10)), cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.3, color=color, thickness=1)
 
     cv2.imwrite(str(out_path), img)
@@ -1307,15 +1358,24 @@ using opencv's contour detection can create a silhouette annotation from the bin
             self.timer_event = None
 
 
+    # CLAUDE FIX (B5): one source of truth for the annotated image size. The out-of-bounds test
+    # used the evaluated render resolution while the YOLO normalisation divided by the UI fields
+    # `image_width_px` / `image_height_px`; any render_scale != 1.0, or a scene resolution that had
+    # drifted from the UI, produced silently mis-scaled labels. Both now use this helper.
+    @staticmethod
+    def _annotation_image_size(scene):
+        pct = scene.render.resolution_percentage / 100.0
+        return int(round(scene.render.resolution_x * pct)), int(round(scene.render.resolution_y * pct))
+
     def handle_render_item(self, context, qitem):
         scene = context.scene
+
         def reset_render_settings():
             scene.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 0)
             scene.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 0
             scene.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 0
 
         p = scene.synth_props
-        kpt_list = [kp.strip() for kp in p.keypoint_list_csv.split(',') if kp.strip()]
 
         cam_name                 = qitem['view']
         frame_index              = qitem['frame']
@@ -1328,7 +1388,6 @@ using opencv's contour detection can create a silhouette annotation from the bin
         kpt_label_out_path       = qitem['kpt_label_path']
         mask_label_out_path      = qitem['mask_label_path']
 
-
         cam_obj = bpy.data.objects.get(cam_name)
         if not cam_obj:
             self.report({'ERROR'}, f"Camera {cam_name} not found")
@@ -1336,21 +1395,46 @@ using opencv's contour detection can create a silhouette annotation from the bin
         scene.camera = cam_obj
         scene.frame_set(frame_index)
 
-        scene.render.filepath = render_out_file_path_bl
-        if p.use_compositor:
-            reset_render_settings()
-        bpy.ops.render.render(write_still=True)
+        img_w, img_h = self._annotation_image_size(scene)
+        if (img_w, img_h) != (int(p.image_width_px), int(p.image_height_px)):
+            self.report({'WARNING'},
+                        f"scene render size {img_w}x{img_h} differs from the UI fields "
+                        f"{int(p.image_width_px)}x{int(p.image_height_px)}; labels follow the "
+                        f"rendered size. Press 'Apply And Save Settings' to sync them.")
 
+        # CLAUDE FIX (B6): the queue holds one item per (camera, frame, mode), but the beauty
+        # render and the whole keypoint/label pipeline used to run for BOTH modes -- every frame
+        # was rendered and annotated twice, and the second pass overwrote the first. The beauty
+        # pass and the annotations now run only for the 'regular' item.
+        if mode == 'regular':
+            scene.render.filepath = render_out_file_path_bl
+            if p.use_compositor:
+                reset_render_settings()
+            bpy.ops.render.render(write_still=True)
+            self._annotate_frame(context, cam_obj, img_w, img_h,
+                                 render_out_file_path_os, kpt_annot_out_file_path,
+                                 kpt_label_out_path)
+
+        if p.render_binary and mode == 'binary':
+            self._render_and_write_mask(context, img_w, img_h, render_prefix_cam_frame,
+                                        render_out_file_path_os, mask_annot_out_file_path,
+                                        mask_label_out_path)
+
+    def _annotate_frame(self, context, cam_obj, img_w, img_h,
+                        render_out_file_path_os, kpt_annot_out_file_path, kpt_label_out_path):
+        scene = context.scene
+        p = scene.synth_props
+        kpt_list = [kp.strip() for kp in p.keypoint_list_csv.split(',') if kp.strip()]
 
         try:
             deps = bpy.context.evaluated_depsgraph_get()
 
-            faces, vertices, normals, kpt_2_verts_list_world, kpt_2_faces_list_world = get_deformed_mesh_data(deps, p.collection_name, p.object_name, kpt_list)
-            
+            faces, vertices, normals, kpt_2_verts_list_world, kpt_2_faces_list_world = \
+                get_deformed_mesh_data(deps, p.collection_name, p.object_name, kpt_list)
 
             kpt_2_visibility_pct, kpt_2_visible_faces = (
-                get_keypoint_visibility_from_faces(deps, kpt_2_faces_list_world, cam_obj) 
-                if p.check_keypoint_visibility 
+                get_keypoint_visibility_from_faces(deps, kpt_2_faces_list_world, cam_obj)
+                if p.check_keypoint_visibility
                 else (
                     {k: 1.0 for k in kpt_2_verts_list_world.keys()},
                     {
@@ -1362,78 +1446,66 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
             # no filtering yet
             kpt_2_visible_vert_coords_list_world = {
-                kpt: list(set([
-                    point 
-                    for poly in kpt_2_visible_faces[kpt] 
-                    for point in poly
-                ]))
-                for kpt, vis in kpt_2_visibility_pct.items() 
+                kpt: list(set([point for poly in kpt_2_visible_faces[kpt] for point in poly]))
+                for kpt in kpt_2_visibility_pct
             }
             kpt_2_coords_list_world = {
-                kpt: list(set([
-                    point 
-                    for poly in kpt_2_faces_list_world[kpt] 
-                    for point in poly["coords"]
-                ]))
-                for kpt, vis in kpt_2_visibility_pct.items() 
+                kpt: list(set([point for poly in kpt_2_faces_list_world[kpt] for point in poly["coords"]]))
+                for kpt in kpt_2_visibility_pct
             }
 
-            # avg over the visible vertices coords
+            # avg over the visible vertices coords / over all the verts
             kpt_2_avg_coords_world_visible = get_avg_kpt_coords_3d(kpt_2_visible_vert_coords_list_world)
-            # avg over all the verts
             kpt_2_avg_coords_world = get_avg_kpt_coords_3d(kpt_2_coords_list_world)
 
-            # compute camera matrix P and project using matrix (keeps parity with original script)
             cam_mats = get_cam_matrix_for_cam(cam_obj, scene)
             P = cam_mats['P_blender']
 
             EPS = 1e-8
-            img_w = int(scene.render.resolution_x * (scene.render.resolution_percentage / 100.0))
-            img_h = int(scene.render.resolution_y * (scene.render.resolution_percentage / 100.0))
+
             def is_outside_image_bounds(x, y):
-                return x < EPS or x > (img_w-EPS) or y < EPS or y > (img_h-EPS)
-            
+                return x < EPS or x > (img_w - EPS) or y < EPS or y > (img_h - EPS)
+
             def project_world_keypoints(kpt_2_coords):
                 kpt_2_projected = {}
                 for kpt, coords in kpt_2_coords.items():
                     ph = P @ Vector((*coords, 1.0))
                     # require a meaningful positive depth (z)
                     if not (ph.z > EPS):
-                        # either skip or explicitly mark as missing; write_pose_labels_yolo expects missing keys possible
-                        # skipping is fine
                         continue
-                    x_img = ph.x / ph.z
-                    y_img = ph.y / ph.z
-                    kpt_2_projected[kpt] = (x_img, y_img)
+                    kpt_2_projected[kpt] = (ph.x / ph.z, ph.y / ph.z)
                 return kpt_2_projected
-                
+
             kpt_2_coords_image_filtered_by_vis = project_world_keypoints(kpt_2_avg_coords_world_visible)
             kpt_2_coords_image_all_faces_count = project_world_keypoints(kpt_2_avg_coords_world)
 
-            # 0: The keypoint is not labeled or is out-of-view (not visible and not labeled).
-            # 1: The keypoint is labeled but not visible (occluded).
-            # 2: The keypoint is labeled and visible (fully visible).
-            occluded_status = 1 if p.keep_occluded_keypoints else 0 # status 1 may only occur if the flag is set
+            # 0: not labeled / out-of-view, 1: labeled but occluded, 2: labeled and visible
+            occluded_status = 1 if p.keep_occluded_keypoints else 0
             kpt_2_vis_status = {
-                kpt: 
+                kpt:
                     0 if is_outside_image_bounds(*coords)
-                    else 
-                    occluded_status if kpt_2_visibility_pct[kpt] < p.keypoint_visible_threshold
-                    else 
-                    2
-                for kpt, coords in kpt_2_coords_image_filtered_by_vis.items() 
+                    else occluded_status if kpt_2_visibility_pct.get(kpt, 0.0) < p.keypoint_visible_threshold
+                    else 2
+                for kpt, coords in kpt_2_coords_image_filtered_by_vis.items()
             }
-            for kpt in [kp.strip() for kp in context.scene.synth_props.keypoint_list_csv.split(',') if kp.strip()]:
+            for kpt in kpt_list:
                 if kpt not in kpt_2_vis_status:
                     kpt_2_vis_status[kpt] = occluded_status
-                    
-            # if the keypoint is occluded, its coordinates are considered to be the center of all its vertices, not only the visible ones (because there are possible none visible)
-            for kpt, status in kpt_2_vis_status.items():
+
+            # CLAUDE FIX (B10): a fully occluded keypoint is absent from
+            # kpt_2_coords_image_filtered_by_vis, and its all-faces centroid may also have failed
+            # to project (behind the camera), so the direct subscript raised KeyError and the whole
+            # frame's labels were lost. Fall back to "missing" instead.
+            for kpt, status in list(kpt_2_vis_status.items()):
                 if status == 1:
-                    kpt_2_coords_image_filtered_by_vis[kpt] = kpt_2_coords_image_all_faces_count[kpt]
+                    fallback = kpt_2_coords_image_all_faces_count.get(kpt)
+                    if fallback is None:
+                        kpt_2_vis_status[kpt] = 0
+                        kpt_2_coords_image_filtered_by_vis[kpt] = (0, 0)
+                    else:
+                        kpt_2_coords_image_filtered_by_vis[kpt] = fallback
                 elif status == 0:
-                    kpt_2_coords_image_filtered_by_vis[kpt] = (0,0)
-            
+                    kpt_2_coords_image_filtered_by_vis[kpt] = (0, 0)
 
             img_annot_source_file_path = render_out_file_path_os
 
@@ -1441,13 +1513,16 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 visible_verts = []
                 for vertex_list in kpt_2_verts_list_world.values():
                     for vertex in vertex_list:
-                        if (not is_vertex_occluded(deps, cam_obj, Vector(vertex["co"])) if p.check_keypoint_visibility else True):
+                        if (not is_vertex_occluded(deps, cam_obj, Vector(vertex["co"]))
+                                if p.check_keypoint_visibility else True):
                             vertex_bl_cam = P @ Vector(tuple(vertex["co"]) + (1,))
-                            visible_verts.append((vertex_bl_cam.x / vertex_bl_cam.z, vertex_bl_cam.y / vertex_bl_cam.z))
+                            if abs(vertex_bl_cam.z) < EPS:
+                                continue
+                            visible_verts.append((vertex_bl_cam.x / vertex_bl_cam.z,
+                                                  vertex_bl_cam.y / vertex_bl_cam.z))
                 draw_points_on_img(visible_verts, img_annot_source_file_path, kpt_annot_out_file_path)
                 img_annot_source_file_path = kpt_annot_out_file_path
 
-            
             if p.create_annotated_images and p.draw_every_keypoint_face:
                 visible_faces = []
                 for face_list in kpt_2_visible_faces.values():
@@ -1455,63 +1530,71 @@ using opencv's contour detection can create a silhouette annotation from the bin
                         projected_face = []
                         for vertex_world in face:
                             ph = P @ Vector((*vertex_world, 1))
+                            if abs(ph.z) < EPS:
+                                continue
                             projected_face.append((ph.x / ph.z, ph.y / ph.z))
-                        visible_faces.append(projected_face)
+                        if projected_face:
+                            visible_faces.append(projected_face)
                 draw_polygons(img_annot_source_file_path, kpt_annot_out_file_path, visible_faces)
                 img_annot_source_file_path = kpt_annot_out_file_path
 
             if p.create_annotated_images:
                 draw_kpts_on_img(
-                    kpt_2_coords_image_filtered_by_vis, 
-                    kpt_2_vis_status, 
-                    kpt_2_visibility_pct, 
-                    img_annot_source_file_path, 
+                    kpt_2_coords_image_filtered_by_vis,
+                    kpt_2_vis_status,
+                    kpt_2_visibility_pct,
+                    img_annot_source_file_path,
                     kpt_annot_out_file_path
                 )
-                
+
             write_pose_labels_yolo(
                 [kpt_2_coords_image_filtered_by_vis],
                 [kpt_2_vis_status],
-                kpt_list, 
-                int(p.image_width_px), 
-                int(p.image_height_px), 
-                [0], 
+                kpt_list,
+                img_w,
+                img_h,
+                [0],
                 kpt_label_out_path
             )
 
         except Exception as e:
             self.report({'WARNING'}, f"Keypoint generation failed: {e}")
 
-        if p.render_binary and mode == 'binary':
-            if p.use_compositor:
-                scene.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
-                scene.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
-                scene.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
-                scene.render.filepath = mask_annot_out_file_path
-                bpy.ops.render.render(write_still=True)
-            else:
-                render_binary_mask_keep_occluders_black(scene,
-                                            bpy.data.objects.get(p.object_name),
-                                            mask_annot_out_file_path)
-            if os.path.exists(mask_annot_out_file_path):
-                polygons = get_mask_polygons_from_binary_image(mask_annot_out_file_path)
-                if p.create_annotated_images:
-                    draw_polygons(render_out_file_path_os, mask_annot_out_file_path, polygons)
-                write_polygons_to_yolo(polygons, int(p.image_width_px), int(p.image_height_px), mask_label_out_path)
-            else:
-                try:
-                    img = cv2.imread(render_out_file_path_os)
-                    if img is not None:
-                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-                        tmp_mask = os.path.join(resolve(p.mask_label_dir), render_prefix_cam_frame + "_tmp_mask.png")
-                        os.makedirs(os.path.dirname(tmp_mask), exist_ok=True)
-                        cv2.imwrite(tmp_mask, thresh)
-                        polygons = get_mask_polygons_from_binary_image(tmp_mask)
-                        write_polygons_to_yolo(polygons, int(p.image_width_px), int(p.image_height_px), mask_label_out_path)
-                        os.remove(tmp_mask)
-                except Exception as e:
-                    self.report({'WARNING'}, f"Mask extraction failed: {e}")
+    def _render_and_write_mask(self, context, img_w, img_h, render_prefix_cam_frame,
+                               render_out_file_path_os, mask_annot_out_file_path,
+                               mask_label_out_path):
+        scene = context.scene
+        p = scene.synth_props
+        if p.use_compositor:
+            scene.node_tree.nodes["Alpha Over"].inputs[1].default_value = (0, 0, 0, 1)
+            scene.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
+            scene.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
+            scene.render.filepath = mask_annot_out_file_path
+            bpy.ops.render.render(write_still=True)
+        else:
+            render_binary_mask_keep_occluders_black(
+                scene, get_target_object(scene), mask_annot_out_file_path)
+
+        if os.path.exists(mask_annot_out_file_path):
+            polygons = get_mask_polygons_from_binary_image(mask_annot_out_file_path)
+            if p.create_annotated_images:
+                draw_polygons(render_out_file_path_os, mask_annot_out_file_path, polygons)
+            write_polygons_to_yolo(polygons, img_w, img_h, mask_label_out_path, class_index=0)
+        else:
+            try:
+                img = cv2.imread(render_out_file_path_os)
+                if img is not None:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+                    tmp_mask = os.path.join(resolve(p.mask_label_dir),
+                                            render_prefix_cam_frame + "_tmp_mask.png")
+                    os.makedirs(os.path.dirname(tmp_mask), exist_ok=True)
+                    cv2.imwrite(tmp_mask, thresh)
+                    polygons = get_mask_polygons_from_binary_image(tmp_mask)
+                    write_polygons_to_yolo(polygons, img_w, img_h, mask_label_out_path, class_index=0)
+                    os.remove(tmp_mask)
+            except Exception as e:
+                self.report({'WARNING'}, f"Mask extraction failed: {e}")
 
 
     def modal(self, context, event):
@@ -1947,7 +2030,7 @@ def export_cam_matrices(context):
 class SYNTH_OT_export_camera_matrices(Operator):
     bl_idname = "synth.export_camera_matrices"
     bl_label = "Export Camera Matrices"
-    bl_description = "Export computed camera parameters & matrices (f, K, R, t, P, Rt) for [Blender world -> CV image]-conversion for all scene cameras to cam_matrices.json in the annotation folder. -- NOTE -- f is specified in mm, K is specified in pixels -- K and t expect coordinates in CV-convention; y is down, z is positive camera look-at (forward), x is right -- P, R, Rt expect coordinates in Blender world convention: z is up, y is forward, x is right"
+    bl_description = "Export computed camera parameters & matrices (f, K, R, t, P, Rt) for [Blender world -> CV image]-conversion for all scene cameras to cam_matrices.json in the annotation folder. -- NOTE -- f is specified in mm, K is specified in pixels -- f is in mm, K is in pixels and maps CV camera coordinates (x right, y down, z forward) to pixels -- CLAUDE FIX (B9): the exported R, t, Rt and P consume CV-WORLD coordinates, not Blender-world ones: get_cam_matrix_for_cam builds them as R_cv = R_blender @ FROM_BLENDERWORLD^-1. Convert a Blender-world point with FROM_BLENDERWORLD first (x_cv = FROM_BLENDERWORLD @ x_blender). The Blender-world variants exist internally as R_blender/Rt_blender/P_blender but are not written to this file."
 
     def execute(self, context):
         try:
@@ -2111,12 +2194,17 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
             self.report({'ERROR'}, f"Bone '{self.bone_name}' not found in armature '{arm_obj.name}'")
             return {'CANCELLED'}
 
+        # CLAUDE FIX (B8): `Bone.matrix` is a 3x3 that is ALREADY expressed in the bone's parent
+        # space, so `rb.parent.matrix.inverted() @ rb.matrix` multiplied two matrices living in
+        # different parents' spaces, and the result was then compared against `PoseBone.matrix`,
+        # which is a 4x4 in ARMATURE space. Use `Bone.matrix_local` (armature space) on the rest
+        # side so both sides are parent-relative in the same space.
         if rb.parent is not None:
-            rest_mat = rb.parent.matrix.inverted() @ rb.matrix
+            rest_mat = rb.parent.matrix_local.inverted() @ rb.matrix_local
             pose_mat = pb.parent.matrix.inverted() @ pb.matrix
         else:
             # root bone fallback: use armature-space orientation
-            rest_mat = rb.matrix
+            rest_mat = rb.matrix_local
             pose_mat = pb.matrix
         rel_mat = rest_mat.inverted().to_3x3() @ pose_mat.to_3x3()
 
@@ -2346,287 +2434,52 @@ class SYNTH_OT_create_videos(Operator):
 
 
 
-# --------------------------- Export Pose Time Series Operator --------------------------
+# --------------------------- Pose Time Series (schema v2) ------------------------------
+#
+# CLAUDE FIX (A1-A9): the exchange format between this add-on and the 4D-reconstruction
+# module is now `pose_time_series/2`. The previous version exported
+# `parent_pose_bone.matrix.inverted() @ pose_bone.matrix`, which at rest equals the bone's
+# REST relative orientation rather than the identity, so it was not the quantity
+# LBS_edit.LBS consumes (a delta-from-rest rotation in template axes). The importer then
+# tried to repair that with a conjugation through `rest_rot_world`, walked a *linear* chain
+# instead of the real (branching) bone tree, and rebuilt the translation from the wrong
+# bone's rest vector.
+#
+# Convention, matching LBS_edit.LBS exactly:
+#     D(b)      = R_pose(b) @ R_rest(b)^-1                 (armature space)
+#     body_pose = expmap( D(parent)^-1 @ D(b) )            (== 0 in the rest pose)
+#     head(b)   = head(parent) + D(parent) @ (H(b) - H(parent)) * L(parent)
+#     world(b)  = Translation(head(b)) @ (D(b) @ R_rest(b))
+# See pose_time_series_schema_v2.md for the full specification.
+
+POSE_TIME_SERIES_SCHEMA = "pose_time_series/2"
+_PTS_ANG_EPS = 1e-12
+_PTS_VIRTUAL_WARN = 1e-3
 
 
-class SYNTH_OT_export_pose_time_series_json(Operator):
-    bl_idname = "synth.export_pose_time_series_json"
-    bl_label = "Export Pose Time Series (JSON)"
-    bl_description = "Export per-frame root position, bone relative rotations in exponential map and bone length scalings to a JSON file"
-
-    def _find_armature_for_scene(self, context):
-        p = context.scene.synth_props
-        try:
-            col = bpy.data.collections.get(p.collection_name)
-            if col:
-                obj = col.objects.get(p.object_name)
-                if obj:
-                    for mod in obj.modifiers:
-                        if mod.type == 'ARMATURE' and mod.object:
-                            return mod.object
-        except Exception:
-            return None
-
-    def execute(self, context):
-        scene = context.scene
-        p = scene.synth_props
-
-        arm_obj = self._find_armature_for_scene(context)
-        if arm_obj is None:
-            self.report({'ERROR'}, "No armature found (checked modifier on target object).")
-            return {'CANCELLED'}
-
-        # Use get_mesh_json to derive bone order, joint list and maps
-        mesh_info = get_mesh_json(context)
-        bone_names_ordered = mesh_info['bone_order']            # includes virtual bones appended
-        bone_names_tree = mesh_info['bone_names_tree']
-        virtual_bone_names = mesh_info['virtual_bone_names']
-        joints = mesh_info['J']                        # list of joint positions (object-space)
-        # compute rest lengths from joint positions: for bone -> (head_joint, tail_joint)
-        # For real bones, tail_joint is bone_to_joint[b], head_joint = parent of that tail (kintree parent)
-        parent_indices = mesh_info['kintree_table'][0]
-
-        # Build a quick map joint_index -> parent_joint_index (from kintree)
-        joint_to_parent = {i: parent_indices[i] for i in range(len(parent_indices))}
-
-        # rest lengths per bone (real + virtual)
-        bone_name_2_rest_length = {}
-        # we need head joint index for each bone:
-        for bname in bone_names_ordered:
-            tail_j = bone_names_tree[bname]['joints'][1] # index of tail joint controlled by this bone
-            head_j = joint_to_parent.get(tail_j, -1)
-            head_pos = Vector(joints[head_j])
-            tail_pos = Vector(joints[tail_j])
-            dist = float((tail_pos - head_pos).length)
-            bone_name_2_rest_length[bname] = dist if dist > 0.0 else 1.0
-
-        # Prepare path and timing
-        out_dir = resolve(p.annot_out_dir)
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"pose_time_series_{p.collection_name}_{p.object_name}.json")
-
-        deps = bpy.context.evaluated_depsgraph_get()
-        frame_start = scene.frame_start
-        frame_end = scene.frame_end
-        try:
-            fps = float(scene.render.fps) / float(scene.render.fps_base)
-        except Exception:
-            fps = float(scene.render.fps)
-
-        data = {
-            "meta": {
-                "armature": arm_obj.name,
-                "bone_order": bone_names_ordered,
-                "frame_start": int(frame_start),
-                "frame_end": int(frame_end),
-                "fps": float(fps),
-                "axis_order": "XYZ (Blender world coordinate convention)",
-                "units": "meters (world space)"
-            },
-            "frames": []
-        }
-
-        # iterate frames
-        for frame in range(frame_start, frame_end + 1):
-            scene.frame_set(frame)
-            deps.update()
-            arm_eval = arm_obj.evaluated_get(deps)
-            pose_bones = arm_eval.pose.bones
-
-            def get_virtual_bone_arm_space_matrix(virtual_bname):
-                if virtual_bname not in virtual_bone_names:
-                    self.report({'ERROR'}, f"Tried to construct virtual arm space matrix for {virtual_bname} which is not a virtual bone")
-                    raise Exception
-                p_name = bone_names_tree[virtual_bname]['p']
-                c_name = bone_names_tree[virtual_bname]['c'][0]
-                # ensure parent & child pose bones exist
-                if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
-                    self.report({'ERROR'}, f"Virtual bone {virtual_bname} refers to missing pose bones at frame {frame}")
-                    raise Exception
-                parent_pb = pose_bones[p_name]
-                child_pb = pose_bones[c_name]
-                # parent tail and child head in armature space
-                parent_tail_arm = Vector(parent_pb.tail)
-                child_head_arm = Vector(child_pb.head)
-                # direction vector in armature space (virtual bone's +Y)
-                dir_vec = child_head_arm - parent_tail_arm
-                dir_len = dir_vec.length
-                # Prepare parent rest rotation in armature space (3x3)
-                # bone_names_tree[p_name]['rest_rot_world'] is stored as 3x3 row lists (world-space)
-                rest_rot_rows = bone_names_tree.get(p_name, {}).get('rest_rot_world', None)
-                if rest_rot_rows is not None:
-                    # convert rows -> 3x3 Matrix (world)
-                    parent_rest_R_world = Matrix((
-                        (rest_rot_rows[0][0], rest_rot_rows[0][1], rest_rot_rows[0][2]),
-                        (rest_rot_rows[1][0], rest_rot_rows[1][1], rest_rot_rows[1][2]),
-                        (rest_rot_rows[2][0], rest_rot_rows[2][1], rest_rot_rows[2][2]),
-                    ))
-                    # convert to armature-space by pre-multiplying with arm_world_inv
-                    arm_world_inv_3 = arm_obj.matrix_world.inverted().to_3x3()
-                    parent_rest_R_arm = arm_world_inv_3 @ parent_rest_R_world
-                else:
-                    parent_rest_R_arm = Matrix.Identity(3)
-                if dir_len < 1e-8:
-                    # degenerate: child head coincident with parent tail -> use parent's rotation
-                    artificial_rot_3 = parent_pb.matrix.to_3x3()
-                else:
-                    y_axis = dir_vec.normalized()
-                    # pick stable reference from parent's REST axes in armature space
-                    # try parent's rest Z (bone local +Z) in armature space
-                    ref_candidate = parent_rest_R_arm @ Vector((0.0, 0.0, 1.0))
-                    # if parallel to y_axis, try local X
-                    if abs(ref_candidate.normalized().dot(y_axis)) > 0.999:
-                        ref_candidate = parent_rest_R_arm @ Vector((1.0, 0.0, 0.0))
-                        # compute z = ref × y, normalize. If degenerate, error out
-                        z_axis = ref_candidate.cross(y_axis)
-                        if z_axis.length < 1e-8:
-                            self.report({'ERROR'}, f"Failed to construct coordinate frame for virtual bone {virtual_bname}: failed to construct z axis")
-                            raise Exception
-                        else:
-                            z_axis.normalize()
-                        x_axis = y_axis.cross(z_axis)
-                    else:
-                        x_axis = ref_candidate.cross(y_axis)
-                        if x_axis.length < 1e-8:
-                            self.report({'ERROR'}, f"Failed to construct coordinate frame for virtual bone {virtual_bname}: failed to construct x axis")
-                            raise Exception
-                        else:
-                            x_axis.normalize()
-                        z_axis = y_axis.cross(x_axis)
-                    # assemble rotation matrix with columns [x, y, z] (local->armature)
-                    # Matrix expects rows; building from column vectors and transposing
-                    artificial_rot_3 = Matrix((x_axis, y_axis, z_axis)).transposed()
-                # build artificial 4x4 matrix in armature space: translation = parent_tail_arm, rotation = artificial_rot_3
-                artificial_virtual_mat = Matrix.Translation(parent_tail_arm) @ artificial_rot_3.to_4x4()
-                return artificial_virtual_mat
-
-            # root: first bone in bone_names must be a real bone (it was originally from ordered bones)
-            first_bone = bone_names_ordered[0]
-            if first_bone not in pose_bones:
-                self.report({'ERROR'}, f"Root bone '{first_bone}' missing in pose at frame {frame}")
-                return {'CANCELLED'}
-
-            pb_root = pose_bones[first_bone]
-            # root global translation: use root bone head in world space
-            root_bone_translation_world = arm_eval.matrix_world @ Vector(pb_root.head)
-            root_bone_rot_matrix_world = arm_eval.matrix_world @ pb_root.matrix
-            root_ori_world = root_bone_rot_matrix_world.to_3x3().to_quaternion().to_exponential_map()
-
-            global_t = [float(root_bone_translation_world.x), float(root_bone_translation_world.y), float(root_bone_translation_world.z)]
-            global_ori = [float(root_ori_world.x), float(root_ori_world.y), float(root_ori_world.z)]
-
-            body_pose = []
-            body_bone_length = []
-
-            # iterate bone_names in order, skipping the first (root)
-            queue = [node for node, p_c_dict in bone_names_tree.items() if not p_c_dict['p']]
-            while queue:
-                bname = queue.pop(0)
-                if bone_names_tree[bname]['p'] != '': # skip root bone (root bone was captured through global_ori, global_t)
-
-                    # Real bone: present in pose_bones
-                    if bname in pose_bones:
-                        pb = pose_bones[bname]
-                        parent_bname = bone_names_tree[bname]['p']
-                        if parent_bname in pose_bones:
-                            parent_pb_matrix = pose_bones[parent_bname].matrix
-                        elif parent_bname in virtual_bone_names:
-                            # construct matrix of virtual bone parent
-                            try:
-                                parent_pb_matrix = get_virtual_bone_arm_space_matrix(parent_bname)
-                            except Exception:
-                                return {'CANCELLED'}
-                        else:
-                            self.report({'ERROR'}, f"Pose bone {bname} unexpectedly has no parent at frame {frame}")
-                            return {'CANCELLED'}
-                        rel_mat = parent_pb_matrix.inverted() @ pb.matrix
-                        q = rel_mat.to_3x3().to_quaternion()
-                        exp_map = q.to_exponential_map()
-                        body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
-
-                        # length scaling using world head/tail
-                        world_head = arm_eval.matrix_world @ Vector(pb.head)
-                        world_tail = arm_eval.matrix_world @ Vector(pb.tail)
-                        cur_len = float((world_tail - world_head).length)
-                        rest_len = bone_name_2_rest_length.get(bname, 1.0)
-                        length_factor = cur_len / rest_len if rest_len != 0 else 1.0
-                        body_bone_length.append(length_factor)
-
-                    # Virtual bone
-                    elif bname in virtual_bone_names:
-                        p_name = bone_names_tree[bname]['p']
-                        c_name = bone_names_tree[bname]['c'][0]
-                        # ensure parent & child pose bones exist
-                        if (p_name not in [b.name for b in pose_bones]) or (c_name not in [b.name for b in pose_bones]):
-                            self.report({'ERROR'}, f"Virtual bone {bname} refers to missing pose bones at frame {frame}")
-                            raise Exception
-                        parent_pb = pose_bones[p_name]
-                        child_pb = pose_bones[c_name]
-                        # parent tail and child head in armature space
-                        parent_tail_arm = Vector(parent_pb.tail)
-                        child_head_arm = Vector(child_pb.head)
-                        # Now compute rel_mat exactly like for real bones
-                        try:
-                            rel_mat = parent_pb.matrix.inverted() @ get_virtual_bone_arm_space_matrix(bname)
-                        except Exception:
-                            return {'CANCELLED'}
-
-                        # extract rotation as exponential map
-                        q = rel_mat.to_3x3().to_quaternion()
-                        exp_map = q.to_exponential_map()
-                        body_pose.append([float(exp_map.x), float(exp_map.y), float(exp_map.z)])
-
-                        # length scaling in world space
-                        world_parent_tail = arm_eval.matrix_world @ parent_tail_arm
-                        world_child_head = arm_eval.matrix_world @ child_head_arm
-                        cur_dist = float((world_child_head - world_parent_tail).length)
-                        rest_len = bone_name_2_rest_length.get(bname, 1.0)
-                        length_factor = cur_dist / rest_len if rest_len != 0 else 1.0
-                        body_bone_length.append(length_factor)
-                    
-                    else:
-                        self.report({'ERROR'}, f"Bone {bname} appears in neither pose_bones nor virtual_bone_names")
-                        return {'CANCELLED'}
-                    
-                for ch in bone_names_tree[bname]['c']:
-                    queue.append(ch)
-
-            frame_entry = {
-                "frame": int(frame),
-                "time": float((frame - frame_start) / fps),
-                "global_t": global_t,
-                "global_ori": global_ori,
-                "body_pose": body_pose,
-                "body_bone_length": body_bone_length
-            }
-            data["frames"].append(frame_entry)
-
-        # write json
-        with open(out_path, 'w') as jf:
-            json.dump(data, jf, indent=2)
-
-        self.report({'INFO'}, f"Wrote pose time series JSON to {out_path}")
-        return {'FINISHED'}
+def _rot3(mat):
+    """Orthonormal 3x3 rotation part of a possibly scaled/sheared matrix."""
+    return mat.to_3x3().to_quaternion().to_matrix()
 
 
+def _expmap(rot3):
+    return rot3.to_quaternion().to_exponential_map()
 
-# --------------------------- Pose Time Series to Animation Operator --------------------------
 
+def _from_expmap(vec):
+    v = Vector(vec)
+    a = v.length
+    if a < _PTS_ANG_EPS:
+        return Matrix.Identity(3)
+    return Matrix.Rotation(a, 3, v / a)
 
-def _expmap_to_rotation_matrix_4x4(exp_map_vec):
-    """Convert an exponential-map 3-vector into a 4x4 rotation matrix (no translation)."""
-    v = Vector(exp_map_vec)
-    angle = v.length
-    if angle == 0.0:
-        return Matrix.Identity(4)
-    axis = v / angle
-    return Matrix.Rotation(angle, 4, axis)
 
 def _matrix3_from_rows(rows):
     """Build a 3x3 Matrix from nested list-of-rows as stored in get_mesh_json."""
     return Matrix(((rows[0][0], rows[0][1], rows[0][2]),
                    (rows[1][0], rows[1][1], rows[1][2]),
                    (rows[2][0], rows[2][1], rows[2][2])))
+
 
 def _ensure_collection(name):
     coll = bpy.data.collections.get(name)
@@ -2635,263 +2488,452 @@ def _ensure_collection(name):
         bpy.context.scene.collection.children.link(coll)
     return coll
 
-def create_animation_from_pose_time_series(context, timeseries_path):
+
+def _frame_from_y_and_ref(y_axis, ref):
+    """Orthonormal frame with +Y along `y_axis`, rolled by `ref`.
+
+    Same construction as get_virtual_bone_rest_matrix_from_bones, so a virtual bone's posed
+    frame collapses onto its rest frame when the rig is in its rest pose.
     """
-    Reads a timeseries JSON and creates a reconstruction in 'Reconstructions' using
-    per-bone rest-rotation matrices (rest_rot) to conjugate/export rotations exactly.
-    Returns (new_arm_obj, new_mesh_obj).
+    y = y_axis.normalized()
+    if abs(ref.normalized().dot(y)) > 0.999:
+        ref = ref.orthogonal()
+    x = ref.cross(y)
+    if x.length < 1e-8:
+        raise ValueError("degenerate x axis while building a virtual bone frame")
+    x.normalize()
+    z = y.cross(x)
+    return Matrix((x, y, z)).transposed()          # columns = x, y, z
+
+
+def _pts_rest_tables(mesh_info, arm_obj):
+    """Rest geometry of every bone (real + virtual) in ARMATURE space."""
+    order = list(mesh_info["bone_order"])
+    tree = mesh_info["bone_names_tree"]
+    virtual = set(mesh_info["virtual_bone_names"])
+    joints = mesh_info["J"]
+    joint_parent = mesh_info["kintree_table"][0]
+
+    roots = [b for b in order if not tree[b]["p"]]
+    if len(roots) != 1:
+        raise ValueError(f"pose_time_series requires exactly one root bone, found {roots}")
+    if order[0] != roots[0]:
+        raise ValueError("bone_order[0] is not the root bone")
+
+    aw_inv3 = arm_obj.matrix_world.inverted().to_3x3()
+    rest_R, rest_head, rest_len = {}, {}, {}
+    for b in order:
+        tail_j = tree[b]["joints"][1]
+        head_j = joint_parent[tail_j]
+        rest_head[b] = Vector(joints[head_j])
+        rest_len[b] = float((Vector(joints[tail_j]) - rest_head[b]).length) or 1.0
+        rows = tree[b].get("rest_rot")
+        if rows:
+            rest_R[b] = _matrix3_from_rows(rows)                      # already armature space
+        else:
+            # legacy template: rest_rot_world was pre-multiplied by arm.matrix_world
+            rest_R[b] = _rot3((aw_inv3 @ _matrix3_from_rows(tree[b]["rest_rot_world"])).to_4x4())
+    return order, tree, virtual, rest_R, rest_head, rest_len
+
+
+def _pts_posed_armature_space(order, tree, virtual, rest_R, pose_bones):
+    """Return (P, D, seg) for one frame, all in armature space.
+
+    P[b]   4x4 pose matrix of the bone (synthesised for virtual bones)
+    D[b]   3x3 delta-from-rest rotation  (R_pose @ R_rest^-1)
+    seg[b] posed head->tail length of the bone
     """
-    scene = context.scene
-    p = scene.synth_props
+    P, D, seg = {}, {}, {}
+    for b in order:                                     # BFS order: parents come first
+        parent = tree[b]["p"]
+        if b in virtual:
+            child = tree[b]["c"][0]
+            if parent not in pose_bones or child not in pose_bones:
+                raise ValueError(f"virtual bone '{b}' references missing pose bones")
+            head = Vector(pose_bones[parent].tail)
+            gap = Vector(pose_bones[child].head) - head
+            # CLAUDE FIX (B15): degenerate gaps are an error, not a silent fallback to the
+            # parent's posed rotation (which disagreed with the rest-side construction).
+            if gap.length < 1e-8:
+                raise ValueError(f"virtual bone '{b}' is degenerate in this frame")
+            # CLAUDE FIX (B16): the roll reference is the parent's POSED local Z, not its rest Z.
+            # With the rest Z, a rigid rotation of the parent gave the virtual bone a spurious
+            # twist, contradicting `virtual_bone_mask` (LBS forces virtual bones to identity).
+            ref = D[parent] @ (rest_R[parent] @ Vector((0.0, 0.0, 1.0)))
+            P[b] = Matrix.Translation(head) @ _frame_from_y_and_ref(gap, ref).to_4x4()
+            seg[b] = float(gap.length)
+        else:
+            pb = pose_bones[b]
+            P[b] = pb.matrix.copy()
+            seg[b] = float((Vector(pb.tail) - Vector(pb.head)).length)
+        D[b] = _rot3(P[b]) @ rest_R[b].inverted()
+    return P, D, seg
 
-    # 1) load timeseries JSON
-    with open(timeseries_path, 'r') as f:
-        ts = json.load(f)
 
-    meta = ts.get('meta', {})
-    bone_order_ts = meta.get('bone_order')
-    bone_rest_rot_world_ts = meta.get('bone_rest_rot_world') # should be dict of bone_name -> 3x3 row lists
+def _pts_solve_frame(entry, order, tree, rest_R, rest_head, arm_world):
+    """Armature-space pose matrices for every bone of one frame (normative chain)."""
+    root = order[0]
+    idx = {b: i - 1 for i, b in enumerate(order) if i}
 
-    mesh_info = get_mesh_json(context)
+    aw_inv = arm_world.inverted()
+    awR = _rot3(arm_world)
 
-    bone_order_mesh = mesh_info['bone_order']
-    bone_names_tree = mesh_info['bone_names_tree']   # each node has p,c,joints,rest_rot_world (3x3 lists)
-    virtual_bone_names = set(mesh_info.get('virtual_bone_names', []))
-    bone_to_joint = {bname: data['joints'][1] for bname, data in bone_names_tree.items()}
-    joints = mesh_info['J']
-    kintree_parent = mesh_info['kintree_table'][0]
+    body_pose = entry.get("body_pose", [])
+    body_len = entry.get("body_bone_length", [])
+    if len(body_pose) != len(order) - 1 or len(body_len) != len(order) - 1:
+        raise ValueError("body_pose / body_bone_length length does not match bone_order")
 
-    # we'll use meta bone order (the exporter order). We warn if it differs from current mesh
-    exported_bone_order = bone_order_ts
-    if exported_bone_order != bone_order_mesh:
-        print("Warning: timeseries bone order differs from mesh bone order; proceeding with timeseries order.")
+    L = {root: float(entry.get("root_bone_length", 1.0))}
+    for b in order[1:]:
+        L[b] = float(body_len[idx[b]])
 
-    # 3) locate source object + its armature
+    D = {root: awR.inverted() @ _from_expmap(entry["global_ori"])}
+    head = {root: aw_inv @ Vector(entry["global_t"])}
+    P = {}
+    for b in order:
+        parent = tree[b]["p"]
+        if parent:
+            D[b] = D[parent] @ _from_expmap(body_pose[idx[b]])
+            head[b] = head[parent] + D[parent] @ ((rest_head[b] - rest_head[parent]) * L[parent])
+        P[b] = Matrix.Translation(head[b]) @ (D[b] @ rest_R[b]).to_4x4()
+    return P
+
+
+def _pts_find_source(context):
+    """(source mesh object, its armature) for the object selected in the UI."""
+    p = context.scene.synth_props
     col = bpy.data.collections.get(p.collection_name)
     if col is None:
         raise ValueError(f"Collection '{p.collection_name}' not found")
-    src_obj = col.objects.get(p.object_name)
-    if src_obj is None:
-        raise ValueError(f"Object '{p.object_name}' not found in collection '{p.collection_name}'")
-
-    src_arm = None
-    for mod in src_obj.modifiers:
+    obj = col.objects.get(p.object_name)
+    if obj is None:
+        raise ValueError(f"Object '{p.object_name}' not found in '{p.collection_name}'")
+    arm = None
+    for mod in obj.modifiers:
         if mod.type == 'ARMATURE' and mod.object:
-            src_arm = mod.object
+            arm = mod.object
             break
-    if src_arm is None:
-        raise ValueError("Source object has no armature modifier.")
+    if arm is None:
+        raise ValueError("Target object has no armature modifier.")
+    return obj, arm
 
-    # 4) duplicate object and armature into Reconstructions collection
-    recon_coll = _ensure_collection("Reconstructions")
 
+class SYNTH_OT_export_pose_time_series_json(Operator):
+    bl_idname = "synth.export_pose_time_series_json"
+    bl_label = "Export Pose Time Series (JSON)"
+    bl_description = ("Export per-frame root position, delta-from-rest bone rotations "
+                      "(exponential map, template axes) and bone length factors to a "
+                      "pose_time_series/2 JSON file")
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        # CLAUDE FIX (B12): every failure path returns {'CANCELLED'}; the old code raised a bare
+        # Exception out of execute() for some of them, which surfaced as an operator traceback.
+        try:
+            _, arm_obj = _pts_find_source(context)
+            mesh_info = get_mesh_json(context)
+            order, tree, virtual, rest_R, rest_head, rest_len = _pts_rest_tables(mesh_info, arm_obj)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Template inspection failed: {exc}")
+            return {'CANCELLED'}
+
+        root = order[0]
+        out_dir = resolve(p.annot_out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"pose_time_series_{p.collection_name}_{p.object_name}.json")
+
+        deps = context.evaluated_depsgraph_get()
+        frame_start, frame_end = scene.frame_start, scene.frame_end
+        try:
+            fps = float(scene.render.fps) / float(scene.render.fps_base)
+        except Exception:
+            fps = float(scene.render.fps)
+
+        data = {
+            "meta": {
+                "schema": POSE_TIME_SERIES_SCHEMA,
+                "producer": "synthetic_data_generator_ui.py",
+                "armature": arm_obj.name,
+                "bone_order": order,
+                "body_pose_bone_order": order[1:],
+                "virtual_bone_names": sorted(virtual),
+                "virtual_bone_mask": [1 if b in virtual else 0 for b in order],
+                "rotation": "axis_angle_exponential_map",
+                "space": ("global_t/global_ori in Blender world; body_pose in template "
+                          "(armature) axes, delta from rest"),
+                "units": "meters",
+                "frame_start": int(frame_start),
+                "frame_end": int(frame_end),
+                "fps": float(fps),
+            },
+            "frames": [],
+        }
+
+        original_frame = scene.frame_current
+        virtual_warned = False
+        try:
+            for frame in range(frame_start, frame_end + 1):
+                scene.frame_set(frame)
+                deps.update()
+                arm_eval = arm_obj.evaluated_get(deps)
+                pose_bones = arm_eval.pose.bones
+
+                try:
+                    P, D, seg = _pts_posed_armature_space(order, tree, virtual, rest_R, pose_bones)
+                except Exception as exc:
+                    self.report({'ERROR'}, f"Frame {frame}: {exc}")
+                    return {'CANCELLED'}
+
+                arm_world = arm_eval.matrix_world
+                global_t = arm_world @ Vector(P[root].translation)
+                global_ori = _expmap(_rot3(arm_world) @ D[root])
+
+                body_pose, body_len = [], []
+                for b in order[1:]:
+                    exp = _expmap(D[tree[b]["p"]].inverted() @ D[b])
+                    if b in virtual and exp.length > _PTS_VIRTUAL_WARN and not virtual_warned:
+                        virtual_warned = True
+                        self.report({'WARNING'},
+                                    f"virtual bone '{b}' rotates by {exp.length:.3f} rad at frame "
+                                    f"{frame}; LBS forces virtual bones to identity, so the "
+                                    f"reconstruction cannot reproduce this rig exactly.")
+                    body_pose.append([float(exp.x), float(exp.y), float(exp.z)])
+                    body_len.append(float(seg[b] / rest_len[b]))
+
+                entry = {
+                    "frame": int(frame),
+                    "time": float((frame - frame_start) / fps) if fps else 0.0,
+                    "global_t": [float(global_t.x), float(global_t.y), float(global_t.z)],
+                    "global_ori": [float(global_ori.x), float(global_ori.y), float(global_ori.z)],
+                    "body_pose": body_pose,
+                    "body_bone_length": body_len,
+                }
+                root_len = float(seg[root] / rest_len[root])
+                if abs(root_len - 1.0) > 1e-6:
+                    # the reconstruction pins the root bone's length to 1.0 (fish_model prepends a
+                    # 1.0), so this field is only honoured on a Blender -> Blender round trip
+                    entry["root_bone_length"] = root_len
+                data["frames"].append(entry)
+        finally:
+            scene.frame_set(original_frame)
+
+        try:
+            with open(out_path, 'w') as jf:
+                json.dump(data, jf, indent=2)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not write {out_path}: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Wrote {len(data['frames'])} frames to {out_path}")
+        return {'FINISHED'}
+
+
+def _pts_disconnect_bones(context, arm_obj, report=None):
+    """`use_connect` locks a pose bone's location channel; bone length factors need it free."""
+    view_layer = context.view_layer
+    prev_active = view_layer.objects.active
+    try:
+        view_layer.objects.active = arm_obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        for eb in arm_obj.data.edit_bones:
+            eb.use_connect = False
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception as exc:
+        if report:
+            report({'WARNING'}, f"Could not disconnect bones ({exc}); bone length factors other "
+                                f"than 1.0 will be ignored.")
+    finally:
+        try:
+            view_layer.objects.active = prev_active
+        except Exception:
+            pass
+
+
+def create_animation_from_pose_time_series(context, timeseries_path, report=None):
+    """Rebuild a Blender animation from a pose_time_series/2 JSON.
+
+    Returns (new_arm_obj, new_mesh_obj).
+    """
+    scene = context.scene
+
+    with open(timeseries_path, 'r') as f:
+        ts = json.load(f)
+    meta = ts.get("meta", {})
+    if meta.get("schema") != POSE_TIME_SERIES_SCHEMA:
+        raise ValueError(
+            f"expected schema '{POSE_TIME_SERIES_SCHEMA}', got '{meta.get('schema')}'. "
+            f"Files written before this fix fold each bone's rest orientation into the pose "
+            f"channel and cannot be converted without the rig they came from; re-export them."
+        )
+
+    src_obj, src_arm = _pts_find_source(context)
+    mesh_info = get_mesh_json(context)
+    order, tree, virtual, rest_R, rest_head, rest_len = _pts_rest_tables(mesh_info, src_arm)
+
+    # CLAUDE FIX (A8): a bone-order mismatch used to be a print. The importer indexes
+    # `bone_names_tree`, `J` and `kintree_table` from the CURRENT template while walking the
+    # FILE's order, so a mismatch silently produces garbage. Refuse instead.
+    if list(meta.get("bone_order", [])) != order:
+        raise ValueError("bone_order in the JSON does not match the current template; refusing to "
+                         "import because the bone indices would be silently wrong.")
+
+    # ---- duplicate object + armature into 'Reconstructions'
+    recon = _ensure_collection("Reconstructions")
     new_obj = src_obj.copy()
     new_obj.data = src_obj.data.copy()
-    recon_coll.objects.link(new_obj)
+    new_obj.animation_data_clear()
+    recon.objects.link(new_obj)
 
     new_arm = src_arm.copy()
     new_arm.data = src_arm.data.copy()
-    recon_coll.objects.link(new_arm)
+    new_arm.animation_data_clear()
+    recon.objects.link(new_arm)
 
-    # make mesh point to duplicated armature
     for mod in new_obj.modifiers:
         if mod.type == 'ARMATURE':
             mod.object = new_arm
+    # parent the mesh to the duplicated armature so that it inherits the per-frame `scale`
+    new_obj.parent = new_arm
+    new_obj.matrix_parent_inverse = Matrix.Identity(4)
+    new_obj.matrix_local = src_arm.matrix_world.inverted() @ src_obj.matrix_world
 
-    # 5) create action on duplicated armature
+    _pts_disconnect_bones(context, new_arm, report)
+
     action = bpy.data.actions.new(name=f"recon_action_{new_arm.name}")
     new_arm.animation_data_create()
     new_arm.animation_data.action = action
 
     pose_bones = new_arm.pose.bones
-    pose_bone_names = {pb.name for pb in pose_bones}
+    data_bones = new_arm.data.bones
+    base_world = src_arm.matrix_world.copy()
+    new_arm.rotation_mode = 'QUATERNION'
 
-    # helper: get rest head->tail vector (object-space) using J & kintree
-    def rest_head_tail_vector_for_bonename(bname):
-        tail_idx = bone_to_joint.get(bname, None)
-        parent_idx = kintree_parent[tail_idx]
-        if parent_idx is None or parent_idx < 0:
-            return Vector((0.0, 0.1, 0.0))
-        head_pos = Vector(joints[parent_idx])
-        tail_pos = Vector(joints[tail_idx])
-        return (tail_pos - head_pos)
+    # CLAUDE FIX (A7): rotation_mode must be set BEFORE any matrix is written, otherwise the
+    # decomposition lands in a different channel than the one that gets keyframed.
+    for pb in pose_bones:
+        pb.rotation_mode = 'QUATERNION'
 
-    # precompute rest vectors and rest rotations (as 3x3 Matrices) for all exported bones
-    bone_rest_vecs = {}
-    bone_rest_Rs_world = {}   # 3x3 Matrix for each exported bone
-    for bname in exported_bone_order:
-        rows = bone_names_tree[bname]['rest_rot_world']
-        bone_rest_Rs_world[bname] = _matrix3_from_rows(rows)
-        # check if rest_rot_world is still accurate
-        rows = bone_rest_rot_world_ts[bname]
-        rest_rot_world_ts = _matrix3_from_rows(rows)
-        bone_rest_vecs[bname] = rest_head_tail_vector_for_bonename(bname)
+    frames = ts["frames"]
+    for entry in frames:
+        f = int(entry["frame"])
+        s = float(entry.get("scale", 1.0) or 1.0)
+        arm_world = base_world @ Matrix.Scale(s, 4)
+        new_arm.matrix_world = arm_world
+        new_arm.keyframe_insert(data_path="location", frame=f)
+        new_arm.keyframe_insert(data_path="rotation_quaternion", frame=f)
+        new_arm.keyframe_insert(data_path="scale", frame=f)
 
+        P = _pts_solve_frame(entry, order, tree, rest_R, rest_head, arm_world)
 
-    arm_world = new_arm.matrix_world
-
-    # iterate frames and set pose
-    for frame_entry in ts['frames']:
-        frame_idx = int(frame_entry['frame'])
-        frame_num = frame_idx
-
-        scale_val = frame_entry.get('scale', None)
-        scale_float = None
-        if scale_val is not None:
-            try:
-                scale_float = float(scale_val)
-            except (TypeError, ValueError):
-                scale_float = None
-        if scale_float is not None:
-            scale_vec = Vector((scale_float, scale_float, scale_float))
-            new_obj.scale = scale_vec
-            new_arm.scale = scale_vec
-            new_obj.keyframe_insert(data_path="scale", frame=frame_num)
-            new_arm.keyframe_insert(data_path="scale", frame=frame_num)
-
-        # root global transform from timeseries
-        global_t = Vector(frame_entry['global_t'])
-        root_bone_local_ori = Quaternion(frame_entry['global_ori']).to_matrix().to_4x4()
-        root_rest_rot_world = bone_rest_Rs_world.get(exported_bone_order[0]).to_4x4()  # convert to 4x4 for conjugation
-        root_bone_world_ori = root_rest_rot_world @ root_bone_local_ori @ root_rest_rot_world.transposed()
-        root_bone_world_frame = Matrix.Translation(global_t) @ root_bone_world_ori
-
-        # start chain with root_world_frame as parent_world
-        parent_world = root_bone_world_frame
-        parent_name = exported_bone_order[0]
-
-        # store already computed world transforms
-        bone_world_matrices = {
-            parent_name: parent_world.copy()
-        }
-
-        body_pose_list = frame_entry.get('body_pose')
-        body_len_list = frame_entry.get('body_bone_length')
-
-        # iterate exported bones in order
-        for i, bname in enumerate(exported_bone_order):
-            
-            if i == 0:
-                # root: set its pose bone transform if present
-                if bname in pose_bone_names:
-                    pb = pose_bones[bname]
-                    pb.matrix = arm_world.inverted() @ parent_world
-                    pb.rotation_mode = 'QUATERNION'
-                    pb.keyframe_insert(data_path="location", frame=frame_num)
-                    pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
-
-                bone_world_matrices[bname] = parent_world.copy()
-                parent_name = bname
-
-                # continue, parent_world remains as is
+        for b in order:
+            if b in virtual:
+                continue                                   # chain-only, no Blender bone
+            db = data_bones.get(b)
+            if db is None:
                 continue
+            # Blender's parent, NOT the tree parent: virtual bones do not exist in the armature
+            bl_parent = db.parent
+            if bl_parent is None:
+                basis = db.matrix_local.inverted() @ P[b]
+            else:
+                rest_rel = bl_parent.matrix_local.inverted() @ db.matrix_local
+                basis = rest_rel.inverted() @ (P[bl_parent.name].inverted() @ P[b])
+            pb = pose_bones[b]
+            # CLAUDE FIX (A7): write matrix_basis, not pose_bone.matrix. The `matrix` setter
+            # solves against the parent's *currently evaluated* matrix, so writing parents and
+            # children in the same tick without a depsgraph update solved children against a
+            # stale parent. matrix_basis is purely local and has no such dependency.
+            pb.matrix_basis = basis
+            pb.keyframe_insert(data_path="location", frame=f)
+            pb.keyframe_insert(data_path="rotation_quaternion", frame=f)
+            pb.keyframe_insert(data_path="scale", frame=f)
 
+    if frames:
+        scene.frame_start = int(meta.get("frame_start", frames[0]["frame"]))
+        scene.frame_end = int(meta.get("frame_end", frames[-1]["frame"]))
 
-            # lookup actual parent from hierarchy
-            expected_parent_name = bone_names_tree[bname]['p']
-
-            # if traversal moved to another branch, load correct parent transform
-            if expected_parent_name is not None and expected_parent_name != parent_name:
-                parent_world = bone_world_matrices[expected_parent_name]
-                parent_name = expected_parent_name
-
-            entry_idx = i - 1 # root bone is excluded from body pose, thus decrement index
-
-            bone_rest_space_ori = Matrix.Identity(4)  # default to identity if no pose provided for this bone
-            length_scale = 1.0
-
-            if entry_idx < len(body_pose_list):
-                bone_rest_space_ori = Quaternion(body_pose_list[entry_idx]).to_matrix().to_4x4()
-
-                if entry_idx < len(body_len_list):
-                    length_scale = float(body_len_list[entry_idx])
-
-            # Now *conjugate* rest space rotation into world frame using bones rest_rot_world:
-            # bone_ori_world = bone_rest_rot_world * bone_rest_space_ori * bone_rest_rot_world^-1
-            bone_rest_rot_world = bone_rest_Rs_world.get(bname).to_4x4()
-            bone_world_ori = (
-                bone_rest_rot_world
-                @ bone_rest_space_ori
-                @ bone_rest_rot_world.transposed()
-            )
-
-            # Build translation using PARENT orientation
-            rest_vec = bone_rest_vecs[bname] * length_scale
-
-            parent_rot_world = parent_world.to_3x3()
-
-            bone_translation_vec = parent_rot_world @ rest_vec
-
-            local_translation = Matrix.Translation(bone_translation_vec)
-
-            # hierarchical propagation
-            tail_joint_world = (
-                parent_world
-                @ local_translation
-                @ bone_world_ori
-            )
-
-            # if virtual bone, do not set pose
-            if bname in virtual_bone_names:
-                bone_world_matrices[bname] = tail_joint_world.copy()
-                parent_world = tail_joint_world
-                parent_name = bname
-                continue
-
-            pb = pose_bones[bname]
-
-            pb.matrix = arm_world.inverted() @ tail_joint_world
-            pb.rotation_mode = 'QUATERNION'
-
-            pb.keyframe_insert(data_path="location", frame=frame_num)
-            pb.keyframe_insert(data_path="rotation_quaternion", frame=frame_num)
-
-            # propagate hierarchy
-            bone_world_matrices[bname] = tail_joint_world.copy()
-            parent_world = tail_joint_world
-            parent_name = bname
-
-    # finalize
-    new_arm.animation_data.action = action
-    bpy.context.view_layer.update()
-
+    context.view_layer.update()
     return new_arm, new_obj
 
-# ----------------------
-# Operator: file selector wrapper
-# ----------------------
+
 class SYNTH_OT_create_animation_from_pose_time_series(Operator, ImportHelper):
-    """Create animation on duplicated object from pose_time_series.json"""
+    """Create an animation on a duplicated object from a pose_time_series/2 JSON"""
     bl_idname = "synth.create_animation_from_pose_time_series"
     bl_label = "Create Animation from Pose Time Series"
     bl_options = {'REGISTER', 'UNDO'}
 
-    # ImportHelper provides a filepath property
     filename_ext = ".json"
-    filter_glob: StringProperty(
-        default="pose_time_series_*.json;*.json",
-        options={'HIDDEN'}
-    )
+    filter_glob: StringProperty(default="pose_time_series_*.json;*.json", options={'HIDDEN'})
 
     def execute(self, context):
         try:
-            new_arm, new_obj = create_animation_from_pose_time_series(context, self.filepath)
-            self.report({'INFO'}, f"Created reconstruction '{new_obj.name}' with animated armature '{new_arm.name}' in collection 'Reconstructions'")
-            return {'FINISHED'}
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to create animation: {e}")
+            new_arm, new_obj = create_animation_from_pose_time_series(
+                context, self.filepath, report=self.report)
+        except Exception as exc:
             import traceback
             traceback.print_exc()
+            self.report({'ERROR'}, f"Failed to create animation: {exc}")
             return {'CANCELLED'}
+        self.report({'INFO'}, f"Created '{new_obj.name}' + '{new_arm.name}' in 'Reconstructions'")
+        return {'FINISHED'}
 
     def invoke(self, context, event):
-        # show the file selector
-        wm = context.window_manager
-        wm.fileselect_add(self)
+        context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
-    
 
 
+class SYNTH_OT_verify_pose_time_series_roundtrip(Operator, ImportHelper):
+    """Re-solve a pose_time_series JSON and compare it against the live armature"""
+    bl_idname = "synth.verify_pose_time_series_roundtrip"
+    bl_label = "Verify Pose Time Series Round Trip"
+    bl_description = ("Recompute every pose bone matrix from the JSON and compare it, frame by "
+                      "frame, against the source armature. Reports the max absolute error.")
+
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="pose_time_series_*.json;*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _, src_arm = _pts_find_source(context)
+            with open(self.filepath) as f:
+                ts = json.load(f)
+            if ts.get("meta", {}).get("schema") != POSE_TIME_SERIES_SCHEMA:
+                raise ValueError(f"not a {POSE_TIME_SERIES_SCHEMA} file")
+            mesh_info = get_mesh_json(context)
+            order, tree, virtual, rest_R, rest_head, _ = _pts_rest_tables(mesh_info, src_arm)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        deps = context.evaluated_depsgraph_get()
+        original = scene.frame_current
+        worst, worst_bone, worst_frame = 0.0, "", -1
+        try:
+            for entry in ts["frames"]:
+                f = int(entry["frame"])
+                scene.frame_set(f)
+                deps.update()
+                arm_eval = src_arm.evaluated_get(deps)
+                P_ref, _, _ = _pts_posed_armature_space(order, tree, virtual, rest_R,
+                                                        arm_eval.pose.bones)
+                P = _pts_solve_frame(entry, order, tree, rest_R, rest_head, arm_eval.matrix_world)
+                for b in order:
+                    err = max(abs(P[b][r][c] - P_ref[b][r][c]) for r in range(4) for c in range(4))
+                    if err > worst:
+                        worst, worst_bone, worst_frame = err, b, f
+        except Exception as exc:
+            self.report({'ERROR'}, f"Verification failed: {exc}")
+            return {'CANCELLED'}
+        finally:
+            scene.frame_set(original)
+
+        level = 'INFO' if worst < 1e-5 else 'WARNING'
+        self.report({level}, f"round-trip max |err| = {worst:.3e} "
+                             f"(bone '{worst_bone}', frame {worst_frame})")
+        return {'FINISHED'}
 
 
 # --------------------------- UI & Registration ----------------------------------
@@ -3062,6 +3104,8 @@ class SYNTH_PT_main_panel(Panel):
         row = layout.row()
         row.operator('synth.export_pose_time_series_json', icon='SEQUENCE')
         row.operator('synth.create_animation_from_pose_time_series', icon='IMPORT')
+        row = layout.row()
+        row.operator('synth.verify_pose_time_series_roundtrip', icon='CHECKMARK')
 
 
 class SYNTH_OT_unregister_timed_render(Operator):
@@ -3100,6 +3144,7 @@ classes = (
     SYNTH_OT_create_videos,
     SYNTH_OT_export_pose_time_series_json,
     SYNTH_OT_create_animation_from_pose_time_series,
+    SYNTH_OT_verify_pose_time_series_roundtrip,
 )
 
 

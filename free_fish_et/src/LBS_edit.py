@@ -38,18 +38,31 @@ class LBS():
         # the head joint is just the origin of the mesh. it is excluded
         self.n_body_joints = J.shape[1] - 1
 
-        # CLAUDE FIX: `joints_homog` holds the rest position of *the joint each transform belongs to*.
-        # Entry k of the transform chain describes joint k+1 (the head joint is excluded), so the
-        # rest-pose reference for entry k must be J[k+1] -- i.e. `J[:, 1:]`. This is what makes the
-        # skinning transform reduce to the identity at zero pose, so that calling the model with a
-        # zero pose, unit bone lengths and unit scale returns the template mesh unchanged.
-        # (See `assert_rest_pose_is_identity()` below, which asserts exactly that.)
-        self.joints_homog = F.pad((J[:, 1:]).unsqueeze(-1), [0, 0, 0, 1], value=0)
+        # CLAUDE FIX (BUGREPORT A10, revised): entry k of the transform chain is BONE k, and a bone
+        # rotates about its own HEAD joint, which is J[parent_indices[k+1]].
+        #
+        # A previous revision restored the rest pose by moving this to `J[:, 1:]` (the bone's TAIL)
+        # while leaving the offset below as the bone's own rest vector. That combination is
+        # self-consistent -- it passes assert_rest_pose_is_identity -- but it is SMPL *joint*
+        # semantics: because the offset sits in T_k next to R_k, it is rotated by the chain WITHOUT
+        # R_k, so pose[k] never moves bone k's own tail and every child of one bone is forced to
+        # share a single orientation. A Blender armature and this model then cannot be made to
+        # agree for any choice of pose (see assert_bone_rotates_its_own_segment below).
+        #
+        # The head pivot is paired with the parent-bone offset in __call__; together they keep the
+        # rest pose exact AND make pose[k] the rotation of bone k about its own head, which is what
+        # the Blender vertex groups, the per-bone swing-twist priors and pose_time_series/2 all
+        # assume.
+        self.joints_homog = F.pad((J[:, parent_indices[1:]]).unsqueeze(-1), [0, 0, 0, 1], value=0)
         # body_joint_locs_rel_to_parents: positions of the body joints (first joint excluded!) relative to their parents
         # ---> len(locs_rel_to_parents) = n_joints-1 = n_bones
+        # entry k is bone k's OWN rest vector (head -> tail); __call__ gathers the PARENT's entry.
         self.body_joint_locs_rel_to_parents = (J[:, 1:] - J[:, parent_indices[1:]]).unsqueeze(-1)
 
         self.parent_indices = parent_indices
+        # parent BONE of bone k, -1 for the root bone. Bone k's head is its parent bone's tail, so
+        # joint parent_indices[k+1] is bone (parent_indices[k+1] - 1)'s tail.
+        self.parent_bone = [int(parent_indices[k + 1]) - 1 for k in range(self.n_body_joints)]
 
         # CLAUDE FIX: the kinematic tree is walked in index order, so every joint must appear after
         # its parent. Validate this once here instead of silently producing a garbled skeleton.
@@ -79,6 +92,52 @@ class LBS():
 
         self.virtual_bone_mask = virtual_bone_mask
 
+    def assert_bone_rotates_its_own_segment(self, tol: float = 1e-3) -> float:
+        """
+        CLAUDE FIX (BUGREPORT A10): companion guard to assert_rest_pose_is_identity.
+
+        Rotating bone k must displace bone k's own tail. Both the head-pivot and the SMPL joint
+        variant of the skinning chain reproduce the rest pose, so assert_rest_pose_is_identity
+        cannot tell them apart; this one can. Under the joint variant the skeleton does not move at
+        all when a bone is rotated, and no exporter can make a Blender armature and this model
+        agree.
+
+        Returns the tail displacement produced by a 0.9 rad bend and raises if it is ~0.
+        """
+        n_bones = self.n_body_joints
+        if n_bones < 2:
+            return float("inf")
+        # pick the last non-virtual body bone (virtual bones are forced to identity in __call__)
+        probe = None
+        for k in range(n_bones - 1, 0, -1):
+            if not bool(self.virtual_bone_mask[k]):
+                probe = k
+                break
+        if probe is None:
+            return float("inf")
+
+        device = self.J.device
+        with torch.no_grad():
+            lengths = torch.ones(1, n_bones, device=device)
+            scale = torch.ones(1, device=device)
+            tails = []
+            for angle in (0.0, 0.9):
+                pose = torch.zeros(1, n_bones * 3, device=device)
+                pose[0, 3 * probe + 2] = angle
+                G = self._transform_chain(self._rotmats(pose, 1), lengths, scale)
+                head = G[0, probe, :3, 3]
+                rot = G[0, probe, :3, :3]
+                own_vec = self.body_joint_locs_rel_to_parents.to(device)[0, probe, :, 0]
+                tails.append(head + rot @ (own_vec * scale))
+            moved = float((tails[1] - tails[0]).norm())
+        if moved < tol:
+            raise ValueError(
+                f"LBS: rotating bone {probe} displaced its own tail by {moved:.3e} (< {tol}). "
+                f"pose[k] is seated at bone k's tail instead of its head, so a Blender armature "
+                f"and this model cannot be made to agree. See BUGREPORT A10."
+            )
+        return moved
+
     def assert_rest_pose_is_identity(self, V: torch.Tensor, tol: float = 1e-4) -> float:
         """
         CLAUDE FIX: regression guard for the skinning transform.
@@ -103,6 +162,58 @@ class LBS():
             )
         return max_dev
 
+    def _rotmats(self, global_ori_plus_body_pose, batch_size):
+        """Exponential-map pose -> (BS, n_bones, 3, 3), with virtual bones pinned to identity."""
+        device = global_ori_plus_body_pose.device
+        R = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3), to_rotmats=True, to_quats=False)
+        R = R.view([batch_size, -1, 3, 3])
+        # hard-code virtual bone rotation to identity (no rotation) since virtual bones do not have
+        # a pose and should not contribute to the deformation of the mesh
+        R[:, self.virtual_bone_mask.bool(), :, :] = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0)
+        return R
+
+    def _transform_chain(self, rotmats, all_bone_length, scale):
+        """
+        Chained bone transforms G_k (BS, n_bones, 4, 4), whose translation column is bone k's posed
+        HEAD position (the rest-pose offset is removed by the caller).
+
+        Args:
+            rotmats (BS, n_bones, 3, 3): per-bone rotations, as produced by `_rotmats`
+        """
+        R = rotmats
+        device = R.device
+        batch_size = R.shape[0]
+        n_bones = self.n_body_joints
+
+        # CLAUDE FIX (BUGREPORT A10, revised): the offset that separates bone k from its parent is
+        # the PARENT bone's rest vector, scaled by the PARENT's length factor -- not bone k's own
+        # vector. Inside the chain G_k = G_parent @ T_k the offset is rotated by G_parent only, so
+        # putting bone k's own vector there means R_k never moves bone k's tail (and all siblings
+        # inherit one shared orientation). The root bone has no parent offset.
+        parent_bone = torch.tensor(self.parent_bone, device=device, dtype=torch.long)
+        gather = parent_bone.clamp_min(0)
+        valid = (parent_bone >= 0).to(torch.float32).view(1, n_bones, 1, 1)
+        locs = self.body_joint_locs_rel_to_parents.to(device)[:, gather]          # (1, nb, 3, 1)
+        offsets = (scale * locs) * all_bone_length[:, gather][:, :, None, None] * valid
+
+        T_rel = torch.zeros([batch_size, n_bones, 4, 4], device=device).float()
+        T_rel[:, :, -1, -1] = 1
+        T_rel[:, :, :3, :] = torch.cat([R, offsets.expand(R.shape[0], -1, -1, -1)], dim=-1)
+        # bone 0's rotation is the global orientation; it is applied to the whole mesh at the end
+        T_rel[:, 0, :3, :3] = torch.eye(3, device=device).unsqueeze(0)
+
+        # CLAUDE FIX: two index spaces meet here and must be converted between explicitly.
+        # `parent_indices` is indexed by *joint* index (0 = head), while this list is indexed by
+        # *bone* index, where entry k describes bone k / joint k+1. `self.parent_bone[k]` performs
+        # that conversion once, in __init__. For a straight chain both index spaces happen to
+        # agree; for any branching rig (fins, limbs) they do not, so subtrees would otherwise be
+        # attached to the wrong parent.
+        chain = [T_rel[:, 0]]
+        for i in range(1, n_bones):
+            parent = self.parent_bone[i]
+            chain.append(T_rel[:, i] if parent < 0 else chain[parent] @ T_rel[:, i])
+        return torch.stack(chain, dim=1)
+
     def __call__(self, V, global_ori_plus_body_pose, all_bone_length, scale, to_rotmats=True):
         """
         Args:
@@ -122,77 +233,26 @@ class LBS():
             raise ValueError("LBS received non-finite scale.")
 
         V_homog = F.pad(V.unsqueeze(-1), [0, 0, 0, 1], value=1)
-        
-        # scale the joint positions by the bone lengths -> init kin-tree excluded head joint, this step should exclude it, too
-        # however, the head bone length is important since the first *body joint* has a location relative to its 
-        # parent (head joint) that needs to be scaled.
-        body_joint_locs_rel_to_parents = (scale * self.body_joint_locs_rel_to_parents) * all_bone_length[:, :, None, None]
 
-        global_ori_plus_body_pose = batch_rodrigues(global_ori_plus_body_pose.view(-1, 3), to_rotmats=True, to_quats=False) # view: pose from list format ([[a,b,c,a1,b1,c1,...]]) to triplet format ([[[a,b,c],[a1,b1,c1],...]])
-        global_ori_plus_body_pose = global_ori_plus_body_pose.view([batch_size, -1, 3, 3])
-        # hard-code virtual bone rotation to identity (no rotation) since virtual bones do not have a pose and should not contribute to the deformation of the mesh
-        global_ori_plus_body_pose[:, self.virtual_bone_mask.bool(), :, :] = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0)
+        # rotation matrices per bone (virtual bones pinned to identity); index 0 is the global
+        # orientation, which is applied to the whole mesh further down rather than inside the chain
+        global_ori_plus_body_pose = self._rotmats(global_ori_plus_body_pose, batch_size)
 
-        T_for_joints_rel_to_parent = torch.zeros([batch_size, self.n_body_joints, 4, 4]).float().to(device) # 4x4 all-0 matrices for every joint (excluding head joint)
-        T_for_joints_rel_to_parent[:, :, -1, -1] = 1 # last-row last-column entry (bottom right) is 1 (homogeneous transform)
-
-        # first body joint just gets translated via bone_length-scaling; no rotation
-        T_for_joints_rel_to_parent[:, 0, :3, :]  = torch.cat([torch.eye(3, device=device).unsqueeze(0), body_joint_locs_rel_to_parents[:,0,:]], dim=-1)
-        # now, T looks like this for the first body joint:
-        #       1           0           0       loc_rel_to_parent[0]
-        #       0           1           0       loc_rel_to_parent[1]
-        #       0           0           1       loc_rel_to_parent[2]
-        #       0           0           0           1
-        T_for_joints_rel_to_parent[:, 1:, :3, :] = torch.cat([global_ori_plus_body_pose[:,1:,:,:], body_joint_locs_rel_to_parents[:,1:,:]], dim=-1)
-        # now, T looks like this for every joint (excluding first two joints, i.e. excluding head joint and first body joint):
-        #
-        #   rotmat(0,0) rotmat(0,1) rotmat(0,2) loc_rel_to_parent[0]
-        #   rotmat(1,0) rotmat(1,1) rotmat(1,2) loc_rel_to_parent[1]
-        #   rotmat(2,0) rotmat(2,1) rotmat(2,2) loc_rel_to_parent[2]
-        #       0           0           0           1
-        #
-        # ---> so it is a transformartion matrix that performs the relative rotation specified by pose and 
-        #      translation to the position of the joint relative to its parent
-
-        T_for_joints_rel_to_head = [T_for_joints_rel_to_parent[:, 0]] 
-        # this will be a recursively generated transformation for each joint (excluding head) built by 
-        # successively applying all the transformations of this joints parents
-        # ---> so T_rel_chained will have transformations relative to the head joint for each joint
-        #      (because every transformation will build on the transformation of the first body joint and 
-        #      that transf is relative to the head joint)
-        # CLAUDE FIX: two index spaces meet here and must be converted between explicitly.
-        # `parent_indices` is indexed by *joint* index (0 = head), while this list is indexed by
-        # *body-joint* index, where entry k describes joint k+1. So the parent of the joint at list
-        # position i is joint `parent_indices[i + 1]`, which lives at list position
-        # `parent_indices[i + 1] - 1`. A parent of joint 0 (the head) has no list entry and means the
-        # joint hangs directly off the root, so its chained transform is its own relative transform.
-        # For a straight chain both index spaces happen to agree; for any branching rig (fins,
-        # limbs) they do not, so subtrees would otherwise be attached to the wrong parent.
-        for i in range(1, self.n_body_joints):
-            parent_joint_idx = int(self.parent_indices[i + 1])
-            parent_list_idx = parent_joint_idx - 1
-            if parent_list_idx < 0:
-                # joint (i+1) is a direct child of the head joint
-                T_for_joints_rel_to_head.append(T_for_joints_rel_to_parent[:, i])
-            else:
-                T_for_joints_rel_to_head.append(
-                    T_for_joints_rel_to_head[parent_list_idx] @ T_for_joints_rel_to_parent[:, i]
-                )
-        T_for_joints_rel_to_head = torch.stack(T_for_joints_rel_to_head, dim=1)
-        T_for_joints_rel_to_head[:, :, :, [-1]] -= T_for_joints_rel_to_head.clone() @ (self.joints_homog * scale)
-        #   compound_rotmat(0,0) compound_rotmat(0,1) compound_rotmat(0,2) transformed_joint[0]
-        #   compound_rotmat(1,0) compound_rotmat(1,1) compound_rotmat(1,2) transformed_joint[1]
-        #   compound_rotmat(2,0) compound_rotmat(2,1) compound_rotmat(2,2) transformed_joint[2]
-        #           0                    0                    0                   1
-        # ---> the translation of each joint is now offset by the position of this joint.
-        #      future vertex translation depends on associated joint position.
+        # chained transforms; the translation column of entry k is bone k's posed HEAD
+        T_for_joints_rel_to_head = self._transform_chain(
+            global_ori_plus_body_pose, all_bone_length, scale)
+        # remove the rest-pose position of each bone's pivot (its head joint), so that the
+        # transform reduces to the identity when the pose is zero
+        T_for_joints_rel_to_head = T_for_joints_rel_to_head.clone()
+        T_for_joints_rel_to_head[:, :, :, [-1]] -= (
+            T_for_joints_rel_to_head.clone() @ (self.joints_homog.to(device) * scale)
+        )
 
         # CLAUDE FIX: the bone-angle (swing-twist) priors are per-joint articulation limits, so they
         # must be evaluated on each bone's *own* rotation relative to its parent -- not on the
-        # accumulated rotation of the whole chain up to that bone, which is what
-        # `T_for_joints_rel_to_head[..., :3, :3]` contains. Returning the local rotations means a
-        # long spine of individually legal bends is no longer reported as a large violation, and
-        # equal-and-opposite bends no longer cancel out and escape the limits.
+        # accumulated rotation of the whole chain up to that bone. Returning the local rotations
+        # means a long spine of individually legal bends is no longer reported as a large
+        # violation, and equal-and-opposite bends no longer cancel out and escape the limits.
         # Index 0 of this tensor is the global orientation (the root bone's own rotation), which is
         # applied separately below; indices 1.. are the body bones, in bone order.
         local_bone_rotations = global_ori_plus_body_pose  # (BS, n_bones, 3, 3)
