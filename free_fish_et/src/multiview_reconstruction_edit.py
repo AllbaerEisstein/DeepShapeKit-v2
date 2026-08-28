@@ -954,6 +954,7 @@ def _interpolate_parameter_entries(
     entry_a: list,
     entry_b: list,
     interpolate_size: int,
+    sample_offsets: list[int],
 ) -> list[list[torch.Tensor]]:
     """
     CLAUDE FIX: linearly interpolate one full `parameters` entry
@@ -962,10 +963,22 @@ def _interpolate_parameter_entries(
     unchanged, then restored to its original shape so the produced entries are drop-in
     replacements for optimizer output (including the `*init` unpacking in `multiview.fit_mesh`).
 
-    Sample i corresponds to the i-th deferred frame: sample 0 is exactly `entry_a`, and
-    `entry_b` itself is never emitted (it is stored as its own frame).
+    `interpolate_pose_pair` places `entry_a` at x = 0 and `entry_b` at x = interpolate_size,
+    so `interpolate_size` must be the *distance between the two endpoint frames*, not the
+    number of frames in the gap, and each gap frame must be read off at its own offset from
+    `frame_a` (`sample_offsets`), not at its position in the gap list. Offset 0 is `entry_a`
+    itself and is therefore never requested; `entry_b` at x = interpolate_size is likewise
+    never emitted, since it is stored as its own frame.
     """
-    interpolated_entries: list[list[torch.Tensor]] = [[] for _ in range(max(interpolate_size, 0))]
+    if interpolate_size <= 0 or not sample_offsets:
+        return []
+    if any(not (0 < offset < interpolate_size) for offset in sample_offsets):
+        raise ValueError(
+            f"gap sample offsets {sample_offsets} must lie strictly between the endpoint "
+            f"frames (0 < offset < {interpolate_size})"
+        )
+
+    interpolated_entries: list[list[torch.Tensor]] = [[] for _ in sample_offsets]
     for tensor_a, tensor_b in zip(entry_a, entry_b):
         tensor_a = tensor_a.detach()
         tensor_b = tensor_b.detach().to(dtype=tensor_a.dtype, device=tensor_a.device)
@@ -975,11 +988,47 @@ def _interpolate_parameter_entries(
             tensor_b.reshape(1, -1),
             interpolate_size,
         )
-        for sample_idx in range(interpolate_size):
-            interpolated_entries[sample_idx].append(
-                samples[sample_idx].reshape(original_shape).clone()
+        for entry_idx, offset in enumerate(sample_offsets):
+            interpolated_entries[entry_idx].append(
+                samples[offset].reshape(original_shape).clone()
             )
     return interpolated_entries
+
+
+def _gap_interpolation_layout(
+    frame_a: int,
+    frame_b: int,
+    gap_frames: list[int],
+) -> tuple[int, list[int]]:
+    """
+    CLAUDE FIX: work out where each deferred frame sits on the x axis spanned by the two
+    endpoint frames. Normally this is just its real frame-number offset from `frame_a`, which
+    keeps the interpolation correct even when the gap is not contiguous -- e.g. when a frame in
+    between was dropped as unavailable (the IndexError/KeyError path) or when `frame_indices`
+    is strided, in which case the deferred frames are not evenly spaced in the gap list.
+
+    Falls back to even spacing over the gap if the frame numbering is not strictly increasing
+    across `frame_a -> gap_frames -> frame_b`, so a pathological frame list degrades instead of
+    raising.
+    """
+    frame_span = int(frame_b) - int(frame_a)
+    sample_offsets = [int(frame) - int(frame_a) for frame in gap_frames]
+    monotonic = (
+        frame_span > 0
+        and all(0 < offset < frame_span for offset in sample_offsets)
+        and all(
+            earlier < later
+            for earlier, later in zip(sample_offsets, sample_offsets[1:])
+        )
+    )
+    if not monotonic:
+        print(
+            f"Warning: frames {gap_frames} are not strictly ordered between frame {frame_a} "
+            f"and frame {frame_b}; falling back to even spacing for the interpolation."
+        )
+        frame_span = len(gap_frames) + 1
+        sample_offsets = list(range(1, frame_span))
+    return frame_span, sample_offsets
 
 
 def _save_pose_time_series_json(
@@ -1579,8 +1628,11 @@ def reconstruct(
                     f"Backfilling frames {pending_gap_frames} via interpolation between "
                     f"frame {frame_a} and frame {idx} ({len(pending_gap_frames)} frame(s))"
                 )
+                frame_span, sample_offsets = _gap_interpolation_layout(
+                    frame_a, idx, pending_gap_frames
+                )
                 interpolated_entries = _interpolate_parameter_entries(
-                    frame_a_entry, frame_b_entry, len(pending_gap_frames)
+                    frame_a_entry, frame_b_entry, frame_span, sample_offsets
                 )
                 for gap_frame_idx, gap_entry in zip(pending_gap_frames, interpolated_entries):
                     try:
@@ -1804,4 +1856,3 @@ def render_pose_time_series(
             pad_to_see_full_reprojection=True,
             plot_other_cameras=True,
         )
-        
