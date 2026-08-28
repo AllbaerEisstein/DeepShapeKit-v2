@@ -92,6 +92,10 @@ def _save_reconstruction_images(
     annotate_keypoints_with_coords: bool = False,
     pad_to_see_full_reprojection: bool = False,
     plot_other_cameras: bool = False,
+    # CLAUDE FIX: frames that were not optimized directly but filled in by interpolation across a
+    # detection gap are rendered with a different silhouette colour so they are distinguishable
+    # from directly-optimized frames at a glance.
+    is_interpolated: bool = False,
 ):
     """
     Render silhouettes, pad originals (zero padding) to silhouette size (centered),
@@ -553,8 +557,14 @@ def _save_reconstruction_images(
                     + blue_img * (mask_overlay_alpha * mask_alpha)
                 )
         # Reconstruction silhouette overlay
+        # CLAUDE FIX: colour is BGR (images are written with cv2.imwrite). Directly-optimized
+        # frames keep the original pure red; interpolated frames get orange so a gap fill is
+        # obvious in the saved images without reading the metrics table.
+        overlay_color_bgr = (0, 140, 255) if is_interpolated else (0, 0, 255)
         red_img = np.zeros_like(blended)
-        red_img[:, :, 2] = 255
+        red_img[:, :, 0] = overlay_color_bgr[0]
+        red_img[:, :, 1] = overlay_color_bgr[1]
+        red_img[:, :, 2] = overlay_color_bgr[2]
         a_exp = a[..., None]
         blended = (
             blended * (1.0 - blend_factor * a_exp)
@@ -789,6 +799,11 @@ def _save_reconstruction_images(
             )
             metric_rows = [
                 ("view", view_name),
+            ]
+            if is_interpolated:
+                # CLAUDE FIX: only added for gap fills, so normal frames keep their original table.
+                metric_rows.append(("frame_source", "INTERPOLATED"))
+            metric_rows += [
                 ("IoU_reconstruction_and_gt", metrics["IoU_reconstruction_and_gt"][view_name]),
                 ("IoU_mask_detection_and_gt", metrics["IoU_mask_detection_and_gt"][view_name]),
                 ("IoU_reconstruction_and_mask_detection", metrics["IoU_reconstruction_and_mask_detection"][view_name]),
@@ -905,6 +920,68 @@ def _clear_reconstruction_cache(cache_path: str) -> None:
         print(f"Warning: failed to remove reconstruction cache '{cache_path}': {exc}")
 
 
+def interpolate_pose_pair(
+    pose_a: torch.Tensor,
+    pose_b: torch.Tensor,
+    interpolate_size: int,
+) -> torch.Tensor:
+    """
+    Reproduce the original np.interp behaviour for one pose pair.
+    The original code sampled x = 0 .. interpolate_size-1 while the two
+    endpoint poses were located at x = 0 and x = interpolate_size.
+    Consequently, the final endpoint itself is not emitted.
+    """
+    if interpolate_size <= 0:
+        return torch.empty(
+            (0, pose_a.shape[1]),
+            dtype=pose_a.dtype,
+            device=pose_a.device,
+        )
+    samples = torch.arange(
+        interpolate_size,
+        dtype=pose_a.dtype,
+        device=pose_a.device,
+    )
+    alpha = samples / interpolate_size
+    return torch.lerp(
+        pose_a.expand(interpolate_size, -1),
+        pose_b.expand(interpolate_size, -1),
+        alpha[:, None],
+    )
+
+
+def _interpolate_parameter_entries(
+    entry_a: list,
+    entry_b: list,
+    interpolate_size: int,
+) -> list[list[torch.Tensor]]:
+    """
+    CLAUDE FIX: linearly interpolate one full `parameters` entry
+    ([global_ori, body_pose, body_bone_length, scale, global_t]) between two reconstructed
+    frames. Each tensor is flattened to (1, D) so `interpolate_pose_pair` can be applied
+    unchanged, then restored to its original shape so the produced entries are drop-in
+    replacements for optimizer output (including the `*init` unpacking in `multiview.fit_mesh`).
+
+    Sample i corresponds to the i-th deferred frame: sample 0 is exactly `entry_a`, and
+    `entry_b` itself is never emitted (it is stored as its own frame).
+    """
+    interpolated_entries: list[list[torch.Tensor]] = [[] for _ in range(max(interpolate_size, 0))]
+    for tensor_a, tensor_b in zip(entry_a, entry_b):
+        tensor_a = tensor_a.detach()
+        tensor_b = tensor_b.detach().to(dtype=tensor_a.dtype, device=tensor_a.device)
+        original_shape = tensor_a.shape
+        samples = interpolate_pose_pair(
+            tensor_a.reshape(1, -1),
+            tensor_b.reshape(1, -1),
+            interpolate_size,
+        )
+        for sample_idx in range(interpolate_size):
+            interpolated_entries[sample_idx].append(
+                samples[sample_idx].reshape(original_shape).clone()
+            )
+    return interpolated_entries
+
+
 def _save_pose_time_series_json(
     outdir: str,
     dataset_dir: str,
@@ -989,6 +1066,11 @@ def _save_pose_time_series_json(
         }
         if payload.get("scale") is not None:
             frame_dict["scale"] = payload["scale"]
+        # CLAUDE FIX: gap-filled frames are flagged so consumers (e.g. the Blender importer) can
+        # tell interpolated poses from directly-optimized ones. The key is omitted entirely for
+        # normal frames, so output for a run without gaps is byte-identical to before.
+        if payload.get("interpolated"):
+            frame_dict["interpolated"] = True
         time_val = time_from_frame(frame_dict["frame"])
         if time_val is None:
             time_val = float(frame_dict["frame"] - frame_start)
@@ -1192,9 +1274,13 @@ def reconstruct(
                 for view_name in dataset.views
             },
             "optimizer_losses": {name: [] for name in optimizer_loss_names},
+            # CLAUDE FIX: frame indices that were filled in by interpolation across a
+            # detection gap rather than optimized directly.
+            "interpolated_frames": [],
         }
 
     def _ensure_metrics_schema(metrics_dict: dict) -> dict:
+        metrics_dict.setdefault("interpolated_frames", [])
         metrics_dict.setdefault("IoU_mask_detection_and_gt", {})
         metrics_dict.setdefault("IoU_reconstruction_and_gt", {})
         metrics_dict.setdefault("IoU_reconstruction_and_mask_detection", {})
@@ -1236,6 +1322,131 @@ def reconstruct(
             resumed_from_cache = False
     metrics = _ensure_metrics_schema(metrics)
 
+    def _append_frame_metrics(frame_metrics: Optional[dict]) -> None:
+        """CLAUDE FIX: keep every metric list the same length as the number of emitted frames,
+        including gap-filled frames whose images could not be rendered."""
+        for view in dataset.views:
+            for metric_name in (
+                "IoU_mask_detection_and_gt",
+                "IoU_reconstruction_and_gt",
+                "IoU_reconstruction_and_mask_detection",
+            ):
+                metrics[metric_name][view].append(
+                    None if frame_metrics is None else frame_metrics[metric_name][view]
+                )
+            for kpt in dataset.index_json["keypoint_list"]:
+                metrics["keypoint_L2_distance"][view][kpt].append(
+                    None if frame_metrics is None else frame_metrics["keypoint_L2_distance"][view][kpt]
+                )
+        for loss_name in optimizer_loss_names:
+            metrics["optimizer_losses"][loss_name].append(
+                None if frame_metrics is None else frame_metrics.get("optimizer_losses", {}).get(loss_name)
+            )
+
+    def _emit_frame(
+        frame_idx: int,
+        entry: list,
+        instance_sample: Optional[dict],
+        final_losses: Optional[dict],
+        world_outputs: Optional[tuple] = None,
+        is_interpolated: bool = False,
+    ) -> None:
+        """
+        CLAUDE FIX: single place where a reconstructed *or* interpolated frame is turned into all
+        of its per-frame outputs (parameters/sample_data caching, deformation, pose time series
+        entry, saved images, metrics, processed_frames bookkeeping). Directly-optimized frames go
+        through exactly the same code path as before; interpolated frames differ only in having no
+        optimizer losses and in the overlay colour / flags.
+
+        Args:
+            entry: [global_ori, body_pose, body_bone_length, scale, global_t], i.e. the layout
+                stored in `parameters` and unpacked as `*init` into `multiview.fit_mesh`.
+            world_outputs: optional (vertices_world, keypoints_world) already computed by
+                `fit_mesh`; recomputed from the deformation when omitted.
+        """
+        global_ori_est, body_pose_est, body_bone_est, scale_est, global_t_est = entry
+
+        out_reconstructed = fish(global_ori_est, body_pose_est, body_bone_est, scale_est)
+        reconstructed_keypoints_local = out_reconstructed["keypoints"].to(device)
+        reconstructed_vertices_local = out_reconstructed["vertices"].to(device)
+
+        if world_outputs is None:
+            global_t_cpu = global_t_est.detach().cpu()
+            vertices_world_est = out_reconstructed["vertices"].detach().cpu() + global_t_cpu
+            keypoints_world_est = out_reconstructed["keypoints"].detach().cpu() + global_t_cpu
+        else:
+            vertices_world_est, keypoints_world_est = world_outputs
+
+        parameters.append([global_ori_est, body_pose_est, body_bone_est, scale_est, global_t_est])
+        if instance_sample is not None:
+            sample_data.append(
+                [
+                    instance_sample["frames"],
+                    instance_sample["imgpaths"],
+                    keypoints_world_est,
+                    instance_sample["bboxes"],
+                    frame_idx,
+                ]
+            )
+        else:
+            sample_data.append([None, None, keypoints_world_est, None, frame_idx])
+
+        global_ori_cpu = global_ori_est.detach().cpu().view(-1).tolist()
+        body_pose_flat = body_pose_est.detach().cpu().view(-1).tolist()
+        body_pose_triplets = [
+            body_pose_flat[i : i + 3]
+            for i in range(0, len(body_pose_flat), 3)
+        ]
+        body_bone_lengths = body_bone_est.detach().cpu().view(-1).tolist()
+        global_t_list = global_t_est.detach().cpu().view(-1).tolist()
+        scale_list = scale_est.detach().cpu().view(-1).tolist()
+        frame_payload = {
+            "frame": int(frame_idx),
+            "global_ori": [float(x) for x in global_ori_cpu],
+            "body_pose": [[float(v) for v in triple] for triple in body_pose_triplets],
+            "body_bone_length": [float(v) for v in body_bone_lengths],
+            "global_t": [float(v) for v in global_t_list],
+            "scale": float(scale_list[0]) if scale_list else None,
+        }
+        if is_interpolated:
+            # Only set for gap fills; omitted for normal frames so their payload is unchanged.
+            frame_payload["interpolated"] = True
+        pose_time_series_frames.append(frame_payload)
+
+        frame_metrics = None
+        if instance_sample is not None:
+            frame_metrics = _save_reconstruction_images(
+                orig_image_paths=instance_sample["imgpaths"],
+                outdir=outdir,
+                renderer=renderer_for_saving_images,
+                instance_number=instance_number,
+                cameras=camera_group_uniform_size_device,
+                reconstructed_keypoints_local=reconstructed_keypoints_local,
+                reconstructed_vertices_local=reconstructed_vertices_local,
+                faces_from_vert_indices=fish.faces.unsqueeze(0).to(device),
+                global_t=global_t_est.to(device),
+                keypoint_names=dataset.index_json["keypoint_list"],
+                view_names=dataset.views,
+                mask_predictions=instance_sample["masks_full"] / 255.0,
+                mask_present_mask=instance_sample["seg_mask_present_mask"],
+                keypoint_predictions=instance_sample["keypoints"],
+                optimizer_losses=final_losses,
+                optimizer_loss_weights=optimizer_loss_weight_map,
+                view_weights=view_weights,
+                is_interpolated=is_interpolated,
+            )
+
+        if save_models:
+            _save_obj_model(outdir, frame_idx, instance_number, vertices_world_est, fish)
+
+        # cache quality metrics for this frame
+        _append_frame_metrics(frame_metrics)
+
+        if is_interpolated and int(frame_idx) not in metrics["interpolated_frames"]:
+            metrics["interpolated_frames"].append(int(frame_idx))
+
+        processed_frames.add(frame_idx)
+
     pbar = tqdm(
         total=len(frame_indices),
         desc=f"{os.path.basename(dataset_dir)} reconstruction frame {frame_indices[0]}",
@@ -1243,6 +1454,9 @@ def reconstruct(
     )
     run_start_wall_time_sec = time.perf_counter()
     paused = False
+    # CLAUDE FIX: frame indices skipped for insufficient detections, awaiting retroactive
+    # interpolation once a frame with sufficient detections is reconstructed again.
+    pending_gap_frames: list[int] = []
 
     # --------------------------
     # loop through frames and reconstruct
@@ -1265,22 +1479,30 @@ def reconstruct(
         kpt_present_mask = instance_sample['kpt_present_mask']
         seg_mask_present_mask = instance_sample['seg_mask_present_mask']
 
-        # QUESTION: how to deal with not enough keypoints/segmasks especially in first frame?
+        # CLAUDE FIX: frames with insufficient detections are no longer discarded. They are
+        # deferred ("pending") and retroactively filled in by interpolation once a later frame
+        # with sufficient detections is reconstructed (see the gap handling below). The
+        # sufficiency criteria themselves are unchanged.
         if len([
                 view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
                 if view_with_seg_mask == True
             ]) < 2:
             print(
-                f"Less than two views with segmentation masks in sample for frame {idx} -> skipping "
-                f"(presence={seg_mask_present_mask})"
+                f"Less than two views with segmentation masks in sample for frame {idx} -> "
+                f"deferring frame for interpolation (presence={seg_mask_present_mask})"
             )
+            pending_gap_frames.append(idx)
             pbar.update()
             continue
         if len([
                 view_with_kpts for view_with_kpts in kpt_present_mask 
                 if any(kpt_present == True for kpt_present in view_with_kpts)
             ]) < 2:
-            print(f"Less than two views with keypoints in sample for frame {idx} -> skipping")
+            print(
+                f"Less than two views with keypoints in sample for frame {idx} -> "
+                f"deferring frame for interpolation"
+            )
+            pending_gap_frames.append(idx)
             pbar.update()
             continue
 
@@ -1298,7 +1520,18 @@ def reconstruct(
         # reconstruct
 
         # initialize from previous solution if available
-        init = parameters[-1] if parameters else None
+        # CLAUDE FIX: after a run of deferred frames the last stored pose is separated from this
+        # frame by an unknown amount of motion, which makes it a poor warm start. Force
+        # `init = None` so this frame goes through the same triangulation+Procrustes
+        # initialization as the very first frame of a run.
+        if pending_gap_frames and parameters:
+            print(
+                f"Frame {idx}: gap of {len(pending_gap_frames)} frame(s) detected, "
+                f"re-initializing with Procrustes instead of previous-frame warm start"
+            )
+            init = None
+        else:
+            init = parameters[-1] if parameters else None
 
         result = multiview.fit_mesh(
             fish,
@@ -1325,70 +1558,63 @@ def reconstruct(
 
         # --------------------------
         # cache results
-        parameters.append([global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est, global_t_est])
-        sample_data.append([views_indices, orig_img_paths, keypoints_world_est, bboxes, idx])
-
-        out_reconstructed = fish(global_ori_plus_pose_est[:, :3], global_ori_plus_pose_est[:, 3:], body_bone_est, scale_est)
-        reconstructed_keypoints_local = out_reconstructed["keypoints"].to(device)
-        reconstructed_vertices_local = out_reconstructed["vertices"].to(device)
-
-        global_ori_cpu = global_ori_plus_pose_est[:, :3].detach().cpu().view(-1).tolist()
-        body_pose_flat = global_ori_plus_pose_est[:, 3:].detach().cpu().view(-1).tolist()
-        body_pose_triplets = [
-            body_pose_flat[i : i + 3]
-            for i in range(0, len(body_pose_flat), 3)
+        frame_b_entry = [
+            global_ori_plus_pose_est[:, :3],
+            global_ori_plus_pose_est[:, 3:],
+            body_bone_est,
+            scale_est,
+            global_t_est,
         ]
-        body_bone_lengths = body_bone_est.detach().cpu().view(-1).tolist()
-        global_t_list = global_t_est.detach().cpu().view(-1).tolist()
-        scale_list = scale_est.detach().cpu().view(-1).tolist()
-        pose_time_series_frames.append(
-            {
-                "frame": int(idx),
-                "global_ori": [float(x) for x in global_ori_cpu],
-                "body_pose": [[float(v) for v in triple] for triple in body_pose_triplets],
-                "body_bone_length": [float(v) for v in body_bone_lengths],
-                "global_t": [float(v) for v in global_t_list],
-                "scale": float(scale_list[0]) if scale_list else None,
-            }
+
+        # --------------------------
+        # CLAUDE FIX: retroactively fill the detection gap that preceded this frame, if any.
+        # The gap is emitted BEFORE this frame's own entry so `parameters`, `sample_data`,
+        # `pose_time_series_frames` and the metric lists all stay in chronological order and
+        # `init = parameters[-1]` for the next frame still refers to this frame.
+        if pending_gap_frames:
+            if parameters:
+                frame_a = sample_data[-1][4]
+                frame_a_entry = parameters[-1]
+                print(
+                    f"Backfilling frames {pending_gap_frames} via interpolation between "
+                    f"frame {frame_a} and frame {idx} ({len(pending_gap_frames)} frame(s))"
+                )
+                interpolated_entries = _interpolate_parameter_entries(
+                    frame_a_entry, frame_b_entry, len(pending_gap_frames)
+                )
+                for gap_frame_idx, gap_entry in zip(pending_gap_frames, interpolated_entries):
+                    try:
+                        gap_sample = dataset.__getitem__(gap_frame_idx, instance_number)
+                    except (IndexError, KeyError) as exc:
+                        print(
+                            f"Interpolated frame {gap_frame_idx}: sample could not be reloaded "
+                            f"({type(exc).__name__}: {exc}); storing pose without saved images"
+                        )
+                        gap_sample = None
+                    _emit_frame(
+                        frame_idx=gap_frame_idx,
+                        entry=gap_entry,
+                        instance_sample=gap_sample,
+                        # interpolated frames were never optimized, so there are no losses
+                        final_losses=None,
+                        is_interpolated=True,
+                    )
+            else:
+                print(
+                    f"Frames {pending_gap_frames} precede the first reconstructed frame "
+                    f"({idx}); there is no earlier pose to interpolate from, so they cannot be "
+                    f"reconstructed or interpolated."
+                )
+            pending_gap_frames = []
+
+        _emit_frame(
+            frame_idx=idx,
+            entry=frame_b_entry,
+            instance_sample=instance_sample,
+            final_losses=final_losses,
+            world_outputs=(vertices_world_est, keypoints_world_est),
+            is_interpolated=False,
         )
-
-        frame_metrics = _save_reconstruction_images(
-            orig_image_paths=orig_img_paths,
-            outdir=outdir,
-            renderer=renderer_for_saving_images,
-            instance_number=instance_number,
-            cameras=camera_group_uniform_size_device,
-            reconstructed_keypoints_local=reconstructed_keypoints_local,
-            reconstructed_vertices_local=reconstructed_vertices_local,
-            faces_from_vert_indices=fish.faces.unsqueeze(0).to(device),
-            global_t=global_t_est.to(device),
-            keypoint_names=dataset.index_json["keypoint_list"],
-            view_names=dataset.views,
-            mask_predictions=masks,
-            mask_present_mask=seg_mask_present_mask,
-            keypoint_predictions=keypoints,
-            optimizer_losses=final_losses,
-            optimizer_loss_weights=optimizer_loss_weight_map,
-            view_weights=view_weights,
-        )
-
-        if save_models:
-            _save_obj_model(outdir, idx, instance_number, vertices_world_est, fish)
-        
-
-        # cache quality metrics for this frame
-        for view in dataset.views:
-            metrics["IoU_mask_detection_and_gt"][view].append(frame_metrics["IoU_mask_detection_and_gt"][view])
-            metrics["IoU_reconstruction_and_gt"][view].append(frame_metrics["IoU_reconstruction_and_gt"][view])
-            metrics["IoU_reconstruction_and_mask_detection"][view].append(frame_metrics["IoU_reconstruction_and_mask_detection"][view])
-            for kpt in dataset.index_json["keypoint_list"]:
-                metrics["keypoint_L2_distance"][view][kpt].append(frame_metrics["keypoint_L2_distance"][view][kpt])
-        for loss_name in optimizer_loss_names:
-            metrics["optimizer_losses"][loss_name].append(
-                frame_metrics.get("optimizer_losses", {}).get(loss_name)
-            )
-
-        processed_frames.add(idx)
         elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)
 
         cache_payload = {
@@ -1416,6 +1642,16 @@ def reconstruct(
             break
 
     # reconstruction done (or paused)
+    # CLAUDE FIX: a gap that is still open when the frame list runs out (or when the run is
+    # paused) has no right-hand endpoint to interpolate towards, so those frames are left
+    # unfilled and reported instead of silently disappearing.
+    if pending_gap_frames:
+        print(
+            f"{len(pending_gap_frames)} trailing frame(s) {pending_gap_frames} had insufficient "
+            f"detections and were never followed by a frame with sufficient detections; they "
+            f"could not be reconstructed or interpolated."
+        )
+
     elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)
     processed_frame_count = len(processed_frames)
     seconds_per_processed_frame = (
@@ -1569,31 +1805,3 @@ def render_pose_time_series(
             plot_other_cameras=True,
         )
         
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--index", nargs="+", type=int, default=list(range(50, 100)))
-    parser.add_argument("--mesh", type=str, default="goldfish_design_small.json")
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        default="data/output/GoldFish20171216_BL320/20171216_124610",
-    )
-    parser.add_argument(
-        "--datadir", type=str, default="data/input/video_frames_20171215_101550"
-    )
-    parser.add_argument("--fish_place", type=int, choices=[1, 2], default=2)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--save_models", action="store_true")
-    args = parser.parse_args()
-
-    reconstruct(
-        mesh_path=args.mesh,
-        dataset_dir=args.datadir,
-        outdir=args.outdir,
-        frame_indices=args.index,
-        instance_number=args.fish_place,
-        seed=args.seed,
-        save_models=args.save_models,
-    )
