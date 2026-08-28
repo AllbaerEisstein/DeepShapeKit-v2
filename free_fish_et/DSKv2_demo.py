@@ -1537,6 +1537,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="save_models",
         help="Enable saving models during reconstruction.",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run the steps given by --steps directly, without launching the GUI. "
+            "Required for batch/automated use."
+        ),
+    )
     parser.set_defaults(save_models=True)
     return parser
 
@@ -1593,12 +1601,28 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
     return config
 
 
+VALID_STEPS = ["extract", "masks", "keypoints", "reconstruct", "render_time_series"]
+
+
+def _ordered_unique_steps(steps: List[str]) -> List[str]:
+    """Validate step names and return them in canonical pipeline order."""
+    unknown = [step for step in steps if step not in VALID_STEPS]
+    if unknown:
+        raise ConfigError(
+            "Unknown step(s): "
+            + ", ".join(sorted(set(unknown)))
+            + ". Valid steps are: "
+            + ", ".join(VALID_STEPS)
+            + "."
+        )
+    if not steps:
+        raise ConfigError("At least one step must be selected.")
+    return [step for step in VALID_STEPS if step in set(steps)]
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
-    if tk is None:
-        parser.error("tkinter is not available; GUI mode cannot be used.")
 
     config = PipelineConfig()
 
@@ -1606,6 +1630,20 @@ def main() -> None:
         config = load_config(Path(args.config))
 
     config = update_config_from_args(config, args)
+
+    if args.headless:
+        # Headless batch execution. Steps are validated up front and reordered into
+        # canonical pipeline order, because run_pipeline only tests membership and
+        # would otherwise silently skip a mistyped step name.
+        steps = _ordered_unique_steps(args.steps)
+        run_pipeline(config, steps)
+        return
+
+    if tk is None:
+        parser.error(
+            "tkinter is not available; GUI mode cannot be used. "
+            "Use --headless to run without the GUI."
+        )
 
     run_gui(config, args.steps)
 
