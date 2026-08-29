@@ -38,6 +38,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -165,6 +166,117 @@ def build_combo_config(
     config["view_weights"] = ",".join(weight_tokens[i] for i in indices)
     config["final_output_folder"] = str(Path(base["out_path"]) / leaf_name)
     return config
+
+
+def combo_run_records(
+    combos: Sequence[Sequence[int]], stems: Sequence[str], out_root: Path
+) -> List[Dict[str, Any]]:
+    """
+    Deterministic (indices -> leaf name -> run_dir) mapping, shared by config
+    generation and result collection so both address the same folders without
+    re-deriving names differently.
+    """
+    records = []
+    for indices in combos:
+        leaf = combo_folder_name(indices, stems)
+        run_dir = out_root / leaf
+        records.append(
+            {
+                "indices": indices,
+                "leaf": leaf,
+                "run_dir": run_dir,
+                "config_path": run_dir / "config.json",
+            }
+        )
+    return records
+
+
+def result_file_paths(run_dir: Path, instance_number: int, dataset_name: str) -> Dict[str, Path]:
+    """
+    Locations reconstruct() and _save_pose_time_series_json() write into
+    run_dir (== final_output_folder), per multiview_reconstruction_edit.py:
+      - metrics: '{outdir}/metrics_instance_{instance_number}.json'
+      - pose time series: '{outdir}/pose_time_series/pose_time_series_{dataset_name}_instance_{instance_number}.json'
+    instance_number and dataset_folder_name are never varied per combination
+    in this sweep, so both are constant across every run.
+    """
+    return {
+        "metrics": run_dir / f"metrics_instance_{instance_number}.json",
+        "pts2": run_dir
+        / "pose_time_series"
+        / f"pose_time_series_{dataset_name}_instance_{instance_number}.json",
+    }
+
+
+def collect_results(
+    base: Dict[str, Any],
+    out_root: Path,
+    combo_records: Sequence[Dict[str, Any]],
+    dry_run: bool,
+) -> int:
+    """
+    Copy each run's metrics and pose_time_series file into flat, view-combination-
+    named collections, plus a single JSON mapping combination name -> metrics.
+    Safe to call standalone against an already-completed sweep (that's the
+    --skip-existing + --collect-results use case): it only reads what each run
+    already produced and never launches anything.
+    """
+    instance_number = base.get("instance_number", 0)
+    dataset_name = base.get("dataset_folder_name", "dataset")
+
+    metrics_dir = out_root / "metrics_collected"
+    pts2_dir = out_root / "pts2_collected"
+
+    log(f"\nCollecting results into:\n  {metrics_dir}\n  {pts2_dir}")
+    if not dry_run:
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        pts2_dir.mkdir(parents=True, exist_ok=True)
+
+    collected_metrics: Dict[str, Any] = {}
+    n_metrics = n_pts2 = n_missing = 0
+
+    for record in combo_records:
+        leaf = record["leaf"]
+        paths = result_file_paths(record["run_dir"], instance_number, dataset_name)
+
+        metrics_src = paths["metrics"]
+        if metrics_src.is_file():
+            dest = metrics_dir / f"metrics_{leaf}.json"
+            if dry_run:
+                log(f"  [dry-run] metrics {metrics_src} -> {dest}")
+            else:
+                shutil.copy2(metrics_src, dest)
+                with metrics_src.open() as fp:
+                    collected_metrics[leaf] = json.load(fp)
+            n_metrics += 1
+        else:
+            log(f"  missing metrics for {leaf}: {metrics_src}")
+            n_missing += 1
+
+        pts2_src = paths["pts2"]
+        if pts2_src.is_file():
+            dest = pts2_dir / f"pts2_{leaf}.json"
+            if dry_run:
+                log(f"  [dry-run] pts2    {pts2_src} -> {dest}")
+            else:
+                shutil.copy2(pts2_src, dest)
+            n_pts2 += 1
+        else:
+            log(f"  missing pts2 for {leaf}: {pts2_src}")
+            n_missing += 1
+
+    collected_json_path = metrics_dir / "collected_metrics.json"
+    if dry_run:
+        log(f"  [dry-run] would write {collected_json_path} ({n_metrics} entries)")
+    else:
+        with collected_json_path.open("w") as fp:
+            json.dump(collected_metrics, fp, indent=2)
+
+    log(
+        f"\nCollected {n_metrics} metrics file(s) and {n_pts2} pose_time_series "
+        f"file(s) across {len(combo_records)} combination(s); {n_missing} file(s) missing."
+    )
+    return n_missing
 
 
 # --------------------------------------------------------------------------
@@ -308,6 +420,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Write every config and print every command, but launch nothing.",
     )
+    parser.add_argument(
+        "--collect-results",
+        action="store_true",
+        help=(
+            "After the sweep (or standalone with --skip-existing against an "
+            "already-completed sweep), gather every run's metrics and "
+            "pose_time_series file into '<out_path>/metrics_collected' and "
+            "'<out_path>/pts2_collected', named by view combination, plus a "
+            "combined 'metrics_collected/collected_metrics.json'."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -379,29 +502,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             log("")
 
     # ---- Phase 2: generate configs ---------------------------------------
+    # combo_records covers every combination in range regardless of skip status,
+    # so --collect-results can address every run's output folder even when this
+    # invocation launches nothing (the retroactive --skip-existing use case).
+    combo_records = combo_run_records(combos, stems, out_root)
+
     run_steps = ["reconstruct"]
     if prep_steps and args.prep_per_run:
         run_steps = prep_steps + ["reconstruct"]
 
     jobs: List[Dict[str, Any]] = []
     skipped = 0
-    for indices in combos:
-        leaf = combo_folder_name(indices, stems)
-        config = build_combo_config(base, indices, weight_tokens, leaf)
-        run_dir = Path(config["final_output_folder"])
-        config_path = run_dir / "config.json"
+    for record in combo_records:
+        config_path = record["config_path"]
 
         if args.skip_existing and config_path.exists():
             skipped += 1
             continue
 
-        run_dir.mkdir(parents=True, exist_ok=True)
+        config = build_combo_config(base, record["indices"], weight_tokens, record["leaf"])
+        record["run_dir"].mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as fp:
             json.dump(config, fp, indent=2)
 
         jobs.append(
             {
-                "label": leaf,
+                "label": record["leaf"],
                 "config_path": config_path,
                 "command": build_command(args.python, demo_path, config_path, run_steps),
             }
@@ -415,48 +541,61 @@ def main(argv: Optional[List[str]] = None) -> int:
             weights = json.loads(job["config_path"].read_text())["view_weights"]
             log(f"  {job['label']}  weights={weights}")
             log(f"    {' '.join(job['command'])}")
+        if args.collect_results:
+            collect_results(base, out_root, combo_records, dry_run=True)
         return 0
+
+    exit_code = 0
 
     if not jobs:
         log("Nothing to run.")
-        return 0
+    else:
+        # ---- Phase 3: bounded parallel execution --------------------------
+        devices = (
+            [d.strip() for d in args.cuda_devices.split(",") if d.strip()]
+            if args.cuda_devices
+            else None
+        )
 
-    # ---- Phase 3: bounded parallel execution ------------------------------
-    devices = (
-        [d.strip() for d in args.cuda_devices.split(",") if d.strip()]
-        if args.cuda_devices
-        else None
-    )
+        log(f"\nLaunching {len(jobs)} reconstructions, {args.jobs} at a time...\n")
+        results: List[Tuple[str, int, float]] = []
+        started = time.time()
 
-    log(f"\nLaunching {len(jobs)} reconstructions, {args.jobs} at a time...\n")
-    results: List[Tuple[str, int, float]] = []
-    started = time.time()
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {
+                pool.submit(
+                    run_command,
+                    job["command"],
+                    log_dir / f"{job['label']}.log",
+                    demo_path.parent,
+                    job["label"],
+                    devices[i % len(devices)] if devices else None,
+                ): job["label"]
+                for i, job in enumerate(jobs)
+            }
+            for future in as_completed(futures):
+                results.append(future.result())
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {
-            pool.submit(
-                run_command,
-                job["command"],
-                log_dir / f"{job['label']}.log",
-                demo_path.parent,
-                job["label"],
-                devices[i % len(devices)] if devices else None,
-            ): job["label"]
-            for i, job in enumerate(jobs)
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+        # ---- Summary --------------------------------------------------
+        failures = [(label, rc) for label, rc, _ in results if rc != 0]
+        log(f"\n{'-' * 60}")
+        log(f"Completed {len(results)} runs in {time.time() - started:.1f}s")
+        log(f"  succeeded : {len(results) - len(failures)}")
+        log(f"  failed    : {len(failures)}")
+        for label, rc in sorted(failures):
+            log(f"    - {label} (rc={rc}) -> {log_dir / (label + '.log')}")
+        exit_code = 1 if failures else 0
 
-    # ---- Summary ----------------------------------------------------------
-    failures = [(label, rc) for label, rc, _ in results if rc != 0]
-    log(f"\n{'-' * 60}")
-    log(f"Completed {len(results)} runs in {time.time() - started:.1f}s")
-    log(f"  succeeded : {len(results) - len(failures)}")
-    log(f"  failed    : {len(failures)}")
-    for label, rc in sorted(failures):
-        log(f"    - {label} (rc={rc}) -> {log_dir / (label + '.log')}")
+    # ---- Phase 4: collect results ------------------------------------
+    # Runs over every combo_record, not just this invocation's jobs, so a
+    # standalone `--skip-existing --collect-results` call against a sweep
+    # that already finished collects everything in one pass.
+    if args.collect_results:
+        n_missing = collect_results(base, out_root, combo_records, dry_run=False)
+        if n_missing and exit_code == 0:
+            exit_code = 1
 
-    return 1 if failures else 0
+    return exit_code
 
 
 if __name__ == "__main__":
