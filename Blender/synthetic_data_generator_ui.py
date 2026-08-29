@@ -10,6 +10,26 @@ bl_info = {
     "category": "Import-Export",
 }
 
+# CONTENTS
+#   GLOBALS
+#   PROPERTY GROUP (scene.synth_props)
+#   UTILITIES -- paths, scene lookups, camera intrinsics
+#   MESH / KEYPOINT EXTRACTION (depsgraph-evaluated)
+#   TEMPLATE EXPORT -- get_mesh_json (bones, joints, skinning weights)
+#   VISIBILITY / OCCLUSION
+#   PROJECTION HELPERS
+#   MASK RENDERING & YOLO LABEL WRITERS
+#   TIMEDRENDER OPERATOR (modal render + annotation queue)
+#   YOLO DATASET HELPERS
+#   SETTINGS OPERATORS (apply / load config / keypoint list)
+#   CAMERA MATRIX EXPORT
+#   BONE GROUPS & BONE PRIORS OPERATORS
+#   MESH / TEMPLATE EXPORT OPERATOR
+#   CREATE VIDEOS OPERATOR
+#   POSE TIME SERIES (schema v2) -- export / import / verify
+#   RECONSTRUCTION EVALUATION -- volumetric 3D IoU & keypoint distances
+#   UI PANEL & REGISTRATION
+
 import csv
 import bpy
 import bmesh
@@ -21,6 +41,7 @@ import glob
 import math
 from collections import defaultdict
 from mathutils import Vector, Matrix
+from mathutils.bvhtree import BVHTree
 from bpy.props import (
     StringProperty, BoolProperty, FloatProperty, IntProperty,
     PointerProperty, CollectionProperty,
@@ -31,7 +52,9 @@ import cv2
 import numpy as np
 
 
-# --------------------------- Globals --------------------------------------
+# =============================================================================
+# GLOBALS
+# =============================================================================
 
 # cache for camera matrices (per-camera)
 cam_name_2_matrix = {}
@@ -57,7 +80,9 @@ BLENDERWORLD_2_CVWORLD = np.array([
 ], dtype=float)
 
 
-# --------------------------- Property Group ---------------------------------
+# =============================================================================
+# PROPERTY GROUP (scene.synth_props)
+# =============================================================================
 class SYNTH_BoneGroupItem(PropertyGroup):
     names_csv: StringProperty(
         name="Bones/Keypoints",
@@ -241,8 +266,54 @@ class SYNTH_PropertyGroup(PropertyGroup):
         default=True
     )
 
+    # Reconstruction evaluation (volumetric IoU / keypoint distances)
+    iou_sample_count: IntProperty(
+        name="IoU Samples / Frame",
+        description=("Monte-Carlo occupancy samples drawn per frame from the union of the two "
+                     "meshes' bounding boxes. Fish meshes are far simpler than ShapeNet objects, "
+                     "so 20k-50k already gives a standard error well below 0.005 IoU"),
+        default=30000,
+        min=1000,
+        max=1000000,
+        step=1000
+    )
 
-# --------------------------- Utilities -------------------------------------
+    iou_random_seed: IntProperty(
+        name="IoU Random Seed",
+        description="Seed for the sample point RNG; the same seed is reused on every frame so "
+                    "the per-frame IoU curve is not contaminated by sampling jitter",
+        default=0,
+        min=0
+    )
+
+    iou_recon_object_name: StringProperty(
+        name="Reconstruction Object",
+        description="Optional explicit name of the reconstruction mesh in the 'Reconstructions' "
+                    "collection. Leave empty to auto-detect the newest copy of the target object",
+        default=""
+    )
+
+    iou_with_keypoint_distances: BoolProperty(
+        name="Also Compute Keypoint Distances",
+        description="Compute the per-keypoint 3D distances inside the SAME frame loop as the IoU "
+                    "and write the sibling keypoint_distances_*.json. Free: both metrics are "
+                    "derived from one evaluated-mesh extraction per object per frame",
+        default=True
+    )
+
+    kpt_dist_warn_threshold: FloatProperty(
+        name="Keypoint Dist Warn (m)",
+        description="If > 0, the final report is raised to WARNING when the largest per-keypoint "
+                    "distance over the sequence exceeds this value. Regression gate; 0 disables",
+        default=0.0,
+        min=0.0,
+        unit='LENGTH'
+    )
+
+
+# =============================================================================
+# UTILITIES -- paths, scene lookups, camera intrinsics
+# =============================================================================
 
 def resolve(path):
     return bpy.path.abspath(path)
@@ -320,7 +391,7 @@ def sync_bone_priors_ui_item_collection(scene):
     return arm_obj, bone_names
 
 
-# ---- camera intrinsic helpers -----------------
+# --- camera intrinsic helpers ---
 
 def get_sensor_size(sensor_fit, sensor_x, sensor_y):
     if sensor_fit == 'VERTICAL':
@@ -378,7 +449,9 @@ def get_3x4_P_matrix_Blendercam2Blenderimage(cam, scene):
     return f, K @ Rt, K, R, T, Rt
 
 
-# --------------------------- Mesh / Keypoint extraction --------------------
+# =============================================================================
+# MESH / KEYPOINT EXTRACTION (depsgraph-evaluated)
+# =============================================================================
 
 def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
     obj = bpy.data.collections[collection_name].objects[object_name]
@@ -461,7 +534,9 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
 
 
 
-# --------------------------- Mesh extraction --------------------
+# =============================================================================
+# TEMPLATE EXPORT -- get_mesh_json (bones, joints, skinning weights)
+# =============================================================================
 
 def get_mesh_json(context):
     def _parse_csv_names(csv_text: str):
@@ -851,7 +926,9 @@ def get_avg_kpt_coords_3d(kpt2verts_co:dict):
     return kpt2coords
 
 
-# --------------------------- Visibility / Occlusion ------------------------
+# =============================================================================
+# VISIBILITY / OCCLUSION
+# =============================================================================
 
 def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-4):
     if deps is None:
@@ -919,7 +996,9 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
     return kpt_2_visibility_pct, kpt_2_visible_faces
 
 
-# --------------------------- Projection helpers ----------------------------
+# =============================================================================
+# PROJECTION HELPERS
+# =============================================================================
 
 
 def get_cam_matrix_for_cam(cam_obj, scene):
@@ -981,7 +1060,9 @@ def project_world_point_with_cam_matrix(P, world_coord):
     return (ph.x / ph.z, ph.y / ph.z)
 
 
-# --------------------------- Mask & YOLO writers ---------------------------
+# =============================================================================
+# MASK RENDERING & YOLO LABEL WRITERS
+# =============================================================================
 
 def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
     """
@@ -1273,7 +1354,9 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
         f.write("\n".join(lines))
 
 
-# --------------------------- TimedRender Operator ---------------------------
+# =============================================================================
+# TIMEDRENDER OPERATOR (modal render + annotation queue)
+# =============================================================================
 
 class TimedRender(Operator):
     bl_idname = "render.timed_render"
@@ -1644,7 +1727,9 @@ using opencv's contour detection can create a silhouette annotation from the bin
         return {'PASS_THROUGH'}
 
 
-# --------------------------- YOLO helpers (create dataset) ------------------
+# =============================================================================
+# YOLO DATASET HELPERS
+# =============================================================================
 
 def get_available_dir_name(imgs_dir, base_name):
     candidate = base_name
@@ -1734,7 +1819,9 @@ def create_yolo_dataset(imgs_dir, label_dir, dataset_name, train_pct, test_pct, 
     create_dataset_yaml(class_list, os.path.join(imgs_dir, dataset_name), kpt_list)
 
 
-# --------------------------- UI Operators & Panel --------------------------
+# =============================================================================
+# SETTINGS OPERATORS (apply / load config / keypoint list)
+# =============================================================================
 class SYNTH_OT_apply_settings(Operator):
     bl_idname = "synth.apply_settings"
     bl_label = "Apply And Save Settings"
@@ -1986,7 +2073,9 @@ class SYNTH_OT_export_keypoint_list(Operator):
 
 
 
-# --------------------------- Camera matrices export operator ----------------
+# =============================================================================
+# CAMERA MATRIX EXPORT
+# =============================================================================
 
 def export_cam_matrices(context):
     scene = context.scene
@@ -2042,7 +2131,9 @@ class SYNTH_OT_export_camera_matrices(Operator):
             return {'CANCELLED'}
 
 
-# -------------------- Bone groups Operator -------------------------------------
+# =============================================================================
+# BONE GROUPS & BONE PRIORS OPERATORS
+# =============================================================================
 
 class SYNTH_UL_bone_groups(UIList):
     """Draw one row per bone group with a text field + include_children toggle."""
@@ -2265,7 +2356,9 @@ class SYNTH_OT_set_bone_prior_from_pose(Operator):
         return {'FINISHED'}
 
 
-# --------------------------- Mesh export operator ----------------
+# =============================================================================
+# MESH / TEMPLATE EXPORT OPERATOR
+# =============================================================================
 
 class SYNTH_OT_export_mesh(Operator):
     bl_idname = "synth.export_mesh"
@@ -2290,7 +2383,9 @@ class SYNTH_OT_export_mesh(Operator):
             return {'CANCELLED'}
         
 
-# --------------------------- Create Videos Operator --------------------------
+# =============================================================================
+# CREATE VIDEOS OPERATOR
+# =============================================================================
 
 class SYNTH_OT_create_videos(Operator):
     bl_idname = "synth.create_videos"
@@ -2434,7 +2529,9 @@ class SYNTH_OT_create_videos(Operator):
 
 
 
-# --------------------------- Pose Time Series (schema v2) ------------------------------
+# =============================================================================
+# POSE TIME SERIES (schema v2) -- export / import / verify
+# =============================================================================
 #
 # CLAUDE FIX (A1-A9): the exchange format between this add-on and the 4D-reconstruction
 # module is now `pose_time_series/2`. The previous version exported
@@ -2936,7 +3033,686 @@ class SYNTH_OT_verify_pose_time_series_roundtrip(Operator, ImportHelper):
         return {'FINISHED'}
 
 
-# --------------------------- UI & Registration ----------------------------------
+# =============================================================================
+# RECONSTRUCTION EVALUATION -- volumetric 3D IoU & keypoint distances
+# =============================================================================
+#
+# Two metrics that quantify how well a reconstruction (an object in the
+# 'Reconstructions' collection, produced by create_animation_from_pose_time_series)
+# recovers the ground-truth synthetic animation:
+#
+#   IoU(frame)       = Vol(GT n R) / Vol(GT u R)
+#                      Monte-Carlo occupancy estimate: N points drawn uniformly from
+#                      the AABB enclosing both meshes, each classified inside/outside
+#                      by a BVHTree ray-parity test (odd hit count == inside).
+#                      Standard definition from the reconstruction literature
+#                      (Occupancy Networks, Mescheder et al. 2019, sec. 4).
+#   dist(kpt, frame) = || centroid_GT(kpt) - centroid_R(kpt) ||_2
+#                      centroid = mean world-space position of a keypoint's vertex
+#                      group members, i.e. exactly get_avg_kpt_coords_3d.
+#
+# Ray parity is preferred over bmesh.ops.intersect_boolean / the boolean modifier:
+# LBS-skinned meshes self-intersect at sharp bends, where exact CSG fails outright
+# while parity only misclassifies the small doubly-covered region.
+#
+# Both metrics are derived from ONE evaluated-mesh extraction per object per frame
+# (_recon_frame_payload), because obj.evaluated_get(deps).to_mesh() is by far the
+# most expensive step of the loop.
+
+VOLUMETRIC_IOU_SCHEMA = "volumetric_iou/1"
+KEYPOINT_DISTANCE_SCHEMA = "keypoint_distances/1"
+
+# Fixed, deliberately non-axis-aligned ray direction: fish rigs are modelled on the world
+# axes, so an axis-aligned ray grazes coplanar fin/body geometry and breaks the parity count.
+_IOU_RAY_DIR = Vector((0.5773502692, 0.3574067444, 0.7341827546)).normalized()
+_IOU_RAY_EPS = 1e-6      # offset past a hit so the same face is not re-hit
+_IOU_MAX_HITS = 256      # parity loop guard (a fish silhouette needs <10 along any ray)
+
+
+# --- GT / reconstruction pairing -------------------------------------------
+
+def _recon_kpt_list(context):
+    """Same parse as TimedRender._annotate_frame."""
+    p = context.scene.synth_props
+    return [kp.strip() for kp in p.keypoint_list_csv.split(',') if kp.strip()]
+
+
+def _iou_find_reconstruction(src_obj, explicit_name=""):
+    """Locate the mesh that create_animation_from_pose_time_series produced for `src_obj`.
+
+    That function does `new_obj = src_obj.copy()` and links the copy into 'Reconstructions'.
+    Blender uniquifies copies, so the reconstruction is NOT called `src_obj.name` -- it is
+    '<name>.001', '<name>.002', ... Match that pattern plus an identical vertex count (the copy
+    is topology-identical by construction) and take the highest suffix = most recent import.
+    Returns (obj, n_candidates).
+    """
+    col = bpy.data.collections.get("Reconstructions")
+    if col is None:
+        raise ValueError("No 'Reconstructions' collection; run "
+                         "'Create Animation from Pose Time Series' first.")
+    if explicit_name:
+        obj = col.objects.get(explicit_name)
+        if obj is None or obj.type != 'MESH':
+            raise ValueError(f"Mesh '{explicit_name}' not found in 'Reconstructions'.")
+        return obj, 1
+
+    n_src = len(src_obj.data.vertices)
+    pat = re.compile(r"^" + re.escape(src_obj.name) + r"(?:\.(\d+))?$")
+    cands = []
+    for ob in col.objects:
+        if ob.type != 'MESH' or ob is src_obj:
+            continue
+        m = pat.match(ob.name)
+        if m is None or len(ob.data.vertices) != n_src:
+            continue
+        cands.append((int(m.group(1) or 0), ob))
+    if not cands:
+        raise ValueError(f"No reconstruction of '{src_obj.name}' in 'Reconstructions' "
+                         f"(looked for '{src_obj.name}.NNN' with {n_src} vertices).")
+    cands.sort(key=lambda t: t[0])
+    return cands[-1][1], len(cands)
+
+
+def _iou_action_range(obj):
+    """Keyframed frame range of `obj`'s action, or None."""
+    if obj is None:
+        return None
+    ad = getattr(obj, "animation_data", None)
+    act = ad.action if ad else None
+    if act is None:
+        return None
+    try:
+        lo, hi = act.frame_range
+        return int(math.floor(lo)), int(math.ceil(hi))
+    except Exception:
+        return None
+
+
+def _recon_pair_context(context, report=None):
+    """Common preamble of both metric operators: GT/reconstruction pairing + frame range.
+
+    Returns dict(src_obj, src_arm, rec_obj, rec_arm, kpt_list, frame_lo, frame_hi).
+    Raises ValueError on anything the caller must turn into {'CANCELLED'}.
+    """
+    scene = context.scene
+    p = scene.synth_props
+
+    src_obj, src_arm = _pts_find_source(context)
+    rec_obj, n_cands = _iou_find_reconstruction(src_obj, p.iou_recon_object_name.strip())
+    if n_cands > 1 and report:
+        report({'WARNING'}, f"{n_cands} reconstructions of '{src_obj.name}' found; using the "
+                            f"newest ('{rec_obj.name}'). Set 'Reconstruction Object' to override.")
+    rec_arm = rec_obj.parent if (rec_obj.parent and rec_obj.parent.type == 'ARMATURE') else None
+
+    # Mismatched frame ranges: intersect the scene range with both actions' keyed ranges.
+    f_start, f_end = int(scene.frame_start), int(scene.frame_end)
+    lo, hi = f_start, f_end
+    for owner in (src_arm, rec_arm, rec_obj):
+        r = _iou_action_range(owner)
+        if r is not None:
+            lo, hi = max(lo, r[0]), min(hi, r[1])
+    if lo > hi:
+        raise ValueError(f"GT and reconstruction animations do not overlap inside the scene "
+                         f"range [{f_start}, {f_end}].")
+    if (lo, hi) != (f_start, f_end) and report:
+        report({'WARNING'}, f"Frame range mismatch: evaluating the overlap [{lo}, {hi}] instead "
+                            f"of the scene range [{f_start}, {f_end}].")
+    return {"src_obj": src_obj, "src_arm": src_arm, "rec_obj": rec_obj, "rec_arm": rec_arm,
+            "kpt_list": _recon_kpt_list(context), "frame_lo": lo, "frame_hi": hi}
+
+
+def _recon_vertex_group_members(obj):
+    """{vertex_group_name: set(vertex indices)} on the base (pre-modifier) mesh."""
+    idx2name = {vg.index: vg.name for vg in obj.vertex_groups}
+    out = {name: set() for name in idx2name.values()}
+    for v in obj.data.vertices:
+        for g in v.groups:
+            name = idx2name.get(g.group)
+            if name is not None:
+                out[name].add(v.index)
+    return out
+
+
+def _recon_check_keypoint_correspondence(src_obj, rec_obj, kpt_list):
+    """Verify the 'no correspondence search needed' assumption, loudly.
+
+    create_animation_from_pose_time_series builds the reconstruction as `src_obj.copy()` with
+    `new_obj.data = src_obj.data.copy()`, so vertex count, vertex order AND vertex groups are
+    identical by construction and keypoint k on GT is keypoint k on R by definition. That is an
+    assumption about how the reconstruction was produced, not an invariant -- a hand-built or
+    re-imported object would break it silently and yield distances between different anatomy.
+    Checked once, O(V), before any frame is touched. Returns the list of keypoints that exist on
+    both objects but have no members (handled per-frame as 'missing', not fatal).
+    """
+    n_src, n_rec = len(src_obj.data.vertices), len(rec_obj.data.vertices)
+    if n_src != n_rec:
+        raise ValueError(f"vertex count mismatch: GT '{src_obj.name}' has {n_src}, reconstruction "
+                         f"'{rec_obj.name}' has {n_rec}; keypoint correspondence is not defined.")
+    g_src = _recon_vertex_group_members(src_obj)
+    g_rec = _recon_vertex_group_members(rec_obj)
+    miss_src = [k for k in kpt_list if k not in g_src]
+    miss_rec = [k for k in kpt_list if k not in g_rec]
+    if miss_src or miss_rec:
+        raise ValueError(
+            f"keypoint vertex groups missing -- on GT '{src_obj.name}': {miss_src or 'none'}; "
+            f"on reconstruction '{rec_obj.name}': {miss_rec or 'none'}. Fix 'Keypoint List' or "
+            f"re-create the reconstruction.")
+    differing = [k for k in kpt_list if g_src[k] != g_rec[k]]
+    if differing:
+        raise ValueError(
+            f"vertex group membership differs between GT and reconstruction for {differing}; "
+            f"refusing to compute distances between mismatched keypoints.")
+    return [k for k in kpt_list if not g_src[k]]
+
+
+# --- per-frame evaluation (shared by both metrics) --------------------------
+
+def _recon_frame_payload(deps, collection_name, obj, kpt_list, need_bvh, report=None):
+    """ONE evaluated-mesh extraction per object per frame, feeding both metrics.
+
+    Everything comes out of a single get_deformed_mesh_data() call:
+      (a) `vertices` + `faces` -> world-space BVHTree + AABB for the IoU occupancy sampling,
+      (b) `kpt_2_verts_worldco` -> get_avg_kpt_coords_3d -> keypoint centroids.
+    to_mesh()/to_mesh_clear() handling stays inside get_deformed_mesh_data; the BVHTree owns its
+    own copy of the geometry, so nothing survives the frame except what is returned.
+
+    Pass kpt_list=[] to skip the vertex-group scan, need_bvh=False to skip the tree build.
+    """
+    obj_eval = obj.evaluated_get(deps)
+    # An object in an excluded/hidden collection is absent from the depsgraph: evaluated_get()
+    # then returns the original and to_mesh() yields the UNDEFORMED rest mesh -- a constant,
+    # meaningless metric rather than an error.
+    if report is not None and not obj_eval.is_evaluated:
+        report({'WARNING'}, f"'{obj.name}' is not in the depsgraph (collection excluded or "
+                            f"disabled in the view layer); its mesh will not be deformed.")
+
+    faces, vertices, _normals, kpt_2_verts_worldco, _kpt_faces = get_deformed_mesh_data(
+        deps, collection_name, obj.name, kpt_list)
+
+    # get_avg_kpt_coords_3d wants {kpt: [(x, y, z), ...]}, but get_deformed_mesh_data returns
+    # [{"id": i, "co": (x, y, z)}, ...]; feeding it the raw dicts raises inside
+    # np.array(..., dtype=float). The 2D annotation path hands it bare coord tuples for the
+    # same reason. Unwrap "co" here rather than duplicating the centroid logic.
+    payload = {
+        "n_verts": len(vertices),
+        "n_faces": 0,
+        "kpt_centroids": get_avg_kpt_coords_3d(
+            {k: [e["co"] for e in ents] for k, ents in kpt_2_verts_worldco.items()}),
+        "bvh": None,
+        "box": None,
+    }
+    if not need_bvh:
+        return payload
+
+    mw = obj_eval.matrix_world
+    world = [mw @ Vector(v["co"]) for v in vertices]
+    polys = [f["verts"] for f in faces if len(f["verts"]) >= 3]
+    payload["n_faces"] = len(polys)
+    if not world or not polys:
+        return payload                       # degenerate: caller skips the frame
+
+    xs = [c.x for c in world]
+    ys = [c.y for c in world]
+    zs = [c.z for c in world]
+    payload["box"] = (Vector((min(xs), min(ys), min(zs))),
+                      Vector((max(xs), max(ys), max(zs))))
+    # FromPolygons tessellates ngons internally, which is what the parity test needs (a
+    # non-planar LBS-deformed ngon would otherwise be entered and left through one face).
+    payload["bvh"] = BVHTree.FromPolygons(world, polys, all_triangles=False, epsilon=0.0)
+    return payload
+
+
+# --- volumetric IoU ---------------------------------------------------------
+
+def _iou_point_inside(bvh, point, direction, max_dist):
+    """Ray-parity inside/outside test (odd hit count == inside).
+
+    mathutils' BVHTree.ray_cast only returns the FIRST hit, so the ray is restarted just past
+    each hit.
+    """
+    origin = point
+    remaining = max_dist
+    hits = 0
+    while hits < _IOU_MAX_HITS:
+        loc, _nrm, idx, dist = bvh.ray_cast(origin, direction, remaining)
+        if idx is None:
+            break
+        hits += 1
+        origin = loc + direction * _IOU_RAY_EPS
+        remaining -= (dist + _IOU_RAY_EPS)
+        if remaining <= 0.0:
+            break
+    return (hits & 1) == 1
+
+
+def _iou_frame(bvh_a, box_a, bvh_b, box_b, n_samples, seed):
+    """Monte-Carlo occupancy IoU between two world-space BVHTrees.
+
+    Samples uniformly from the AABB enclosing both meshes. Padding the box is IoU-neutral --
+    extra points fall outside both meshes and enter neither numerator nor denominator -- it only
+    guards against samples landing exactly on a mesh-tangent box face.
+    Returns a dict, or None if the box or the union is degenerate.
+    """
+    lo = np.array([min(box_a[0][i], box_b[0][i]) for i in range(3)], dtype=np.float64)
+    hi = np.array([max(box_a[1][i], box_b[1][i]) for i in range(3)], dtype=np.float64)
+    ext = hi - lo
+    diag = float(np.linalg.norm(ext))
+    if diag <= 0.0 or not np.all(np.isfinite(ext)):
+        return None
+    pad = 1e-3 * diag
+    lo -= pad
+    hi += pad
+    ext = hi - lo
+    box_vol = float(ext[0] * ext[1] * ext[2])
+    if box_vol <= 0.0:
+        return None
+
+    rng = np.random.default_rng(seed)
+    pts = rng.random((n_samples, 3)) * ext + lo
+
+    # Cheap vectorised AABB rejection: a point outside a mesh's own bbox cannot be inside it,
+    # which removes most of the ray casts when the two meshes are offset from each other.
+    a_lo = np.array(box_a[0], dtype=np.float64)
+    a_hi = np.array(box_a[1], dtype=np.float64)
+    b_lo = np.array(box_b[0], dtype=np.float64)
+    b_hi = np.array(box_b[1], dtype=np.float64)
+    cand_a = np.all((pts >= a_lo) & (pts <= a_hi), axis=1)
+    cand_b = np.all((pts >= b_lo) & (pts <= b_hi), axis=1)
+
+    pts_list = pts.tolist()
+    ray_len = diag * 2.0 + 1.0
+    inside_a = np.zeros(n_samples, dtype=bool)
+    inside_b = np.zeros(n_samples, dtype=bool)
+    for i in np.nonzero(cand_a)[0]:
+        inside_a[i] = _iou_point_inside(bvh_a, Vector(pts_list[i]), _IOU_RAY_DIR, ray_len)
+    for i in np.nonzero(cand_b)[0]:
+        inside_b[i] = _iou_point_inside(bvh_b, Vector(pts_list[i]), _IOU_RAY_DIR, ray_len)
+
+    n_a = int(inside_a.sum())
+    n_b = int(inside_b.sum())
+    n_i = int((inside_a & inside_b).sum())
+    n_u = int((inside_a | inside_b).sum())
+    if n_u == 0:
+        return None                      # both meshes zero-volume w.r.t. this sample set
+
+    iou = n_i / n_u
+    scale = box_vol / float(n_samples)
+    return {
+        "iou": float(iou),
+        # binomial standard error of the ratio over the union samples; ~0.003 at n_u = 20k
+        "iou_stderr": float(math.sqrt(max(iou * (1.0 - iou), 0.0) / n_u)),
+        "vol_gt": float(n_a * scale),
+        "vol_recon": float(n_b * scale),
+        "vol_intersection": float(n_i * scale),
+        "vol_union": float(n_u * scale),
+        "n_inside_gt": n_a,
+        "n_inside_recon": n_b,
+        "n_intersection": n_i,
+        "n_union": n_u,
+    }
+
+
+# --- keypoint distances -----------------------------------------------------
+
+def _kpt_frame_distances(cent_gt, cent_rc, kpt_list, missing, report=None):
+    """{kpt: || c_GT - c_R ||_2} for the keypoints present on both meshes this frame.
+
+    A keypoint whose vertex group resolved to no vertices on the evaluated mesh is dropped by
+    get_avg_kpt_coords_3d; it is excluded from this frame's aggregate and warned about ONCE
+    (`missing` is the operator-lifetime memo), never per frame.
+    """
+    out = {}
+    for k in kpt_list:
+        a, b = cent_gt.get(k), cent_rc.get(k)
+        if a is None or b is None:
+            if k not in missing:
+                where = ("both meshes" if a is None and b is None
+                         else ("the GT mesh" if a is None else "the reconstruction"))
+                missing[k] = where
+                if report:
+                    report({'WARNING'}, f"keypoint '{k}' has no vertices on {where}; excluded "
+                                        f"from every frame it is missing on.")
+            continue
+        out[k] = float((Vector(a) - Vector(b)).length)
+    return out
+
+
+def _kpt_record(frame, per_keypoint):
+    """One frames[] entry: per-keypoint distances plus this frame's mean/max."""
+    entry = {"frame": int(frame), "per_keypoint": per_keypoint}
+    if per_keypoint:
+        worst = max(per_keypoint, key=per_keypoint.get)
+        entry["mean"] = float(sum(per_keypoint.values()) / len(per_keypoint))
+        entry["max"] = float(per_keypoint[worst])
+        entry["max_keypoint"] = worst
+    else:
+        entry["mean"] = None
+        entry["max"] = None
+        entry["max_keypoint"] = None
+    entry["n_keypoints"] = len(per_keypoint)
+    return entry
+
+
+def _kpt_dist_meta(p, ctx, lo, hi):
+    return {
+        "schema": KEYPOINT_DISTANCE_SCHEMA,
+        "producer": "synthetic_data_generator_ui.py",
+        "metric": "l2_distance_between_vertex_group_centroids_world_space",
+        "gt_collection": p.collection_name,
+        "gt_object": ctx["src_obj"].name,
+        "gt_armature": ctx["src_arm"].name if ctx["src_arm"] else None,
+        "recon_collection": "Reconstructions",
+        "recon_object": ctx["rec_obj"].name,
+        "recon_armature": ctx["rec_arm"].name if ctx["rec_arm"] else None,
+        "keypoint_list": list(ctx["kpt_list"]),
+        "frame_start": int(lo),
+        "frame_end": int(hi),
+        "units": "meters",
+    }
+
+
+def _kpt_dist_finalize(records, per_kpt, missing, meta, out_path):
+    """Aggregate per keypoint / per frame, write the JSON, return the summary dict."""
+    per_kpt_summary = {}
+    for k, series in per_kpt.items():
+        vals = [d for _f, d in series]
+        i_max = max(range(len(vals)), key=lambda j: vals[j])
+        per_kpt_summary[k] = {
+            "n_frames": len(vals),
+            "mean": float(sum(vals) / len(vals)),
+            "max": float(vals[i_max]),
+            "max_frame": int(series[i_max][0]),
+        }
+    all_vals = [(f["frame"], k, d) for f in records for k, d in f["per_keypoint"].items()]
+    overall = {
+        "n_frames": len(records),
+        "n_keypoints": len(per_kpt_summary),
+        "skipped_keypoints": dict(missing),
+        "per_keypoint": per_kpt_summary,
+    }
+    if all_vals:
+        mx = max(all_vals, key=lambda t: t[2])
+        overall.update({
+            "overall_mean": float(sum(t[2] for t in all_vals) / len(all_vals)),
+            "overall_max": float(mx[2]),
+            "overall_max_frame": int(mx[0]),
+            "overall_max_keypoint": mx[1],
+        })
+    data = {"meta": meta, "summary": overall, "frames": records}
+    with open(out_path, 'w') as jf:
+        json.dump(data, jf, indent=2)
+    return overall
+
+
+# --- operators --------------------------------------------------------------
+
+class SYNTH_OT_compute_volumetric_iou(Operator):
+    """Per-frame volumetric 3D IoU between the GT mesh and its reconstruction"""
+    bl_idname = "synth.compute_volumetric_iou"
+    bl_label = "Compute Volumetric 3D IoU"
+    bl_description = ("Monte-Carlo occupancy IoU, Vol(GT n R) / Vol(GT u R), between the target "
+                      "mesh and its counterpart in 'Reconstructions', for every frame in the "
+                      "scene range. Optionally computes the per-keypoint 3D distances in the "
+                      "same pass. Writes JSON next to the pose time series export")
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        try:
+            ctx = _recon_pair_context(context, self.report)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        src_obj, rec_obj = ctx["src_obj"], ctx["rec_obj"]
+        lo, hi = ctx["frame_lo"], ctx["frame_hi"]
+        with_kpts = bool(p.iou_with_keypoint_distances)
+        kpt_list = ctx["kpt_list"] if with_kpts else []
+        if with_kpts and not kpt_list:
+            with_kpts = False
+            self.report({'WARNING'}, "'Keypoint List' is empty; computing the IoU only.")
+        if with_kpts:
+            try:
+                empty = _recon_check_keypoint_correspondence(src_obj, rec_obj, kpt_list)
+            except Exception as exc:
+                self.report({'ERROR'}, f"Keypoint correspondence check failed: {exc}")
+                return {'CANCELLED'}
+            if empty:
+                self.report({'WARNING'}, f"keypoint vertex groups with no members: {empty}")
+
+        n_samples, seed = int(p.iou_sample_count), int(p.iou_random_seed)
+        out_dir = resolve(p.annot_out_dir)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not create {out_dir}: {exc}")
+            return {'CANCELLED'}
+        iou_path = os.path.join(out_dir,
+                                f"volumetric_iou_{p.collection_name}_{p.object_name}.json")
+        kpt_path = os.path.join(out_dir,
+                                f"keypoint_distances_{p.collection_name}_{p.object_name}.json")
+
+        data = {
+            "meta": {
+                "schema": VOLUMETRIC_IOU_SCHEMA,
+                "producer": "synthetic_data_generator_ui.py",
+                "method": "monte_carlo_occupancy_bvh_ray_parity",
+                "gt_collection": p.collection_name,
+                "gt_object": src_obj.name,
+                "recon_object": rec_obj.name,
+                "samples_per_frame": n_samples,
+                "random_seed": seed,
+                "ray_direction": [float(_IOU_RAY_DIR.x), float(_IOU_RAY_DIR.y),
+                                  float(_IOU_RAY_DIR.z)],
+                "frame_start": int(lo),
+                "frame_end": int(hi),
+            },
+            "frames": [],
+        }
+        kpt_records, per_kpt, missing = [], defaultdict(list), {}
+
+        deps = context.evaluated_depsgraph_get()
+        original_frame = scene.frame_current
+        skipped, degenerate_warned = [], False
+        try:
+            for frame in range(lo, hi + 1):
+                scene.frame_set(frame)
+                deps.update()
+
+                pay_gt = pay_rc = None
+                try:
+                    rep = self.report if frame == lo else None
+                    pay_gt = _recon_frame_payload(deps, p.collection_name, src_obj,
+                                                  kpt_list, True, rep)
+                    pay_rc = _recon_frame_payload(deps, "Reconstructions", rec_obj,
+                                                  kpt_list, True, rep)
+
+                    if with_kpts:
+                        d = _kpt_frame_distances(pay_gt["kpt_centroids"], pay_rc["kpt_centroids"],
+                                                 kpt_list, missing, self.report)
+                        kpt_records.append(_kpt_record(frame, d))
+                        for k, v in d.items():
+                            per_kpt[k].append((frame, v))
+
+                    if pay_gt["bvh"] is None or pay_rc["bvh"] is None:
+                        if not degenerate_warned:
+                            degenerate_warned = True
+                            self.report({'WARNING'},
+                                        f"Frame {frame}: degenerate mesh (GT faces="
+                                        f"{pay_gt['n_faces']}, recon faces={pay_rc['n_faces']}); "
+                                        f"frame skipped.")
+                        skipped.append(frame)
+                        data["frames"].append({"frame": int(frame), "iou": None,
+                                               "reason": "degenerate_mesh"})
+                        continue
+
+                    res = _iou_frame(pay_gt["bvh"], pay_gt["box"],
+                                     pay_rc["bvh"], pay_rc["box"], n_samples, seed)
+                    if res is None:
+                        if not degenerate_warned:
+                            degenerate_warned = True
+                            self.report({'WARNING'}, f"Frame {frame}: zero-volume occupancy; "
+                                                     f"frame skipped.")
+                        skipped.append(frame)
+                        data["frames"].append({"frame": int(frame), "iou": None,
+                                               "reason": "zero_volume"})
+                        continue
+                    res["frame"] = int(frame)
+                    data["frames"].append(res)
+                finally:
+                    # BVHTrees hold their own geometry copy; drop both payloads every frame so
+                    # nothing accumulates over a several-hundred-frame sequence.
+                    del pay_gt
+                    del pay_rc
+        except Exception as exc:
+            self.report({'ERROR'}, f"Computation failed at frame {scene.frame_current}: {exc}")
+            return {'CANCELLED'}
+        finally:
+            scene.frame_set(original_frame)
+
+        vals = [f["iou"] for f in data["frames"] if f.get("iou") is not None]
+        if not vals:
+            self.report({'ERROR'}, "No frame produced a valid IoU.")
+            return {'CANCELLED'}
+        i_min = min(range(len(vals)), key=lambda k: vals[k])
+        i_max = max(range(len(vals)), key=lambda k: vals[k])
+        valid_frames = [f["frame"] for f in data["frames"] if f.get("iou") is not None]
+        data["summary"] = {
+            "n_frames": len(data["frames"]),
+            "n_valid": len(vals),
+            "n_skipped": len(skipped),
+            "skipped_frames": skipped,
+            "mean_iou": float(sum(vals) / len(vals)),
+            "min_iou": float(vals[i_min]),
+            "min_iou_frame": int(valid_frames[i_min]),
+            "max_iou": float(vals[i_max]),
+            "max_iou_frame": int(valid_frames[i_max]),
+        }
+
+        try:
+            with open(iou_path, 'w') as jf:
+                json.dump(data, jf, indent=2)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not write {iou_path}: {exc}")
+            return {'CANCELLED'}
+
+        s = data["summary"]
+        msg = (f"3D IoU vs '{rec_obj.name}': mean {s['mean_iou']:.4f}, "
+               f"min {s['min_iou']:.4f} @ {s['min_iou_frame']}, "
+               f"max {s['max_iou']:.4f} @ {s['max_iou_frame']} "
+               f"({s['n_valid']}/{s['n_frames']} frames, {n_samples} samples)")
+        level = 'INFO'
+        if with_kpts and kpt_records:
+            try:
+                ks = _kpt_dist_finalize(kpt_records, per_kpt, missing,
+                                        _kpt_dist_meta(p, ctx, lo, hi), kpt_path)
+            except Exception as exc:
+                self.report({'WARNING'}, f"IoU written, but keypoint distances failed: {exc}")
+            else:
+                msg += (f"; kpt dist mean {ks.get('overall_mean', float('nan')):.5f} m, "
+                        f"max {ks.get('overall_max', float('nan')):.5f} m @ frame "
+                        f"{ks.get('overall_max_frame')} ('{ks.get('overall_max_keypoint')}')")
+                thr = float(p.kpt_dist_warn_threshold)
+                if thr > 0.0 and ks.get("overall_max", 0.0) > thr:
+                    level = 'WARNING'
+        self.report({level}, msg + f" -> {out_dir}")
+        return {'FINISHED'}
+
+
+class SYNTH_OT_compute_keypoint_distances(Operator):
+    """Per-frame, per-keypoint 3D distance between GT and reconstruction"""
+    bl_idname = "synth.compute_keypoint_distances"
+    bl_label = "Compute Keypoint 3D Distances"
+    bl_description = ("For every frame, the L2 distance between each keypoint's world-space "
+                      "vertex-group centroid on the target mesh and on its counterpart in "
+                      "'Reconstructions'. Writes keypoint_distances_<collection>_<object>.json")
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        try:
+            ctx = _recon_pair_context(context, self.report)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        kpt_list = ctx["kpt_list"]
+        if not kpt_list:
+            self.report({'ERROR'}, "'Keypoint List' is empty; nothing to measure.")
+            return {'CANCELLED'}
+
+        src_obj, rec_obj = ctx["src_obj"], ctx["rec_obj"]
+        try:
+            empty = _recon_check_keypoint_correspondence(src_obj, rec_obj, kpt_list)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Keypoint correspondence check failed: {exc}")
+            return {'CANCELLED'}
+        if empty:
+            self.report({'WARNING'}, f"keypoint vertex groups with no members: {empty}")
+
+        out_dir = resolve(p.annot_out_dir)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not create {out_dir}: {exc}")
+            return {'CANCELLED'}
+        out_path = os.path.join(out_dir,
+                                f"keypoint_distances_{p.collection_name}_{p.object_name}.json")
+
+        lo, hi = ctx["frame_lo"], ctx["frame_hi"]
+        deps = context.evaluated_depsgraph_get()
+        original_frame = scene.frame_current
+        records, per_kpt, missing = [], defaultdict(list), {}
+        try:
+            for frame in range(lo, hi + 1):
+                scene.frame_set(frame)
+                deps.update()
+                rep = self.report if frame == lo else None
+                # need_bvh=False: no tree build, no occupancy sampling -- this pass is ~2
+                # to_mesh() calls per frame and nothing else.
+                pay_gt = _recon_frame_payload(deps, p.collection_name, src_obj,
+                                              kpt_list, False, rep)
+                pay_rc = _recon_frame_payload(deps, "Reconstructions", rec_obj,
+                                              kpt_list, False, rep)
+                d = _kpt_frame_distances(pay_gt["kpt_centroids"], pay_rc["kpt_centroids"],
+                                         kpt_list, missing, self.report)
+                records.append(_kpt_record(frame, d))
+                for k, v in d.items():
+                    per_kpt[k].append((frame, v))
+        except Exception as exc:
+            self.report({'ERROR'}, f"Keypoint distances failed at frame "
+                                   f"{scene.frame_current}: {exc}")
+            return {'CANCELLED'}
+        finally:
+            scene.frame_set(original_frame)
+
+        if not per_kpt:
+            self.report({'ERROR'}, "No keypoint could be measured on any frame.")
+            return {'CANCELLED'}
+
+        try:
+            summary = _kpt_dist_finalize(records, per_kpt, missing,
+                                         _kpt_dist_meta(p, ctx, lo, hi), out_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not write {out_path}: {exc}")
+            return {'CANCELLED'}
+
+        thr = float(p.kpt_dist_warn_threshold)
+        level = 'WARNING' if (thr > 0.0 and summary.get("overall_max", 0.0) > thr) else 'INFO'
+        self.report({level},
+                    f"Keypoint dist vs '{rec_obj.name}': mean "
+                    f"{summary['overall_mean']:.5f} m, max {summary['overall_max']:.5f} m "
+                    f"('{summary['overall_max_keypoint']}' @ frame "
+                    f"{summary['overall_max_frame']}) over {summary['n_frames']} frames, "
+                    f"{summary['n_keypoints']} keypoints -> {out_path}")
+        return {'FINISHED'}
+
+
+# =============================================================================
+# UI PANEL & REGISTRATION
+# =============================================================================
 
 class SYNTH_PT_main_panel(Panel):
     bl_space_type = 'VIEW_3D'
@@ -3107,6 +3883,18 @@ class SYNTH_PT_main_panel(Panel):
         row = layout.row()
         row.operator('synth.verify_pose_time_series_roundtrip', icon='CHECKMARK')
 
+        box = layout.box()
+        box.label(text="Reconstruction Evaluation")
+        row = box.row(align=True)
+        row.prop(p, 'iou_sample_count')
+        row.prop(p, 'iou_random_seed')
+        box.prop(p, 'iou_recon_object_name')
+        box.prop(p, 'iou_with_keypoint_distances')
+        box.prop(p, 'kpt_dist_warn_threshold')
+        row = box.row(align=True)
+        row.operator('synth.compute_volumetric_iou', icon='MESH_CUBE')
+        row.operator('synth.compute_keypoint_distances', icon='EMPTY_AXIS')
+
 
 class SYNTH_OT_unregister_timed_render(Operator):
     bl_idname = "synth.unregister_timed_render"
@@ -3145,6 +3933,8 @@ classes = (
     SYNTH_OT_export_pose_time_series_json,
     SYNTH_OT_create_animation_from_pose_time_series,
     SYNTH_OT_verify_pose_time_series_roundtrip,
+    SYNTH_OT_compute_volumetric_iou,
+    SYNTH_OT_compute_keypoint_distances,
 )
 
 
