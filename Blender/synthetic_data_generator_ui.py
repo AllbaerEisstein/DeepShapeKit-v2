@@ -31,6 +31,7 @@ bl_info = {
 #   UI PANEL & REGISTRATION
 
 import csv
+import pickle
 import bpy
 import bmesh
 import os
@@ -266,6 +267,28 @@ class SYNTH_PropertyGroup(PropertyGroup):
         default=True
     )
 
+    # Reconstruction-dataset export: a second, parallel output tree in the schema the DSKv2
+    # reconstruction pipeline consumes (the one extract_frames_edit.py writes), so the same
+    # render pass that produces YOLO training labels also produces annotated ground truth that
+    # can be pointed at `--ground-truth-dataset` or `--reconstruct-from-gt`.
+    create_reconstruction_dataset: BoolProperty(
+        name="Create Reconstruction Dataset",
+        description=(
+            "Additionally write a DSKv2-schema reconstruction dataset (origin/, cropped/, mask/, "
+            "mask_full/, files.csv, files_crop.csv, keypoints_confs.pickle, keypoints_gt.pickle, "
+            "index.json) alongside the YOLO export. Requires 'Render Binary Masks', since the "
+            "binary mask render is the ground-truth segmentation"
+        ),
+        default=False
+    )
+
+    reconstruction_dataset_out_dir: StringProperty(
+        name="Reconstruction Dataset Dir",
+        description="Output root for the DSKv2-schema reconstruction dataset",
+        subtype='DIR_PATH',
+        default="//synthetic_data/dataset"
+    )
+
     # Reconstruction evaluation (volumetric IoU / keypoint distances)
     iou_sample_count: IntProperty(
         name="IoU Samples / Frame",
@@ -314,6 +337,20 @@ class SYNTH_PropertyGroup(PropertyGroup):
 # =============================================================================
 # UTILITIES -- paths, scene lookups, camera intrinsics
 # =============================================================================
+
+def camera_name_to_view_name(cam_name):
+    """
+    Map a Blender camera name to the view/folder name used everywhere downstream.
+
+    'Camera.003_Fish Top R' -> '003_Fish Top R_Camera'. This expression previously appeared
+    verbatim in both TimedRender.make_prefix_cam_frame and export_cam_matrices; the
+    reconstruction-dataset export needs the same keys as cam_matrices.json, so all three now
+    share this one definition.
+    """
+    if '.' in cam_name:
+        return cam_name.split('.', 1)[1] + '_' + cam_name.split('.', 1)[0]
+    return cam_name
+
 
 def resolve(path):
     return bpy.path.abspath(path)
@@ -1358,6 +1395,278 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
 # TIMEDRENDER OPERATOR (modal render + annotation queue)
 # =============================================================================
 
+# =============================================================================
+# RECONSTRUCTION DATASET EXPORT (DSKv2 schema)
+#
+# Writes the same folder layout `extract_frames_edit.py` produces and
+# `dataloaders_edit.Multiview_Dataset` consumes, but populated with *annotated* ground truth
+# instead of detector output.
+#
+# Two loader facts drive the design:
+#   1. Multiview_Dataset treats a (frame, instance, view) as "mask present" only if the
+#      `cropped`, `mask` AND `mask_full` rows all exist in files_crop.csv with a non-empty
+#      file_loc and all three files are readable. Writing only mask_full/ makes the loader
+#      silently report every frame as maskless, so the tight crop and the cropped image are
+#      written too even though their pixel content is never read into the returned tensors.
+#   2. Keypoint presence is driven purely by conf > 0 in keypoints_confs.pickle, which has no
+#      room for a tri-state visibility flag. The lossless 0/1/2 flags therefore go into a
+#      separate keypoints_gt.pickle that only the evaluation code reads.
+# =============================================================================
+
+RECON_FILES_CSV_HEADER = ['frame', 'file_loc', 'category', 'sub_index', 'folder']
+RECON_FILES_CROP_CSV_HEADER = ['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox']
+
+
+def recon_dataset_crop_and_pad(image, mask, bbox):
+    """
+    Square-pad crop, mirroring extract_frames_edit.predict_masks_yolo's local crop_and_pad so
+    the two dataset producers agree. Returns (cropped_image, cropped_mask).
+    """
+    xmin, ymin, xmax, ymax = bbox
+    crop_img = image[ymin:ymax, xmin:xmax]
+    crop_mask = mask[ymin:ymax, xmin:xmax]
+
+    h, w = crop_img.shape[:2]
+    diff = abs(h - w)
+    if h < w:
+        pad_top = diff // 2
+        pad_bottom = diff - pad_top
+        crop_img = np.pad(crop_img, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode='constant')
+        crop_mask = np.pad(crop_mask, ((pad_top, pad_bottom), (0, 0)), mode='constant')
+    elif w < h:
+        pad_left = diff // 2
+        pad_right = diff - pad_left
+        crop_img = np.pad(crop_img, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant')
+        crop_mask = np.pad(crop_mask, ((0, 0), (pad_left, pad_right)), mode='constant')
+    return crop_img, crop_mask
+
+
+def recon_dataset_read_binary_mask(mask_path):
+    """Read the rendered GT mask as a 0/1 uint8 array, or None if it is unreadable."""
+    img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    _, binary = cv2.threshold(img, 127, 1, cv2.THRESH_BINARY)
+    return binary.astype(np.uint8)
+
+
+def recon_dataset_write_frame(
+    root, view_name, frame, origin_image_path, gt_mask_binary,
+    kpt_2_coords, kpt_2_vis_status, kpt_list, write_bbox_masked=True,
+):
+    """
+    Write one (view, frame) into the reconstruction dataset and return the CSV rows and the
+    two keypoint dictionaries for it. Nothing is appended to disk-resident CSVs here; the
+    caller accumulates and the finalizer writes them, because TimedRender is a modal operator
+    processing one queue item per tick and a partially-written run must stay re-runnable.
+
+    An empty GT mask (object fully out of frame or fully occluded) yields no crop rows at all
+    and the "no instance detected" keypoint sentinel, rather than a degenerate zero-area bbox
+    that the loader would happily accept.
+    """
+    view_dir = os.path.join(root, view_name)
+    for sub in ('origin', 'cropped', 'mask', 'mask_full', 'bbox-masked_image', 'keypoints_results'):
+        os.makedirs(os.path.join(view_dir, sub), exist_ok=True)
+
+    origin_name = f"{view_name}_{frame}.png"
+    origin_rel = f"{view_name}/origin/{origin_name}"
+    shutil.copyfile(origin_image_path, os.path.join(view_dir, 'origin', origin_name))
+
+    files_row = [frame, origin_rel, 'origin', 0, view_name]
+    crop_rows = []
+
+    has_instance = gt_mask_binary is not None and int(gt_mask_binary.sum()) > 0
+    if has_instance:
+        x, y, w, h = cv2.boundingRect(gt_mask_binary)
+        bbox = [int(x), int(y), int(x + w), int(y + h)]
+        origin_img = cv2.imread(str(origin_image_path), cv2.IMREAD_COLOR)
+        crop_img, crop_mask = recon_dataset_crop_and_pad(origin_img, gt_mask_binary, bbox)
+
+        cv2.imwrite(os.path.join(view_dir, 'mask_full', f"image_{frame}_0_mask_full.png"),
+                    (gt_mask_binary * 255).astype(np.uint8))
+        cv2.imwrite(os.path.join(view_dir, 'mask', f"image_{frame}_0_mask.png"),
+                    (crop_mask * 255).astype(np.uint8))
+        cv2.imwrite(os.path.join(view_dir, 'cropped', f"image_{frame}_0.png"), crop_img)
+
+        bbox_str = f"[{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}]"
+        crop_rows.append([frame, f"{view_name}/cropped/image_{frame}_0.png", 'cropped', 0, view_name, bbox_str])
+        crop_rows.append([frame, f"{view_name}/mask/image_{frame}_0_mask.png", 'mask', 0, view_name, bbox_str])
+        crop_rows.append([frame, f"{view_name}/mask_full/image_{frame}_0_mask_full.png", 'mask_full', 0, view_name, bbox_str])
+
+        if write_bbox_masked:
+            # Not needed by Multiview_Dataset, but it gives full schema parity so this tree can
+            # also be fed to predict_masks_yolo / detect_keypoints_yolo as if it were real
+            # extract_from_video output.
+            bbox_masked = np.zeros_like(origin_img)
+            bbox_masked[bbox[1]:bbox[3], bbox[0]:bbox[2]] = origin_img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            name = f"image_{frame}_0_bbox-masked.png"
+            cv2.imwrite(os.path.join(view_dir, 'bbox-masked_image', name), bbox_masked)
+            crop_rows.append([frame, f"{view_name}/bbox-masked_image/{name}", 'bbox-masked', 0, view_name, bbox_str])
+
+    # Pipeline-native, lossy: this is what the optimizer consumes under --reconstruct-from-gt.
+    # Only genuinely visible keypoints get a confidence, because a real detector cannot see
+    # what is occluded; occluded (vis == 1) is therefore correctly recorded as undetected.
+    if has_instance:
+        confs_entry = {}
+        for kpt in kpt_list:
+            if kpt_2_vis_status.get(kpt, 0) == 2:
+                x_img, y_img = kpt_2_coords.get(kpt, (0.0, 0.0))
+                confs_entry[kpt] = [float(x_img), float(y_img), 1.0]
+            else:
+                confs_entry[kpt] = [0.0, 0.0, 0.0]
+    else:
+        confs_entry = {kpt: [-1.0, -1.0, -1.0] for kpt in kpt_list}
+
+    # Evaluation-only, lossless: the raw 0/1/2 flag is kept unconditionally so the metrics can
+    # separate a miss (GT visible, detector silent) from a correct absence.
+    gt_entry = {}
+    for kpt in kpt_list:
+        vis = int(kpt_2_vis_status.get(kpt, 0))
+        x_img, y_img = kpt_2_coords.get(kpt, (0.0, 0.0)) if vis > 0 else (0.0, 0.0)
+        gt_entry[kpt] = [float(x_img), float(y_img), float(vis)]
+
+    return files_row, crop_rows, confs_entry, gt_entry
+
+
+def _recon_read_existing_csv(path, key_fields, header):
+    """Read an existing CSV into {key_tuple: row_list}; empty dict if absent or unreadable."""
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    try:
+        with open(path, newline='') as fh:
+            for row in csv.DictReader(fh, quotechar='"'):
+                key = tuple(str(row.get(f, '')) for f in key_fields)
+                out[key] = [row.get(col, '') for col in header]
+    except Exception:
+        return {}
+    return out
+
+
+def _recon_load_existing_pickle(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'rb') as fh:
+            data = pickle.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def recon_dataset_finalize(root, state, kpt_list, report=None):
+    """
+    Merge this run's accumulated rows with whatever is already on disk and write the per-view
+    CSVs, the two keypoint pickles and index.json.
+
+    Merging rather than appending is what makes the export incrementally safe: TimedRender's
+    queue builder skips (camera, frame) items whose renders and labels already exist, so a
+    resumed run holds only the newly rendered frames in memory and must not drop the rest.
+    """
+    os.makedirs(root, exist_ok=True)
+    index_path = os.path.join(root, 'index.json')
+
+    index = {}
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as fh:
+                index = json.load(fh)
+        except Exception:
+            index = {}
+
+    frame_folders = list(index.get('frame_folders', []))
+    index_files = dict(index.get('index_files', {}))
+    image_sizes = dict(index.get('image_sizes', {}))
+    image_counts = dict(index.get('image_counts', {}))
+    camera_matrices = dict(index.get('camera_matrices', {}))
+
+    for view_name, view_state in state['views'].items():
+        view_dir = os.path.join(root, view_name)
+        for sub in ('origin', 'cropped', 'mask', 'mask_full', 'bbox-masked_image', 'keypoints_results'):
+            os.makedirs(os.path.join(view_dir, sub), exist_ok=True)
+
+        files_csv_path = os.path.join(view_dir, 'files.csv')
+        merged_files = _recon_read_existing_csv(files_csv_path, ['frame'], RECON_FILES_CSV_HEADER)
+        for row in view_state['files_rows']:
+            merged_files[(str(row[0]),)] = row
+
+        crop_csv_path = os.path.join(view_dir, 'files_crop.csv')
+        merged_crops = _recon_read_existing_csv(
+            crop_csv_path, ['frame', 'category', 'sub_index'], RECON_FILES_CROP_CSV_HEADER)
+        # Drop every stale crop row for a frame this run re-rendered before re-adding, so a
+        # frame that changed from "has instance" to "no instance" does not keep its old rows.
+        rerendered = {str(row[0]) for row in view_state['files_rows']}
+        merged_crops = {k: v for k, v in merged_crops.items() if k[0] not in rerendered}
+        for row in view_state['crop_rows']:
+            merged_crops[(str(row[0]), str(row[2]), str(row[3]))] = row
+
+        with open(files_csv_path, 'w', newline='') as fh:
+            writer = csv.writer(fh, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(RECON_FILES_CSV_HEADER)
+            writer.writerows([merged_files[k] for k in sorted(merged_files, key=lambda k: int(k[0]))])
+
+        with open(crop_csv_path, 'w', newline='') as fh:
+            writer = csv.writer(fh, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(RECON_FILES_CROP_CSV_HEADER)
+            writer.writerows([
+                merged_crops[k] for k in sorted(merged_crops, key=lambda k: (int(k[0]), k[1], int(k[2])))
+            ])
+
+        # 1:1 origin -> reconstruction frame map, listing only frames actually on disk.
+        with open(os.path.join(view_dir, 'frame2video_1.csv'), 'w', newline='') as fh:
+            writer = csv.writer(fh, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(['origin_frame', 'new_frame'])
+            for key in sorted(merged_files, key=lambda k: int(k[0])):
+                writer.writerow([int(key[0]), int(key[0])])
+
+        kpt_dir = os.path.join(view_dir, 'keypoints_results')
+        confs_path = os.path.join(kpt_dir, 'keypoints_confs.pickle')
+        gt_path = os.path.join(kpt_dir, 'keypoints_gt.pickle')
+        merged_confs = _recon_load_existing_pickle(confs_path)
+        merged_confs.update(view_state['keypoints_confs'])
+        merged_gt = _recon_load_existing_pickle(gt_path)
+        merged_gt.update(view_state['keypoints_gt'])
+        with open(confs_path, 'wb') as fh:
+            pickle.dump(merged_confs, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(gt_path, 'wb') as fh:
+            pickle.dump(merged_gt, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if view_name not in frame_folders:
+            frame_folders.append(view_name)
+        index_files[view_name] = files_csv_path
+        image_sizes[view_name] = [int(view_state['image_size'][0]), int(view_state['image_size'][1])]
+        image_counts[view_name] = len(merged_files)
+        if view_state.get('camera_matrix') is not None:
+            camera_matrices[view_name] = view_state['camera_matrix']
+
+    index.update({
+        'frame_folders': frame_folders,
+        'index_files': index_files,
+        'image_sizes': image_sizes,
+        'image_counts': image_counts,
+        'camera_matrices': camera_matrices,
+        'keypoint_list': list(kpt_list),
+        'max_n_instances': 1,
+        'status': 'keypoints_detected',
+    })
+    distinct_counts = set(image_counts.values())
+    index['image_count'] = next(iter(distinct_counts)) if len(distinct_counts) == 1 else None
+
+    with open(index_path, 'w') as fh:
+        json.dump(index, fh, indent=2)
+
+    # Multiview_Dataset refuses to load views with differing frame counts, since a view short by
+    # one frame silently shifts every later frame against the others. Say so here rather than
+    # letting it surface as an exception at reconstruction time.
+    if len(distinct_counts) > 1 and report is not None:
+        report({'WARNING'},
+               "Reconstruction dataset views have different frame counts: "
+               + ", ".join(f"{v}={c}" for v, c in image_counts.items())
+               + ". Reconstruction will refuse to load it until every enabled camera has "
+                 "rendered the same frame range.")
+    return index_path
+
+
 class TimedRender(Operator):
     bl_idname = "render.timed_render"
     bl_label = "Timed Render for Synthetic Dataset"
@@ -1377,10 +1686,17 @@ using opencv's contour detection can create a silhouette annotation from the bin
     rendering = False
     cancel_render = False
     total = 0
+    # Accumulated reconstruction-dataset rows, keyed by view name. Held in memory across the
+    # whole queue because the modal operator handles one (camera, frame, mode) per timer tick,
+    # and index.json / the CSVs can only be written once every view is known.
+    recon_state = None
+    # Bridges _annotate_frame (which runs on the 'regular' queue item) to _render_and_write_mask
+    # (which runs on the following 'binary' item for the same camera and frame). The GT mask and
+    # the GT keypoints for one (view, frame) never exist inside the same call.
+    recon_pending_keypoints = None
 
     def make_prefix_cam_frame(self, cam_name, frame_number):
-        prefix_for_cam = cam_name.split('.', 1)[1] + '_' + cam_name.split('.', 1)[0] if '.' in cam_name else cam_name
-        return f"{prefix_for_cam}_{str(frame_number).zfill(4)}"
+        return f"{camera_name_to_view_name(cam_name)}_{str(frame_number).zfill(4)}"
 
     def execute(self, context):
         scene = context.scene
@@ -1391,6 +1707,17 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
         cam_objects = sync_camera_selections(scene)
         enabled_camera_names = {item.camera_name for item in p.camera_selections if item.enabled}
+
+        self.recon_state = {'views': {}} if p.create_reconstruction_dataset else None
+        self.recon_pending_keypoints = {}
+        if p.create_reconstruction_dataset and not p.render_binary:
+            # The binary render *is* the ground-truth segmentation; without it the dataset would
+            # have no mask_full, and Multiview_Dataset would then treat every frame as maskless
+            # while still loading successfully -- a silent, hard-to-trace failure.
+            self.recon_state = None
+            self.report({'WARNING'},
+                        "'Create Reconstruction Dataset' needs 'Render Binary Masks' enabled; "
+                        "skipping the reconstruction-dataset export for this run.")
 
         modes = ["regular"] + (["binary"] if p.render_binary else [])
 
@@ -1496,15 +1823,22 @@ using opencv's contour detection can create a silhouette annotation from the bin
             bpy.ops.render.render(write_still=True)
             self._annotate_frame(context, cam_obj, img_w, img_h,
                                  render_out_file_path_os, kpt_annot_out_file_path,
-                                 kpt_label_out_path)
+                                 kpt_label_out_path,
+                                 view_name=camera_name_to_view_name(cam_name),
+                                 frame_index=frame_index)
 
         if p.render_binary and mode == 'binary':
             self._render_and_write_mask(context, img_w, img_h, render_prefix_cam_frame,
                                         render_out_file_path_os, mask_annot_out_file_path,
-                                        mask_label_out_path)
+                                        mask_label_out_path,
+                                        cam_obj=cam_obj,
+                                        view_name=camera_name_to_view_name(cam_name),
+                                        frame_index=frame_index,
+                                        image_size=(img_w, img_h))
 
     def _annotate_frame(self, context, cam_obj, img_w, img_h,
-                        render_out_file_path_os, kpt_annot_out_file_path, kpt_label_out_path):
+                        render_out_file_path_os, kpt_annot_out_file_path, kpt_label_out_path,
+                        view_name=None, frame_index=None):
         scene = context.scene
         p = scene.synth_props
         kpt_list = [kp.strip() for kp in p.keypoint_list_csv.split(',') if kp.strip()]
@@ -1640,12 +1974,61 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 kpt_label_out_path
             )
 
+            # Hand the *same* dictionaries write_pose_labels_yolo just consumed to the
+            # reconstruction-dataset export; visibility is never recomputed on a second path.
+            if self.recon_state is not None and view_name is not None:
+                self.recon_pending_keypoints[(view_name, frame_index)] = (
+                    dict(kpt_2_coords_image_filtered_by_vis), dict(kpt_2_vis_status)
+                )
+
         except Exception as e:
             self.report({'WARNING'}, f"Keypoint generation failed: {e}")
 
+    def _recon_write_frame(self, context, view_name, frame_index, cam_obj,
+                           render_out_file_path_os, gt_mask_binary, image_size):
+        """Add one (view, frame) to the in-memory reconstruction-dataset accumulator."""
+        scene = context.scene
+        p = scene.synth_props
+        kpt_list = [kp.strip() for kp in p.keypoint_list_csv.split(',') if kp.strip()]
+        root = resolve(p.reconstruction_dataset_out_dir)
+
+        coords, vis_status = self.recon_pending_keypoints.pop(
+            (view_name, frame_index), ({}, {})
+        )
+
+        try:
+            files_row, crop_rows, confs_entry, gt_entry = recon_dataset_write_frame(
+                root, view_name, frame_index, render_out_file_path_os,
+                gt_mask_binary, coords, vis_status, kpt_list,
+            )
+        except Exception as e:
+            self.report({'WARNING'}, f"Reconstruction dataset write failed for "
+                                     f"{view_name} frame {frame_index}: {e}")
+            return
+
+        view_state = self.recon_state['views'].setdefault(view_name, {
+            'files_rows': [], 'crop_rows': [],
+            'keypoints_confs': {}, 'keypoints_gt': {},
+            'image_size': image_size, 'camera_matrix': None,
+        })
+        view_state['image_size'] = image_size
+        view_state['files_rows'].append(files_row)
+        view_state['crop_rows'].extend(crop_rows)
+        # str(frame) -> instance "0" -> kpt -> [...], the shape Multiview_Dataset expects.
+        view_state['keypoints_confs'][str(frame_index)] = {"0": confs_entry}
+        view_state['keypoints_gt'][str(frame_index)] = {"0": gt_entry}
+
+        if view_state['camera_matrix'] is None:
+            try:
+                view_state['camera_matrix'] = cam_matrix_json_entry(
+                    cam_obj, get_cam_matrix_for_cam(cam_obj, scene))
+            except Exception as e:
+                self.report({'WARNING'}, f"Could not compute camera matrix for {cam_obj.name}: {e}")
+
     def _render_and_write_mask(self, context, img_w, img_h, render_prefix_cam_frame,
                                render_out_file_path_os, mask_annot_out_file_path,
-                               mask_label_out_path):
+                               mask_label_out_path,
+                               cam_obj=None, view_name=None, frame_index=None, image_size=None):
         scene = context.scene
         p = scene.synth_props
         if p.use_compositor:
@@ -1660,10 +2043,29 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
         if os.path.exists(mask_annot_out_file_path):
             polygons = get_mask_polygons_from_binary_image(mask_annot_out_file_path)
+            # NOTE: this must happen BEFORE the draw_polygons call below. When
+            # create_annotated_images is on, draw_polygons *overwrites* mask_annot_out_file_path
+            # with an annotated copy of the beauty render, destroying the binary GT mask in
+            # place. Reading it afterwards would silently feed an RGB overlay to the exporter.
+            if self.recon_state is not None and view_name is not None:
+                self._recon_write_frame(
+                    context, view_name, frame_index, cam_obj, render_out_file_path_os,
+                    recon_dataset_read_binary_mask(mask_annot_out_file_path),
+                    image_size or (img_w, img_h),
+                )
             if p.create_annotated_images:
                 draw_polygons(render_out_file_path_os, mask_annot_out_file_path, polygons)
             write_polygons_to_yolo(polygons, img_w, img_h, mask_label_out_path, class_index=0)
         else:
+            # No binary render for this frame. The YOLO path falls back to thresholding the
+            # beauty render, but that heuristic is exactly what the reconstruction metrics are
+            # meant to stop relying on, so the frame is recorded as "no instance" instead: the
+            # origin row is still written, which keeps the per-view frame counts equal.
+            if self.recon_state is not None and view_name is not None:
+                self._recon_write_frame(
+                    context, view_name, frame_index, cam_obj, render_out_file_path_os,
+                    None, image_size or (img_w, img_h),
+                )
             try:
                 img = cv2.imread(render_out_file_path_os)
                 if img is not None:
@@ -1690,6 +2092,17 @@ using opencv's contour detection can create a silhouette annotation from the bin
         if event.type == 'TIMER':
             if not self.render_queue or len(self.render_queue) == 0 or self.cancel_render:
                 self.cleanup(context)
+                if self.recon_state is not None and self.recon_state['views']:
+                    try:
+                        index_path = recon_dataset_finalize(
+                            resolve(context.scene.synth_props.reconstruction_dataset_out_dir),
+                            self.recon_state,
+                            [kp.strip() for kp in context.scene.synth_props.keypoint_list_csv.split(',') if kp.strip()],
+                            report=self.report,
+                        )
+                        self.report({'INFO'}, f"Wrote DSKv2 reconstruction dataset index to {index_path}")
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Reconstruction dataset finalization failed: {e}")
                 if context.scene.synth_props.create_yolo_datasets:
                     try:
                         create_yolo_dataset(
@@ -1885,6 +2298,8 @@ class SYNTH_OT_apply_settings(Operator):
             'draw_every_keypoint_face': p.draw_every_keypoint_face,
             'draw_lattice_for_kpt_annot': p.draw_lattice_for_kpt_annot,
             'create_yolo_datasets': p.create_yolo_datasets,
+            'create_reconstruction_dataset': p.create_reconstruction_dataset,
+            'RECONSTRUCTION_DATASET_OUT_DIR': p.reconstruction_dataset_out_dir,
             'BONE_GROUPS': bone_groups_cfg,
             'BONE_PRIORS': bone_priors_cfg,
         }
@@ -1956,6 +2371,8 @@ class SYNTH_OT_load_config(Operator):
             'draw_every_keypoint_face': 'draw_every_keypoint_face',
             'draw_lattice_for_kpt_annot': 'draw_lattice_for_kpt_annot',
             'create_yolo_datasets': 'create_yolo_datasets',
+            'create_reconstruction_dataset': 'create_reconstruction_dataset',
+            'RECONSTRUCTION_DATASET_OUT_DIR': 'reconstruction_dataset_out_dir',
         }
 
         # apply mapped simple scalar/bool/string values
@@ -2077,6 +2494,30 @@ class SYNTH_OT_export_keypoint_list(Operator):
 # CAMERA MATRIX EXPORT
 # =============================================================================
 
+def cam_matrix_json_entry(cam, mats):
+    """
+    Serialise get_cam_matrix_for_cam's output into the exact dict schema DSKv2 parses
+    (parse_cams_json.CameraSet). Shared by cam_matrices.json and by the reconstruction
+    dataset's index.json['camera_matrices'] so the two can never drift apart.
+
+    'distortion' is deliberately absent: synthetic renders carry no lens distortion and the
+    downstream parser defaults a missing key to zero.
+    """
+    def mat_to_list(m):
+        return [[float(v) for v in row] for row in m]
+
+    return {
+        'f': float(mats['f']) if mats.get('f') is not None else None,
+        'K': mat_to_list(mats['K']),
+        'R': mat_to_list(mats['R']),
+        't': [float(v) for v in mats['t']],
+        'Rt': mat_to_list(mats['Rt']),
+        'P': mat_to_list(mats['P']),
+        'FROM_BLENDERWORLD': mat_to_list(mats['FROM_BLENDERWORLD']),
+        'camera_name': cam.name
+    }
+
+
 def export_cam_matrices(context):
     scene = context.scene
     p = scene.synth_props
@@ -2091,21 +2532,7 @@ def export_cam_matrices(context):
             mats = get_cam_matrix_for_cam(cam, scene)
         except Exception as e:
             raise ValueError(f"Failed to compute matrix for {cam.name}: {e}")
-        def mat_to_list(m):
-            return [[float(v) for v in row] for row in m]
-
-        entry = {
-            'f': float(mats['f']) if mats.get('f') is not None else None,
-            'K': mat_to_list(mats['K']),
-            'R': mat_to_list(mats['R']),
-            't': [float(v) for v in mats['t']],
-            'Rt': mat_to_list(mats['Rt']),
-            'P': mat_to_list(mats['P']),
-            'FROM_BLENDERWORLD': mat_to_list(mats['FROM_BLENDERWORLD']),
-            'camera_name': cam.name
-        }
-        video_name = cam.name.split('.', 1)[1] + '_' + cam.name.split('.', 1)[0] if '.' in cam.name else cam.name
-        out[video_name] = entry
+        out[camera_name_to_view_name(cam.name)] = cam_matrix_json_entry(cam, mats)
     try:
         out_path = os.path.join(resolve(p.annot_out_dir), 'cam_matrices.json')
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -3866,6 +4293,11 @@ class SYNTH_PT_main_panel(Panel):
         box.label(text="Misc")
         box.prop(p, 'create_annotated_images')
         box.prop(p, 'create_yolo_datasets')
+        box.prop(p, 'create_reconstruction_dataset')
+        if p.create_reconstruction_dataset:
+            box.prop(p, 'reconstruction_dataset_out_dir')
+            if not p.render_binary:
+                box.label(text="Needs 'Render Binary Masks' enabled.", icon='ERROR')
         box.prop(p, 'event_timer_interval')
         row = layout.row()
         row.operator('synth.apply_settings', icon='CHECKMARK')

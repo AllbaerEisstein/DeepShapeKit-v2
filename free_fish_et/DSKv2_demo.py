@@ -76,6 +76,14 @@ class PipelineConfig:
     # rasterizes a quarter of the pixels. Lower values trade silhouette detail for a large drop in
     # per-iteration render cost and GPU memory. Inspection images are always saved at full size.
     render_scale: float = 1.0
+    # Path to a dataset in the normal DSKv2 schema holding *annotated* ground truth (as
+    # exported by the Blender add-on's "Create Reconstruction Dataset"). When set, reconstruct()
+    # additionally scores the run against it. Independent of reconstruct_from_gt: the primary
+    # intended use is reconstructing from real YOLO detections and scoring against synthetic GT.
+    ground_truth_dataset: Optional[str] = None
+    # When true, skip extract/masks/keypoints entirely and drive the fit from the GT dataset's
+    # own masks and keypoints, i.e. measure the fitter in isolation from detector error.
+    reconstruct_from_gt: bool = False
 
     def dataset_folder(self) -> Path:
         return Path(self.out_path) / self.dataset_folder_name
@@ -229,14 +237,42 @@ def run_pipeline(
     if not videos:
         raise ConfigError("At least one video path must be provided.")
 
+    # Enforced here rather than only in the GUI: --headless bypasses the GUI entirely, so a
+    # GUI-only guard would let a batch run silently re-run detection over the GT dataset.
+    if config.reconstruct_from_gt:
+        if not config.ground_truth_dataset:
+            raise ConfigError(
+                "ground_truth_dataset is required when reconstruct_from_gt is enabled."
+            )
+        skipped = [step for step in ("extract", "masks", "keypoints") if step in steps]
+        if skipped:
+            print(
+                "Warning: reconstruct_from_gt is enabled; skipping "
+                + ", ".join(skipped)
+                + " in favour of the ground-truth dataset at "
+                + str(config.ground_truth_dataset)
+            )
+        steps = [step for step in steps if step not in ("extract", "masks", "keypoints")]
+
     reconstruct_pause_event = (
         pause_event if pause_event is not None and "reconstruct" in steps else None
     )
 
     out_dir = Path(config.out_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    dataset_folder_path = config.dataset_folder()
-    dataset_folder_path.mkdir(parents=True, exist_ok=True)
+    if config.reconstruct_from_gt:
+        # frame_range resolution, resolve_dataset_views and final_output_folder all operate on
+        # whatever dataset dir they are handed, so pointing this one variable at the GT dataset
+        # is the whole branch. In particular resolve_dataset_views still preserves the order of
+        # config.videos, which view_weights and sweep_view_combinations.py depend on positionally.
+        dataset_folder_path = Path(config.ground_truth_dataset)
+        if not (dataset_folder_path / "index.json").exists():
+            raise ConfigError(
+                f"ground_truth_dataset does not contain an index.json: {dataset_folder_path}"
+            )
+    else:
+        dataset_folder_path = config.dataset_folder()
+        dataset_folder_path.mkdir(parents=True, exist_ok=True)
 
     final_output_folder = Path(config.final_output_folder)
     final_output_folder.mkdir(parents=True, exist_ok=True)
@@ -338,6 +374,7 @@ def run_pipeline(
             keypoints_weight=config.keypoints_weight,
             view_weights=parsed_view_weights,
             render_scale=config.render_scale,
+            gt_dataset_dir=config.ground_truth_dataset or None,
         )
 
 
@@ -428,20 +465,41 @@ def _summarize_keypoint_metric(metric_name: str, metric_data: Dict[str, Dict[str
     return summary
 
 
+# Metrics shaped Dict[view] -> List[float]. The GT-referenced entries only exist in the JSON
+# when the run had a ground_truth_dataset, so each is included only if actually present.
+SCALAR_METRIC_NAMES = [
+    "IoU_mask_detection_and_gt",
+    "IoU_reconstruction_and_gt",
+    "IoU_reconstruction_and_mask_detection",
+    "keypoint_PCK_AUC_to_gt",
+    "contour_HD95_to_gt",
+    "keypoint_detection_coverage",
+    "gt_body_length_px",
+]
+
+# Metrics shaped Dict[view] -> Dict[keypoint] -> List[float].
+KEYPOINT_METRIC_NAMES = [
+    "keypoint_L2_distance",
+    "keypoint_L2_distance_to_gt",
+    "keypoint_hit_rate_vs_gt",
+    "keypoint_miss_rate_vs_gt",
+    "keypoint_hallucination_rate_vs_gt",
+    "keypoint_correct_absence_rate_vs_gt",
+]
+
+
 def compute_metrics_summary(metrics_data: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
-    scalar_metrics = ["IoU_mask_detection_and_gt", "IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection"]
 
-    for metric_name in scalar_metrics:
+    for metric_name in SCALAR_METRIC_NAMES:
         metric_values = metrics_data.get(metric_name)
         if metric_values is not None:
             summary[metric_name] = _summarize_scalar_metric(metric_name, metric_values)
 
-    keypoint_metric = metrics_data.get("keypoint_L2_distance")
-    if keypoint_metric is not None:
-        summary["keypoint_L2_distance"] = _summarize_keypoint_metric(
-            "keypoint_L2_distance", keypoint_metric
-        )
+    for metric_name in KEYPOINT_METRIC_NAMES:
+        keypoint_metric = metrics_data.get(metric_name)
+        if keypoint_metric is not None:
+            summary[metric_name] = _summarize_keypoint_metric(metric_name, keypoint_metric)
 
     if not summary:
         raise ValueError("No metrics found to summarize.")
@@ -458,7 +516,18 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
         return f"mean={mean_val:.4f}, median={median_val:.4f}"
 
     sections: List[str] = []
-    metric_order = ["IoU_reconstruction_and_gt", "IoU_reconstruction_and_mask_detection", "keypoint_L2_distance"]
+    # keypoint_detection_coverage deliberately follows the two GT accuracy metrics in this
+    # order: an accuracy number read without its coverage rewards a pipeline that fails on the
+    # hard frames, because failed frames become NaN and are dropped from the mean.
+    metric_order = [
+        "IoU_reconstruction_and_gt",
+        "IoU_reconstruction_and_mask_detection",
+        "keypoint_L2_distance",
+        "keypoint_PCK_AUC_to_gt",
+        "contour_HD95_to_gt",
+        "keypoint_detection_coverage",
+        "gt_body_length_px",
+    ]
 
     sections.append("Overall metrics")
     for metric_name in metric_order:
@@ -493,14 +562,18 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
             sections.append(f"    frame {frame_idx}: {fmt(stats)}")
     sections.append("")
 
-    keypoint_summary = summary.get("keypoint_L2_distance")
-    if keypoint_summary:
-        sections.append("Keypoint_L2_distance by keypoint")
+    for metric_name in KEYPOINT_METRIC_NAMES:
+        keypoint_summary = summary.get(metric_name)
+        if not keypoint_summary:
+            continue
+        label = metric_name[0].upper() + metric_name[1:]
+
+        sections.append(f"{label} by keypoint")
         for keypoint, stats in sorted(keypoint_summary.get("by_keypoint", {}).items()):
             sections.append(f"  {keypoint}: {fmt(stats)}")
         sections.append("")
 
-        sections.append("Keypoint_L2_distance by keypoint and view")
+        sections.append(f"{label} by keypoint and view")
         for view, keypoint_stats in sorted(
             keypoint_summary.get("by_view_and_keypoint", {}).items()
         ):
@@ -509,20 +582,31 @@ def format_metrics_summary_text(summary: Dict[str, Any]) -> str:
                 sections.append(f"    {keypoint}: {fmt(stats)}")
         sections.append("")
 
-        sections.append("Keypoint_L2_distance by frame")
+        sections.append(f"{label} by frame")
         for frame_idx, stats in sorted(
             keypoint_summary.get("by_frame", {}).items(), key=lambda x: int(x[0])
         ):
             sections.append(f"  frame {frame_idx}: {fmt(stats)}")
         sections.append("")
 
-        sections.append("Keypoint_L2_distance by view")
+        sections.append(f"{label} by view")
         for view, stats in sorted(keypoint_summary.get("by_view", {}).items()):
             sections.append(f"  {view}: {fmt(stats)}")
         sections.append("")
 
-        sections.append("Keypoint_L2_distance overall")
+        sections.append(f"{label} overall")
         sections.append(f"  {fmt(keypoint_summary['overall'])}")
+        sections.append("")
+
+    if "keypoint_detection_coverage" in summary:
+        coverage = summary["keypoint_detection_coverage"].get("overall", {})
+        sections.append("")
+        sections.append(
+            "Note: every accuracy number above is conditioned on a keypoint detection "
+            f"coverage of {fmt(coverage)}. Frames and keypoints without a detection are NaN "
+            "and are dropped before the mean/median, so an accuracy figure quoted without "
+            "its coverage rewards a run that simply failed on the hard frames."
+        )
 
     return "\n".join(sections).strip()
 
@@ -694,6 +778,8 @@ class PipelineGUI:
         self.keypoints_weight_var = tk.StringVar(value=str(self.config.keypoints_weight))
         self.view_weights_var = tk.StringVar(value=str(self.config.view_weights))
         self.render_scale_var = tk.StringVar(value=str(self.config.render_scale))
+        self.ground_truth_dataset_var = tk.StringVar(value=self.config.ground_truth_dataset or "")
+        self.reconstruct_from_gt_var = tk.BooleanVar(value=self.config.reconstruct_from_gt)
         self.advanced_visible = tk.BooleanVar(value=False)
         self.step_vars: Dict[str, "tk.BooleanVar"] = {
             "extract": tk.BooleanVar(value="extract" in self.steps),
@@ -788,9 +874,17 @@ class PipelineGUI:
         steps_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(6, 2))
         for col in range(4):
             steps_frame.columnconfigure(col, weight=1)
-        ttk.Checkbutton(steps_frame, text="extract_from_video", variable=self.step_vars["extract"]).grid(row=0, column=0, sticky="w", padx=6, pady=2)
-        ttk.Checkbutton(steps_frame, text="predict_masks_yolo", variable=self.step_vars["masks"]).grid(row=0, column=1, sticky="w", padx=6, pady=2)
-        ttk.Checkbutton(steps_frame, text="detect_keypoints_yolo", variable=self.step_vars["keypoints"]).grid(row=0, column=2, sticky="w", padx=6, pady=2)
+        # CLAUDE FIX: kept as attributes so _sync_reconstruct_from_gt can disable them; the
+        # actual enforcement lives in run_pipeline, since --headless never builds this GUI.
+        self.detection_step_checkbuttons = []
+        for column, (step_key, step_label) in enumerate((
+            ("extract", "extract_from_video"),
+            ("masks", "predict_masks_yolo"),
+            ("keypoints", "detect_keypoints_yolo"),
+        )):
+            check = ttk.Checkbutton(steps_frame, text=step_label, variable=self.step_vars[step_key])
+            check.grid(row=0, column=column, sticky="w", padx=6, pady=2)
+            self.detection_step_checkbuttons.append(check)
         ttk.Checkbutton(steps_frame, text="reconstruct", variable=self.step_vars["reconstruct"]).grid(row=0, column=3, sticky="w", padx=6, pady=2)
         row += 1
 
@@ -858,8 +952,20 @@ class PipelineGUI:
         render_button.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
 
+        self._add_directory_row(
+            self.advanced_frame, 6, "Ground truth dataset",
+            self.ground_truth_dataset_var, self.browse_ground_truth_dataset,
+        )
+        reconstruct_from_gt_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="Reconstruct from GT dataset",
+            variable=self.reconstruct_from_gt_var,
+            command=self._sync_reconstruct_from_gt,
+        )
+        reconstruct_from_gt_check.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         optimization_frame = ttk.LabelFrame(self.advanced_frame, text="Optimization settings")
-        optimization_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        optimization_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         optimization_frame.columnconfigure(1, weight=1)
 
         ttk.Label(optimization_frame, text="num_iters").grid(row=0, column=0, sticky="w", pady=2, padx=(6, 4))
@@ -896,6 +1002,7 @@ class PipelineGUI:
             foreground="#777",
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 4), padx=(6, 6))
 
+        self._sync_reconstruct_from_gt()
         self.advanced_frame.grid_remove()
         row += 1
 
@@ -988,6 +1095,15 @@ class PipelineGUI:
     def browse_final_output(self) -> None:
         self._browse_directory(self.final_output_var, "Select final output directory")
 
+    def browse_ground_truth_dataset(self) -> None:
+        self._browse_directory(self.ground_truth_dataset_var, "Select ground truth dataset directory")
+
+    def _sync_reconstruct_from_gt(self) -> None:
+        """Grey out the detection steps when the run is driven from the GT dataset."""
+        state = tk.DISABLED if self.reconstruct_from_gt_var.get() else tk.NORMAL
+        for check in getattr(self, "detection_step_checkbuttons", []):
+            check.configure(state=state)
+
     def _browse_file(self, variable: "tk.StringVar", title: str) -> None:
         file_path = filedialog.askopenfilename(title=title)
         if file_path:
@@ -1051,6 +1167,20 @@ class PipelineGUI:
             raise ConfigError("render_scale must be numeric.") from exc
         if not (0.0 < config.render_scale <= 1.0):
             raise ConfigError("render_scale must be greater than 0 and at most 1.")
+
+        ground_truth_dataset = self.ground_truth_dataset_var.get().strip()
+        config.ground_truth_dataset = ground_truth_dataset or None
+        config.reconstruct_from_gt = bool(self.reconstruct_from_gt_var.get())
+        if config.reconstruct_from_gt:
+            if not config.ground_truth_dataset:
+                raise ConfigError(
+                    "ground_truth_dataset is required when reconstruct_from_gt is enabled."
+                )
+            if not (Path(config.ground_truth_dataset) / "index.json").exists():
+                raise ConfigError(
+                    "ground_truth_dataset does not contain an index.json: "
+                    f"{config.ground_truth_dataset}"
+                )
 
         view_weights_text = self.view_weights_var.get().strip()
         config.view_weights = view_weights_text if view_weights_text else "1"
@@ -1122,6 +1252,9 @@ class PipelineGUI:
         self.keypoints_weight_var.set(str(config.keypoints_weight))
         self.view_weights_var.set(str(config.view_weights))
         self.render_scale_var.set(str(config.render_scale))
+        self.ground_truth_dataset_var.set(config.ground_truth_dataset or "")
+        self.reconstruct_from_gt_var.set(bool(config.reconstruct_from_gt))
+        self._sync_reconstruct_from_gt()
         self._refresh_video_listbox()
 
     def _toggle_advanced(self) -> None:
@@ -1538,6 +1671,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable saving models during reconstruction.",
     )
     parser.add_argument(
+        "--ground-truth-dataset",
+        dest="ground_truth_dataset",
+        help=(
+            "Path to a dataset in the DSKv2 schema holding annotated ground truth. When given, "
+            "reconstruct() additionally reports GT-referenced 2D metrics (PCK-AUC, contour HD95, "
+            "detection coverage) alongside the existing ones."
+        ),
+    )
+    parser.add_argument(
+        "--reconstruct-from-gt",
+        action="store_true",
+        dest="reconstruct_from_gt",
+        help=(
+            "Drive the fit from the ground-truth dataset's own masks and keypoints, skipping "
+            "extract/masks/keypoints. Requires --ground-truth-dataset."
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help=(
@@ -1598,6 +1749,15 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         config.view_weights = args.view_weights
     if hasattr(args, "save_models") and args.save_models is not None:
         config.save_models = args.save_models
+    if getattr(args, "ground_truth_dataset", None):
+        config.ground_truth_dataset = args.ground_truth_dataset
+    if getattr(args, "reconstruct_from_gt", False):
+        config.reconstruct_from_gt = True
+    # Validated here as well as in gather_config, because --headless never touches the GUI.
+    if config.reconstruct_from_gt and not config.ground_truth_dataset:
+        raise ConfigError(
+            "ground_truth_dataset is required when reconstruct_from_gt is enabled."
+        )
     return config
 
 

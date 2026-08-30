@@ -30,6 +30,322 @@ def setup_device(seed: int) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# =============================================================================
+# GT-REFERENCED 2D EVALUATION HELPERS
+#
+# Everything in this block is only used when a *ground-truth dataset* is supplied
+# (`reconstruct(gt_dataset_dir=...)`). It is strictly additive: with no GT dataset the
+# metrics dict, and therefore metrics_instance_*.json, is byte-identical to before.
+#
+# Coordinate convention: every 2D quantity below lives in the **uniform padded canvas**,
+# the same frame `CameraGroup.perspective_projection_from_blworld` projects into and the
+# same frame `Multiview_Dataset` pads its masks/keypoints into. GT keypoints come off disk
+# in per-view *original* image coordinates and are shifted by (pad_left, pad_top) here.
+#
+# Normalisation convention: every pixel-space distance reported against GT is divided by a
+# **GT-only** body-length normaliser (§_body_length_normalizer), recomputed per frame and
+# per view so it tracks perspective foreshortening. The reconstruction's own scale is never
+# used, otherwise a systematically over-scaled fit would normalise away its own error.
+# =============================================================================
+
+GT_KEYPOINT_PICKLE_NAME = "keypoints_gt.pickle"
+DEFAULT_BODY_LENGTH_KEYPOINTS = ("mouth tip", "caudal peduncle")
+# Fixed, documented alpha sweep for PCK. Reported as the AUC of the PCK(alpha) curve
+# rescaled to [0, 1]; a single threshold saturates at 1.0 once the fit is good and then
+# discriminates nothing between configurations.
+PCK_ALPHAS = np.linspace(0.0, 0.5, 21)
+
+# `np.trapz` was removed in NumPy 2.0 in favour of `np.trapezoid`; the repository pins neither,
+# so resolve it once here rather than letting the AUC raise AttributeError on whichever version
+# the evaluation machine happens to have.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
+
+def load_gt_keypoint_visibility(gt_dataset_dir: str, views: List[str]) -> dict:
+    """
+    Load the lossless GT keypoint pickles written by the Blender add-on.
+
+    Shape: dict[view][frame_str][instance_str][kpt_name] -> [x, y, vis], with vis the raw
+    0/1/2 Blender visibility flag (0 = not labelled, 1 = labelled but occluded, 2 = visible).
+    `Multiview_Dataset` cannot carry this file: keypoints_confs.pickle only has room for a
+    scalar confidence, so occluded and unlabelled keypoints are indistinguishable there.
+    """
+    out: dict = {}
+    for view in views:
+        path = os.path.join(gt_dataset_dir, view, "keypoints_results", GT_KEYPOINT_PICKLE_NAME)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Ground-truth keypoint file not found: {path}. Re-export the reconstruction "
+                f"dataset from the Blender add-on with 'Create Reconstruction Dataset' enabled."
+            )
+        with open(path, "rb") as handle:
+            out[view] = pickle.load(handle)
+    return out
+
+
+def build_gt_keypoints_tensor(
+    gt_dataset: Multiview_Dataset,
+    gt_kpts_raw: dict,
+    frame_idx: int,
+    instance_number: int,
+    keypoint_names: List[str],
+) -> torch.Tensor:
+    """
+    (V, K, 3) tensor of (x, y, vis) in uniform-padded-canvas coordinates, view order and
+    keypoint order both canonical (gt_dataset.views / index.json['keypoint_list']).
+
+    A keypoint absent from the pickle is reported as vis == 0 rather than shifting every
+    later keypoint up by one.
+    """
+    uniform_w, uniform_h = gt_dataset.uniform_img_size
+    per_view_rows = []
+    for view in gt_dataset.views:
+        width, height = gt_dataset.index_json["image_sizes"][view]
+        pad_left = int((uniform_w - width) // 2)
+        pad_top = int((uniform_h - height) // 2)
+        try:
+            frame_key = gt_dataset._origin_frame_number(view, str(frame_idx))
+        except IndexError:
+            frame_key = None
+        per_frame = gt_kpts_raw.get(view, {}).get(frame_key, {}) if frame_key is not None else {}
+        per_instance = per_frame.get(str(instance_number), {}) or {}
+
+        rows = []
+        for kpt_name in keypoint_names:
+            entry = per_instance.get(kpt_name)
+            if entry is None or len(entry) < 3:
+                rows.append([0.0, 0.0, 0.0])
+                continue
+            x, y, vis = float(entry[0]), float(entry[1]), float(entry[2])
+            if vis > 0:
+                x += pad_left
+                y += pad_top
+            else:
+                x, y = 0.0, 0.0
+            rows.append([x, y, vis])
+        per_view_rows.append(rows)
+    return torch.tensor(per_view_rows, dtype=torch.float32)
+
+
+def _mask_bbox_diagonal(mask_binary: np.ndarray) -> float:
+    """Bounding-box diagonal, in px, of a binary mask. NaN for an empty mask."""
+    ys, xs = np.nonzero(mask_binary)
+    if xs.size == 0:
+        return float("nan")
+    width = float(xs.max() - xs.min() + 1)
+    height = float(ys.max() - ys.min() + 1)
+    return float(math.hypot(width, height))
+
+
+def _body_length_normalizer(
+    gt_keypoints_view: np.ndarray,  # (K, 3) = (x, y, vis)
+    landmark_indices: tuple,
+    gt_mask_binary: Optional[np.ndarray],
+) -> float:
+    """
+    Per (frame, view) scale normaliser, computed from GT only.
+
+    Primary: 2D distance between the two configured landmark keypoints (default mouth tip ->
+    caudal peduncle, i.e. projected standard body length). Fallback, when either landmark is
+    not labelled in this view: the GT full mask's bbox diagonal. NaN if neither is available;
+    NaN is dropped from mean/median downstream, a 0 would look like a perfect score.
+    """
+    idx_a, idx_b = landmark_indices
+    if idx_a is not None and idx_b is not None:
+        vis_a = float(gt_keypoints_view[idx_a, 2])
+        vis_b = float(gt_keypoints_view[idx_b, 2])
+        if vis_a > 0 and vis_b > 0:
+            length = float(
+                math.hypot(
+                    gt_keypoints_view[idx_a, 0] - gt_keypoints_view[idx_b, 0],
+                    gt_keypoints_view[idx_a, 1] - gt_keypoints_view[idx_b, 1],
+                )
+            )
+            if length > 0.0:
+                return length
+    if gt_mask_binary is None:
+        return float("nan")
+    return _mask_bbox_diagonal(gt_mask_binary)
+
+
+def _pck_auc(distances: np.ndarray, body_length: float, alphas: np.ndarray = PCK_ALPHAS) -> float:
+    """
+    Trapezoidal AUC of PCK(alpha) over `alphas`, rescaled to [0, 1] by the sweep width so the
+    number is readable independently of the sweep bounds. `distances` must already be pooled
+    over the GT-visible keypoints of a *single* (frame, view): pooling across frames or views
+    first would over-weight the frames/views with more valid detections.
+    """
+    if distances.size == 0:
+        return float("nan")
+    if body_length is None or not np.isfinite(body_length) or body_length <= 0.0:
+        return float("nan")
+    thresholds = alphas * float(body_length)
+    pck_curve = (distances[None, :] <= thresholds[:, None]).mean(axis=1)
+    span = float(alphas[-1] - alphas[0])
+    if span <= 0.0:
+        return float("nan")
+    return float(_trapezoid(pck_curve, alphas) / span)
+
+
+def _contour_points(binary_uint8: np.ndarray) -> Optional[np.ndarray]:
+    """
+    All contour pixels of a binary image as (N, 2) int array of (x, y).
+
+    RETR_LIST + concatenation rather than "largest contour": a fish split in two by an
+    occluder is a multi-component mask, and keeping only the largest component silently drops
+    the occluded part from the metric.
+    """
+    contours, _ = cv2.findContours(binary_uint8, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    parts = [c.reshape(-1, 2) for c in contours if c is not None and len(c) > 0]
+    if not parts:
+        return None
+    return np.concatenate(parts, axis=0)
+
+
+def _directed_contour_distances(
+    src_points: np.ndarray, dst_points: np.ndarray, shape: tuple
+) -> np.ndarray:
+    """Nearest-neighbour distance from every point of `src_points` to `dst_points`, in px."""
+    canvas = np.full(shape, 255, dtype=np.uint8)
+    canvas[dst_points[:, 1], dst_points[:, 0]] = 0
+    dist = cv2.distanceTransform(canvas, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return dist[src_points[:, 1], src_points[:, 0]].astype(np.float64)
+
+
+def _contour_hd95(gt_binary: np.ndarray, pred_binary: np.ndarray) -> float:
+    """
+    Symmetric 95th-percentile Hausdorff distance between two mask contours, in px.
+
+    Mask IoU is dominated by the fish's trunk and is nearly blind to fin and caudal-tail
+    geometry -- precisely the articulated parts the template exists to recover; a few-pixel
+    tail-tip error moves HD95 substantially while barely touching IoU. NaN (never 0) when
+    either contour is empty: an empty reprojection or a fully-occluded GT instance is an
+    undefined comparison, not a perfect one.
+    """
+    gt_pts = _contour_points(gt_binary)
+    pred_pts = _contour_points(pred_binary)
+    if gt_pts is None or pred_pts is None:
+        return float("nan")
+    shape = gt_binary.shape[:2]
+    d_gt_to_pred = _directed_contour_distances(gt_pts, pred_pts, shape)
+    d_pred_to_gt = _directed_contour_distances(pred_pts, gt_pts, shape)
+    return float(
+        max(float(np.percentile(d_gt_to_pred, 95.0)), float(np.percentile(d_pred_to_gt, 95.0)))
+    )
+
+
+
+def interpolate_pose_pair(
+    pose_a: torch.Tensor,
+    pose_b: torch.Tensor,
+    interpolate_size: int,
+) -> torch.Tensor:
+    """
+    Reproduce the original np.interp behaviour for one pose pair.
+    The original code sampled x = 0 .. interpolate_size-1 while the two
+    endpoint poses were located at x = 0 and x = interpolate_size.
+    Consequently, the final endpoint itself is not emitted.
+    """
+    if interpolate_size <= 0:
+        return torch.empty(
+            (0, pose_a.shape[1]),
+            dtype=pose_a.dtype,
+            device=pose_a.device,
+        )
+    samples = torch.arange(
+        interpolate_size,
+        dtype=pose_a.dtype,
+        device=pose_a.device,
+    )
+    alpha = samples / interpolate_size
+    return torch.lerp(
+        pose_a.expand(interpolate_size, -1),
+        pose_b.expand(interpolate_size, -1),
+        alpha[:, None],
+    )
+
+
+def _interpolate_parameter_entries(
+    entry_a: list,
+    entry_b: list,
+    interpolate_size: int,
+    sample_offsets: list[int],
+) -> list[list[torch.Tensor]]:
+    """
+    CLAUDE FIX: linearly interpolate one full `parameters` entry
+    ([global_ori, body_pose, body_bone_length, scale, global_t]) between two reconstructed
+    frames. Each tensor is flattened to (1, D) so `interpolate_pose_pair` can be applied
+    unchanged, then restored to its original shape so the produced entries are drop-in
+    replacements for optimizer output (including the `*init` unpacking in `multiview.fit_mesh`).
+
+    `interpolate_pose_pair` places `entry_a` at x = 0 and `entry_b` at x = interpolate_size,
+    so `interpolate_size` must be the *distance between the two endpoint frames*, not the
+    number of frames in the gap, and each gap frame must be read off at its own offset from
+    `frame_a` (`sample_offsets`), not at its position in the gap list. Offset 0 is `entry_a`
+    itself and is therefore never requested; `entry_b` at x = interpolate_size is likewise
+    never emitted, since it is stored as its own frame.
+    """
+    if interpolate_size <= 0 or not sample_offsets:
+        return []
+    if any(not (0 < offset < interpolate_size) for offset in sample_offsets):
+        raise ValueError(
+            f"gap sample offsets {sample_offsets} must lie strictly between the endpoint "
+            f"frames (0 < offset < {interpolate_size})"
+        )
+
+    interpolated_entries: list[list[torch.Tensor]] = [[] for _ in sample_offsets]
+    for tensor_a, tensor_b in zip(entry_a, entry_b):
+        tensor_a = tensor_a.detach()
+        tensor_b = tensor_b.detach().to(dtype=tensor_a.dtype, device=tensor_a.device)
+        original_shape = tensor_a.shape
+        samples = interpolate_pose_pair(
+            tensor_a.reshape(1, -1),
+            tensor_b.reshape(1, -1),
+            interpolate_size,
+        )
+        for entry_idx, offset in enumerate(sample_offsets):
+            interpolated_entries[entry_idx].append(
+                samples[offset].reshape(original_shape).clone()
+            )
+    return interpolated_entries
+
+
+def _gap_interpolation_layout(
+    frame_a: int,
+    frame_b: int,
+    gap_frames: list[int],
+) -> tuple[int, list[int]]:
+    """
+    CLAUDE FIX: work out where each deferred frame sits on the x axis spanned by the two
+    endpoint frames. Normally this is just its real frame-number offset from `frame_a`, which
+    keeps the interpolation correct even when the gap is not contiguous -- e.g. when a frame in
+    between was dropped as unavailable (the IndexError/KeyError path) or when `frame_indices`
+    is strided, in which case the deferred frames are not evenly spaced in the gap list.
+
+    Falls back to even spacing over the gap if the frame numbering is not strictly increasing
+    across `frame_a -> gap_frames -> frame_b`, so a pathological frame list degrades instead of
+    raising.
+    """
+    frame_span = int(frame_b) - int(frame_a)
+    sample_offsets = [int(frame) - int(frame_a) for frame in gap_frames]
+    monotonic = (
+        frame_span > 0
+        and all(0 < offset < frame_span for offset in sample_offsets)
+        and all(
+            earlier < later
+            for earlier, later in zip(sample_offsets, sample_offsets[1:])
+        )
+    )
+    if not monotonic:
+        print(
+            f"Warning: frames {gap_frames} are not strictly ordered between frame {frame_a} "
+            f"and frame {frame_b}; falling back to even spacing for the interpolation."
+        )
+        frame_span = len(gap_frames) + 1
+        sample_offsets = list(range(1, frame_span))
+    return frame_span, sample_offsets
+
+
 def _ensure_dir(path: str) -> None:
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
@@ -79,6 +395,11 @@ def _save_reconstruction_images(
     mask_predictions: Optional[torch.Tensor] = None, # for calculating mask-reprojection IoU
     mask_present_mask: Optional[List[bool]] = None,
     keypoint_predictions: Optional[torch.Tensor] = None, # for calculating keypoint L2 distance
+    # --- GT-referenced 2D evaluation (all None => byte-identical behaviour to before) ---
+    gt_keypoints: Optional[torch.Tensor] = None,        # (V, K, 3) = (x, y, vis 0/1/2), padded canvas
+    gt_masks_full: Optional[torch.Tensor] = None,       # (V, H, W) annotated GT mask, padded canvas
+    gt_mask_present_mask: Optional[List[bool]] = None,
+    body_length_keypoint_indices: Optional[tuple] = None,
     optimizer_losses: Optional[dict[str, Optional[float]]] = None,
     optimizer_loss_weights: Optional[dict[str, float]] = None,
     view_weights: Optional[List[float]] = None,
@@ -92,9 +413,8 @@ def _save_reconstruction_images(
     annotate_keypoints_with_coords: bool = False,
     pad_to_see_full_reprojection: bool = False,
     plot_other_cameras: bool = False,
-    # CLAUDE FIX: frames that were not optimized directly but filled in by interpolation across a
-    # detection gap are rendered with a different silhouette colour so they are distinguishable
-    # from directly-optimized frames at a glance.
+    # Frames filled by pose interpolation across detection gaps are rendered differently
+    # so they remain distinguishable from directly optimized frames.
     is_interpolated: bool = False,
 ):
     """
@@ -283,6 +603,28 @@ def _save_reconstruction_images(
             "final_deviation_from_prev_frame": None
         },
     }
+
+    # CLAUDE FIX: GT-referenced 2D metrics. These keys only exist when a ground-truth dataset
+    # was supplied, so a run without one writes exactly the same metrics JSON as before.
+    gt_metrics_enabled = gt_keypoints is not None or gt_masks_full is not None
+    if gt_metrics_enabled:
+        metrics.update({
+            "keypoint_PCK_AUC_to_gt": {view_name: None for view_name in view_names},
+            "contour_HD95_to_gt": {view_name: None for view_name in view_names},
+            "keypoint_detection_coverage": {view_name: None for view_name in view_names},
+            "gt_body_length_px": {view_name: None for view_name in view_names},
+        })
+        for rate_key in (
+            "keypoint_hit_rate_vs_gt",
+            "keypoint_miss_rate_vs_gt",
+            "keypoint_hallucination_rate_vs_gt",
+            "keypoint_correct_absence_rate_vs_gt",
+            "keypoint_L2_distance_to_gt",
+        ):
+            metrics[rate_key] = {
+                view_name: {keypoint_name: None for keypoint_name in keypoint_names}
+                for view_name in view_names
+            }
     if optimizer_losses is not None:
         for name in metrics["optimizer_losses"].keys():
             value = optimizer_losses.get(name)
@@ -482,6 +824,28 @@ def _save_reconstruction_images(
         _GT_MASK_NOISE_THRESHOLD = 10  # pixel values <= this are still treated as background
         _, padded_binary = cv2.threshold(padded_gray_denoised, _GT_MASK_NOISE_THRESHOLD, 1, cv2.THRESH_BINARY)
 
+        # CLAUDE FIX: the threshold above is a black-background heuristic that happens to work for
+        # the synthetic renders; it is not an annotated ground-truth mask. When a GT dataset is
+        # supplied, the two "*_and_gt" IoUs are scored against the real annotated mask instead.
+        gt_binary_np: Optional[np.ndarray] = None
+        if gt_masks_full is not None:
+            gt_present = True if gt_mask_present_mask is None else bool(gt_mask_present_mask[view_idx])
+            if gt_present:
+                gt_view = gt_masks_full[view_idx]
+                if isinstance(gt_view, torch.Tensor):
+                    gt_view = gt_view.detach().cpu().numpy()
+                gt_view = np.asarray(gt_view)
+                if gt_view.max(initial=0) > 1.0:
+                    gt_view = gt_view / 255.0
+                gt_binary_np = (gt_view > 0.5).astype(np.uint8)
+                if any((extra_pad_left, extra_pad_right, extra_pad_top, extra_pad_bottom)):
+                    gt_binary_np = np.pad(
+                        gt_binary_np,
+                        ((extra_pad_top, extra_pad_bottom), (extra_pad_left, extra_pad_right)),
+                        mode="constant",
+                    )
+                padded_binary = gt_binary_np
+
         a = np.clip(alpha[view_idx], 0.0, 1.0)  # (H,W), float
         # threshold tiny values
         a[a < silhouette_threshold] = 0.0
@@ -518,6 +882,105 @@ def _save_reconstruction_images(
                 metrics["IoU_reconstruction_and_mask_detection"][view_names[view_idx]] = float("nan")
         metrics["IoU_reconstruction_and_gt"][view_names[view_idx]] = IoU_reconstruction_and_gt.item()
 
+        # ------------------------------------------------------------------
+        # GT-referenced 2D metrics (PCK-AUC, contour HD95, detection accounting)
+        # ------------------------------------------------------------------
+        if gt_metrics_enabled:
+            view_name = view_names[view_idx]
+            gt_kpts_view = (
+                gt_keypoints[view_idx].detach().cpu().numpy()
+                if gt_keypoints is not None
+                else np.zeros((len(keypoint_names), 3), dtype=np.float32)
+            )
+
+            # --- per-frame, per-view body-length normaliser, from GT only ---
+            body_length = _body_length_normalizer(
+                gt_kpts_view,
+                body_length_keypoint_indices or (None, None),
+                gt_binary_np,
+            )
+            metrics["gt_body_length_px"][view_name] = (
+                float(body_length) if np.isfinite(body_length) else float("nan")
+            )
+
+            # --- PCK@alpha-AUC of the projected template keypoints vs GT ---
+            # Both coordinate sets live in the same padded canvas, so the extra-padding
+            # offset cancels; the raw sub-pixel projections are used rather than the rounded
+            # integers used for drawing.
+            for kpt_name in keypoint_names:
+                metrics["keypoint_L2_distance_to_gt"][view_name][kpt_name] = float("nan")
+
+            proj_xy = np.asarray(keypoints_proj[view_idx, :, :2].detach().cpu().numpy())
+            usable = (gt_kpts_view[:, 2] > 0) & np.isfinite(proj_xy).all(axis=1)
+            if usable.any():
+                distances = np.linalg.norm(proj_xy[usable] - gt_kpts_view[usable, :2], axis=1)
+                metrics["keypoint_PCK_AUC_to_gt"][view_name] = _pck_auc(distances, body_length)
+                # per-keypoint L2 to GT in body lengths, for failure attribution
+                if np.isfinite(body_length) and body_length > 0:
+                    for local_idx, kp_idx in enumerate(np.nonzero(usable)[0]):
+                        metrics["keypoint_L2_distance_to_gt"][view_name][keypoint_names[kp_idx]] = (
+                            float(distances[local_idx] / body_length)
+                        )
+            else:
+                # zero GT-visible keypoints in this (frame, view) -> undefined, not perfect
+                metrics["keypoint_PCK_AUC_to_gt"][view_name] = float("nan")
+
+            # --- contour HD95 vs GT, normalised by GT body length ---
+            if gt_binary_np is not None:
+                pred_binary_np = (
+                    reprojection_mask_binary.detach().cpu().numpy() > 0.5
+                ).astype(np.uint8)
+                hd95_px = _contour_hd95(gt_binary_np, pred_binary_np)
+                metrics["contour_HD95_to_gt"][view_name] = (
+                    float(hd95_px / body_length)
+                    if np.isfinite(hd95_px) and np.isfinite(body_length) and body_length > 0
+                    else float("nan")
+                )
+            else:
+                metrics["contour_HD95_to_gt"][view_name] = float("nan")
+
+            # --- detection coverage rho and GT-visibility-conditioned outcome rates ---
+            # Without these, a frame the detector failed on yields NaN and is silently dropped
+            # from the mean, so failing on the hard frames improves the reported accuracy.
+            gt_visible_count = 0
+            hit_count = 0
+            for kp_idx, kpt_name in enumerate(keypoint_names):
+                gt_vis = float(gt_kpts_view[kp_idx, 2]) if gt_keypoints is not None else 0.0
+                if keypoint_predictions is not None:
+                    detector_conf = float(keypoint_predictions[view_idx, kp_idx, 2].item())
+                else:
+                    detector_conf = -1.0
+                detector_present = detector_conf > 0.0
+
+                hit = 1.0 if (gt_vis > 0 and detector_present) else 0.0
+                miss = 1.0 if (gt_vis > 0 and not detector_present) else 0.0
+                hallucination = 1.0 if (gt_vis == 0 and detector_present) else 0.0
+                correct_absence = 1.0 if (gt_vis == 0 and not detector_present) else 0.0
+
+                # Rates are conditioned on GT visibility, so the denominators differ: a
+                # hit/miss is undefined where the GT says the keypoint is not there, and a
+                # hallucination is undefined where it is. NaN keeps those cells out of the
+                # mean rather than diluting it with structural zeros.
+                metrics["keypoint_hit_rate_vs_gt"][view_name][kpt_name] = (
+                    hit if gt_vis > 0 else float("nan")
+                )
+                metrics["keypoint_miss_rate_vs_gt"][view_name][kpt_name] = (
+                    miss if gt_vis > 0 else float("nan")
+                )
+                metrics["keypoint_hallucination_rate_vs_gt"][view_name][kpt_name] = (
+                    hallucination if gt_vis == 0 else float("nan")
+                )
+                metrics["keypoint_correct_absence_rate_vs_gt"][view_name][kpt_name] = (
+                    correct_absence if gt_vis == 0 else float("nan")
+                )
+
+                if gt_vis > 0:
+                    gt_visible_count += 1
+                    hit_count += int(hit)
+
+            metrics["keypoint_detection_coverage"][view_name] = (
+                float(hit_count) / float(gt_visible_count) if gt_visible_count else float("nan")
+            )
 
         # Start from the padded original image.
         blended = padded.astype(np.float32).copy()
@@ -556,10 +1019,8 @@ def _save_reconstruction_images(
                     blended * (1.0 - mask_overlay_alpha * mask_alpha)
                     + blue_img * (mask_overlay_alpha * mask_alpha)
                 )
-        # Reconstruction silhouette overlay
-        # CLAUDE FIX: colour is BGR (images are written with cv2.imwrite). Directly-optimized
-        # frames keep the original pure red; interpolated frames get orange so a gap fill is
-        # obvious in the saved images without reading the metrics table.
+        # Reconstruction silhouette overlay.
+        # Directly optimized frames stay red; interpolated gap frames are orange.
         overlay_color_bgr = (0, 140, 255) if is_interpolated else (0, 0, 255)
         red_img = np.zeros_like(blended)
         red_img[:, :, 0] = overlay_color_bgr[0]
@@ -801,7 +1262,6 @@ def _save_reconstruction_images(
                 ("view", view_name),
             ]
             if is_interpolated:
-                # CLAUDE FIX: only added for gap fills, so normal frames keep their original table.
                 metric_rows.append(("frame_source", "INTERPOLATED"))
             metric_rows += [
                 ("IoU_reconstruction_and_gt", metrics["IoU_reconstruction_and_gt"][view_name]),
@@ -810,6 +1270,16 @@ def _save_reconstruction_images(
                 ("kpt_L2_mean", keypoint_mean_error),
                 ("kpt_valid", f"{len(view_kpt_errors)}/{len(keypoint_names)}"),
             ]
+            if gt_metrics_enabled:
+                # The coverage row sits immediately next to the two GT accuracy rows on
+                # purpose: an accuracy figure read without its coverage rewards a fit that
+                # simply failed to attempt the hard keypoints.
+                metric_rows.extend([
+                    ("PCK_AUC_to_gt", metrics["keypoint_PCK_AUC_to_gt"][view_name]),
+                    ("contour_HD95_to_gt", metrics["contour_HD95_to_gt"][view_name]),
+                    ("kpt_coverage_vs_gt", metrics["keypoint_detection_coverage"][view_name]),
+                    ("gt_body_length_px", metrics["gt_body_length_px"][view_name]),
+                ])
             for keypoint_name in keypoint_names:
                 metric_rows.append(
                     (
@@ -920,117 +1390,6 @@ def _clear_reconstruction_cache(cache_path: str) -> None:
         print(f"Warning: failed to remove reconstruction cache '{cache_path}': {exc}")
 
 
-def interpolate_pose_pair(
-    pose_a: torch.Tensor,
-    pose_b: torch.Tensor,
-    interpolate_size: int,
-) -> torch.Tensor:
-    """
-    Reproduce the original np.interp behaviour for one pose pair.
-    The original code sampled x = 0 .. interpolate_size-1 while the two
-    endpoint poses were located at x = 0 and x = interpolate_size.
-    Consequently, the final endpoint itself is not emitted.
-    """
-    if interpolate_size <= 0:
-        return torch.empty(
-            (0, pose_a.shape[1]),
-            dtype=pose_a.dtype,
-            device=pose_a.device,
-        )
-    samples = torch.arange(
-        interpolate_size,
-        dtype=pose_a.dtype,
-        device=pose_a.device,
-    )
-    alpha = samples / interpolate_size
-    return torch.lerp(
-        pose_a.expand(interpolate_size, -1),
-        pose_b.expand(interpolate_size, -1),
-        alpha[:, None],
-    )
-
-
-def _interpolate_parameter_entries(
-    entry_a: list,
-    entry_b: list,
-    interpolate_size: int,
-    sample_offsets: list[int],
-) -> list[list[torch.Tensor]]:
-    """
-    CLAUDE FIX: linearly interpolate one full `parameters` entry
-    ([global_ori, body_pose, body_bone_length, scale, global_t]) between two reconstructed
-    frames. Each tensor is flattened to (1, D) so `interpolate_pose_pair` can be applied
-    unchanged, then restored to its original shape so the produced entries are drop-in
-    replacements for optimizer output (including the `*init` unpacking in `multiview.fit_mesh`).
-
-    `interpolate_pose_pair` places `entry_a` at x = 0 and `entry_b` at x = interpolate_size,
-    so `interpolate_size` must be the *distance between the two endpoint frames*, not the
-    number of frames in the gap, and each gap frame must be read off at its own offset from
-    `frame_a` (`sample_offsets`), not at its position in the gap list. Offset 0 is `entry_a`
-    itself and is therefore never requested; `entry_b` at x = interpolate_size is likewise
-    never emitted, since it is stored as its own frame.
-    """
-    if interpolate_size <= 0 or not sample_offsets:
-        return []
-    if any(not (0 < offset < interpolate_size) for offset in sample_offsets):
-        raise ValueError(
-            f"gap sample offsets {sample_offsets} must lie strictly between the endpoint "
-            f"frames (0 < offset < {interpolate_size})"
-        )
-
-    interpolated_entries: list[list[torch.Tensor]] = [[] for _ in sample_offsets]
-    for tensor_a, tensor_b in zip(entry_a, entry_b):
-        tensor_a = tensor_a.detach()
-        tensor_b = tensor_b.detach().to(dtype=tensor_a.dtype, device=tensor_a.device)
-        original_shape = tensor_a.shape
-        samples = interpolate_pose_pair(
-            tensor_a.reshape(1, -1),
-            tensor_b.reshape(1, -1),
-            interpolate_size,
-        )
-        for entry_idx, offset in enumerate(sample_offsets):
-            interpolated_entries[entry_idx].append(
-                samples[offset].reshape(original_shape).clone()
-            )
-    return interpolated_entries
-
-
-def _gap_interpolation_layout(
-    frame_a: int,
-    frame_b: int,
-    gap_frames: list[int],
-) -> tuple[int, list[int]]:
-    """
-    CLAUDE FIX: work out where each deferred frame sits on the x axis spanned by the two
-    endpoint frames. Normally this is just its real frame-number offset from `frame_a`, which
-    keeps the interpolation correct even when the gap is not contiguous -- e.g. when a frame in
-    between was dropped as unavailable (the IndexError/KeyError path) or when `frame_indices`
-    is strided, in which case the deferred frames are not evenly spaced in the gap list.
-
-    Falls back to even spacing over the gap if the frame numbering is not strictly increasing
-    across `frame_a -> gap_frames -> frame_b`, so a pathological frame list degrades instead of
-    raising.
-    """
-    frame_span = int(frame_b) - int(frame_a)
-    sample_offsets = [int(frame) - int(frame_a) for frame in gap_frames]
-    monotonic = (
-        frame_span > 0
-        and all(0 < offset < frame_span for offset in sample_offsets)
-        and all(
-            earlier < later
-            for earlier, later in zip(sample_offsets, sample_offsets[1:])
-        )
-    )
-    if not monotonic:
-        print(
-            f"Warning: frames {gap_frames} are not strictly ordered between frame {frame_a} "
-            f"and frame {frame_b}; falling back to even spacing for the interpolation."
-        )
-        frame_span = len(gap_frames) + 1
-        sample_offsets = list(range(1, frame_span))
-    return frame_span, sample_offsets
-
-
 def _save_pose_time_series_json(
     outdir: str,
     dataset_dir: str,
@@ -1115,11 +1474,6 @@ def _save_pose_time_series_json(
         }
         if payload.get("scale") is not None:
             frame_dict["scale"] = payload["scale"]
-        # CLAUDE FIX: gap-filled frames are flagged so consumers (e.g. the Blender importer) can
-        # tell interpolated poses from directly-optimized ones. The key is omitted entirely for
-        # normal frames, so output for a run without gaps is byte-identical to before.
-        if payload.get("interpolated"):
-            frame_dict["interpolated"] = True
         time_val = time_from_frame(frame_dict["frame"])
         if time_val is None:
             time_val = float(frame_dict["frame"] - frame_start)
@@ -1154,11 +1508,27 @@ def reconstruct(
     keypoints_weight: float = 1.0,
     view_weights: Optional[List[float]] = None,
     render_scale: float = 1.0,
+    gt_dataset_dir: Optional[str] = None,
+    body_length_keypoints: tuple = DEFAULT_BODY_LENGTH_KEYPOINTS,
 ) -> None:
     """
     Run multiview reconstruction for given frames.
 
     Args:
+        gt_dataset_dir: optional path to a *ground-truth* dataset in the same schema as
+            `dataset_dir` (as exported by the Blender add-on's "Create Reconstruction
+            Dataset" option). When given, the two "*_and_gt" IoU metrics are scored against
+            the annotated GT masks instead of the black-background threshold heuristic, and
+            an additional set of genuinely GT-referenced 2D metrics is written:
+            keypoint_PCK_AUC_to_gt, contour_HD95_to_gt, keypoint_L2_distance_to_gt,
+            keypoint_detection_coverage, gt_body_length_px and the GT-visibility-conditioned
+            hit / miss / hallucination / correct-absence rates. Independent of how the
+            reconstruction itself was driven: real YOLO detections can be scored against
+            synthetic GT, which is the primary intended use.
+            When None, every metric key and value is exactly as it was before.
+        body_length_keypoints: the two GT landmarks whose 2D distance normalises every
+            pixel-space GT metric, recomputed per frame and per view. Falls back to the GT
+            mask's bbox diagonal when either landmark is not labelled in that view.
         render_scale: CLAUDE FIX. Linear resolution factor for the differentiable silhouette
             renderer used during fitting, relative to the calibrated image size (1.0 = full
             resolution). Lowering it reduces rasterization time and GPU memory roughly with its
@@ -1192,6 +1562,42 @@ def reconstruct(
     print("     Bone length constraint violation: ", bone_length_constraint_weight)
     print("     Bone group deviation:             ", big_artic_weight)
     print("   Silhouette render scale:            ", render_scale)
+
+    # CLAUDE FIX: optional second dataset holding *annotated* ground truth, in the identical
+    # schema, restricted to the same view subset so every per-view list stays index-aligned
+    # with the primary dataset's. The lossless 0/1/2 visibility flags are read directly from
+    # keypoints_gt.pickle because Multiview_Dataset's keypoint tensor has room only for a
+    # scalar confidence and cannot distinguish "occluded" from "not labelled".
+    gt_dataset: Optional[Multiview_Dataset] = None
+    gt_keypoints_raw: dict = {}
+    body_length_kpt_indices: tuple = (None, None)
+    if gt_dataset_dir:
+        gt_dataset = Multiview_Dataset(root=gt_dataset_dir, views=dataset.views)
+        gt_keypoints_raw = load_gt_keypoint_visibility(gt_dataset_dir, gt_dataset.views)
+        keypoint_list = dataset.index_json["keypoint_list"]
+        gt_keypoint_list = gt_dataset.index_json.get("keypoint_list", keypoint_list)
+        if list(gt_keypoint_list) != list(keypoint_list):
+            raise ValueError(
+                "Ground-truth dataset keypoint_list differs from the reconstruction dataset's. "
+                f"GT: {list(gt_keypoint_list)}; reconstruction: {list(keypoint_list)}. "
+                "Keypoint order is load-bearing everywhere downstream, so this must match."
+            )
+        if tuple(gt_dataset.uniform_img_size) != tuple(dataset.uniform_img_size):
+            raise ValueError(
+                "Ground-truth dataset image size "
+                f"{tuple(gt_dataset.uniform_img_size)} differs from the reconstruction dataset's "
+                f"{tuple(dataset.uniform_img_size)}; 2D metrics would compare different canvases."
+            )
+        body_length_kpt_indices = tuple(
+            keypoint_list.index(name) if name in keypoint_list else None
+            for name in body_length_keypoints
+        )
+        print("   Ground-truth dataset:               ", gt_dataset_dir)
+        print(
+            "   Body-length normaliser landmarks:   ",
+            f"{body_length_keypoints[0]!r} -> {body_length_keypoints[1]!r} "
+            f"(indices {body_length_kpt_indices}; missing landmarks fall back to the GT mask bbox diagonal)",
+        )
     print("     Views:")
     for view_name, weight in zip(dataset.views, view_weights):
         print(f"          {view_name}: {weight}")
@@ -1288,6 +1694,10 @@ def reconstruct(
         cache_dataset = cache_data.get("dataset_dir")
         cache_mesh = cache_data.get("mesh_path")
         cache_frames = cache_data.get("frame_indices")
+        # CLAUDE FIX: a cached run made without a GT dataset holds none of the GT-referenced
+        # metrics, so resuming it for a run that now wants them would silently produce a
+        # metrics JSON with those keys populated for only part of the frame range.
+        cache_gt_dataset = cache_data.get("gt_dataset_dir")
         cache_view_weights = _normalize_weights(cache_data.get("view_weights"))
         requested_view_weights = _normalize_weights(view_weights)
         requested_frame_indices = _normalize_frame_indices(frame_indices)
@@ -1297,6 +1707,7 @@ def reconstruct(
             or (_normalize_path(cache_mesh) and _normalize_path(cache_mesh) != _normalize_path(mesh_path))
             or (cached_frame_indices and requested_frame_indices and cached_frame_indices != requested_frame_indices)
             or (cache_view_weights and requested_view_weights and cache_view_weights != requested_view_weights)
+            or (_normalize_path(cache_gt_dataset) != _normalize_path(gt_dataset_dir))
         ):
             print("Existing reconstruction cache does not match current configuration; starting a new reconstruction run.")
         else:
@@ -1313,8 +1724,21 @@ def reconstruct(
                 cached_elapsed_wall_time_sec = 0.0
             resumed_from_cache = True
 
+    # CLAUDE FIX: the GT-referenced metric keys exist only when a GT dataset was supplied, so
+    # a run without one keeps writing exactly today's metrics JSON.
+    gt_scalar_metric_names = (
+        ["keypoint_PCK_AUC_to_gt", "contour_HD95_to_gt", "keypoint_detection_coverage",
+         "gt_body_length_px"]
+        if gt_dataset is not None else []
+    )
+    gt_keypoint_metric_names = (
+        ["keypoint_L2_distance_to_gt", "keypoint_hit_rate_vs_gt", "keypoint_miss_rate_vs_gt",
+         "keypoint_hallucination_rate_vs_gt", "keypoint_correct_absence_rate_vs_gt"]
+        if gt_dataset is not None else []
+    )
+
     def _fresh_metrics() -> dict:
-        return {
+        fresh = {
             "IoU_mask_detection_and_gt": {view_name: [] for view_name in dataset.views},
             "IoU_reconstruction_and_gt": {view_name: [] for view_name in dataset.views},
             "IoU_reconstruction_and_mask_detection": {view_name: [] for view_name in dataset.views},
@@ -1323,10 +1747,16 @@ def reconstruct(
                 for view_name in dataset.views
             },
             "optimizer_losses": {name: [] for name in optimizer_loss_names},
-            # CLAUDE FIX: frame indices that were filled in by interpolation across a
-            # detection gap rather than optimized directly.
             "interpolated_frames": [],
         }
+        for name in gt_scalar_metric_names:
+            fresh[name] = {view_name: [] for view_name in dataset.views}
+        for name in gt_keypoint_metric_names:
+            fresh[name] = {
+                view_name: {kpt: [] for kpt in dataset.index_json["keypoint_list"]}
+                for view_name in dataset.views
+            }
+        return fresh
 
     def _ensure_metrics_schema(metrics_dict: dict) -> dict:
         metrics_dict.setdefault("interpolated_frames", [])
@@ -1334,6 +1764,8 @@ def reconstruct(
         metrics_dict.setdefault("IoU_reconstruction_and_gt", {})
         metrics_dict.setdefault("IoU_reconstruction_and_mask_detection", {})
         metrics_dict.setdefault("keypoint_L2_distance", {})
+        for name in gt_scalar_metric_names + gt_keypoint_metric_names:
+            metrics_dict.setdefault(name, {})
         for view_name in dataset.views:
             metrics_dict["IoU_mask_detection_and_gt"].setdefault(view_name, [])
             metrics_dict["IoU_reconstruction_and_gt"].setdefault(view_name, [])
@@ -1341,6 +1773,12 @@ def reconstruct(
             metrics_dict["keypoint_L2_distance"].setdefault(view_name, {})
             for kpt_name in dataset.index_json["keypoint_list"]:
                 metrics_dict["keypoint_L2_distance"][view_name].setdefault(kpt_name, [])
+            for name in gt_scalar_metric_names:
+                metrics_dict[name].setdefault(view_name, [])
+            for name in gt_keypoint_metric_names:
+                metrics_dict[name].setdefault(view_name, {})
+                for kpt_name in dataset.index_json["keypoint_list"]:
+                    metrics_dict[name][view_name].setdefault(kpt_name, [])
 
         metrics_dict.setdefault("optimizer_losses", {})
         target_len = max(
@@ -1372,8 +1810,7 @@ def reconstruct(
     metrics = _ensure_metrics_schema(metrics)
 
     def _append_frame_metrics(frame_metrics: Optional[dict]) -> None:
-        """CLAUDE FIX: keep every metric list the same length as the number of emitted frames,
-        including gap-filled frames whose images could not be rendered."""
+        """Keep every metric list aligned with the emitted pose frames."""
         for view in dataset.views:
             for metric_name in (
                 "IoU_mask_detection_and_gt",
@@ -1387,9 +1824,24 @@ def reconstruct(
                 metrics["keypoint_L2_distance"][view][kpt].append(
                     None if frame_metrics is None else frame_metrics["keypoint_L2_distance"][view][kpt]
                 )
+
+            # GT-referenced metrics use NaN for frames where no GT result was available.
+            for name in gt_scalar_metric_names:
+                metrics[name][view].append(
+                    None if frame_metrics is None
+                    else frame_metrics.get(name, {}).get(view, float("nan"))
+                )
+            for name in gt_keypoint_metric_names:
+                for kpt in dataset.index_json["keypoint_list"]:
+                    metrics[name][view][kpt].append(
+                        None if frame_metrics is None
+                        else frame_metrics.get(name, {}).get(view, {}).get(kpt, float("nan"))
+                    )
+
         for loss_name in optimizer_loss_names:
             metrics["optimizer_losses"][loss_name].append(
-                None if frame_metrics is None else frame_metrics.get("optimizer_losses", {}).get(loss_name)
+                None if frame_metrics is None
+                else frame_metrics.get("optimizer_losses", {}).get(loss_name)
             )
 
     def _emit_frame(
@@ -1399,19 +1851,16 @@ def reconstruct(
         final_losses: Optional[dict],
         world_outputs: Optional[tuple] = None,
         is_interpolated: bool = False,
+        gt_keypoints_tensor: Optional[torch.Tensor] = None,
+        gt_masks_full_tensor: Optional[torch.Tensor] = None,
+        gt_seg_mask_present_mask: Optional[List[bool]] = None,
     ) -> None:
         """
-        CLAUDE FIX: single place where a reconstructed *or* interpolated frame is turned into all
-        of its per-frame outputs (parameters/sample_data caching, deformation, pose time series
-        entry, saved images, metrics, processed_frames bookkeeping). Directly-optimized frames go
-        through exactly the same code path as before; interpolated frames differ only in having no
-        optimizer losses and in the overlay colour / flags.
+        Turn a directly optimized or interpolated parameter entry into all per-frame outputs.
 
-        Args:
-            entry: [global_ori, body_pose, body_bone_length, scale, global_t], i.e. the layout
-                stored in `parameters` and unpacked as `*init` into `multiview.fit_mesh`.
-            world_outputs: optional (vertices_world, keypoints_world) already computed by
-                `fit_mesh`; recomputed from the deformation when omitted.
+        Interpolated frames use exactly the same deformation, rendering, GT metrics, cache,
+        and time-series path as optimized frames; the only differences are their optimizer losses
+        (none) and the explicit interpolation marker/visualization.
         """
         global_ori_est, body_pose_est, body_bone_est, scale_est, global_t_est = entry
 
@@ -1425,6 +1874,26 @@ def reconstruct(
             keypoints_world_est = out_reconstructed["keypoints"].detach().cpu() + global_t_cpu
         else:
             vertices_world_est, keypoints_world_est = world_outputs
+
+        # Load GT for interpolated frames here; directly optimized frames can pass the already
+        # loaded tensors from the main loop to avoid changing the normal code path.
+        if gt_dataset is not None and gt_keypoints_tensor is None:
+            try:
+                gap_gt_sample = gt_dataset.__getitem__(frame_idx, instance_number)
+                gt_masks_full_tensor = gap_gt_sample["masks_full"] / 255.0
+                gt_seg_mask_present_mask = gap_gt_sample["seg_mask_present_mask"]
+            except (IndexError, KeyError) as exc:
+                print(
+                    f"Ground truth for frame {frame_idx} unavailable "
+                    f"({type(exc).__name__}: {exc})"
+                )
+            gt_keypoints_tensor = build_gt_keypoints_tensor(
+                gt_dataset,
+                gt_keypoints_raw,
+                frame_idx,
+                instance_number,
+                dataset.index_json["keypoint_list"],
+            )
 
         parameters.append([global_ori_est, body_pose_est, body_bone_est, scale_est, global_t_est])
         if instance_sample is not None:
@@ -1458,7 +1927,6 @@ def reconstruct(
             "scale": float(scale_list[0]) if scale_list else None,
         }
         if is_interpolated:
-            # Only set for gap fills; omitted for normal frames so their payload is unchanged.
             frame_payload["interpolated"] = True
         pose_time_series_frames.append(frame_payload)
 
@@ -1479,6 +1947,10 @@ def reconstruct(
                 mask_predictions=instance_sample["masks_full"] / 255.0,
                 mask_present_mask=instance_sample["seg_mask_present_mask"],
                 keypoint_predictions=instance_sample["keypoints"],
+                gt_keypoints=gt_keypoints_tensor,
+                gt_masks_full=gt_masks_full_tensor,
+                gt_mask_present_mask=gt_seg_mask_present_mask,
+                body_length_keypoint_indices=body_length_kpt_indices,
                 optimizer_losses=final_losses,
                 optimizer_loss_weights=optimizer_loss_weight_map,
                 view_weights=view_weights,
@@ -1488,7 +1960,6 @@ def reconstruct(
         if save_models:
             _save_obj_model(outdir, frame_idx, instance_number, vertices_world_est, fish)
 
-        # cache quality metrics for this frame
         _append_frame_metrics(frame_metrics)
 
         if is_interpolated and int(frame_idx) not in metrics["interpolated_frames"]:
@@ -1503,8 +1974,8 @@ def reconstruct(
     )
     run_start_wall_time_sec = time.perf_counter()
     paused = False
-    # CLAUDE FIX: frame indices skipped for insufficient detections, awaiting retroactive
-    # interpolation once a frame with sufficient detections is reconstructed again.
+    # Frames skipped for insufficient detections are emitted later by interpolation once a
+    # subsequent frame with sufficient detections has been reconstructed.
     pending_gap_frames: list[int] = []
 
     # --------------------------
@@ -1525,15 +1996,34 @@ def reconstruct(
             pbar.update()
             continue
 
+        # CLAUDE FIX: the GT sample is loaded for scoring only; a frame missing from the GT
+        # dataset degrades the GT metrics of that frame to NaN instead of aborting the run or,
+        # worse, skipping the frame and biasing every other metric by dropping the hard frames.
+        gt_keypoints_tensor: Optional[torch.Tensor] = None
+        gt_masks_full_tensor: Optional[torch.Tensor] = None
+        gt_seg_mask_present_mask: Optional[List[bool]] = None
+        if gt_dataset is not None:
+            try:
+                gt_sample = gt_dataset.__getitem__(idx, instance_number)
+                gt_masks_full_tensor = gt_sample["masks_full"] / 255.0
+                gt_seg_mask_present_mask = gt_sample["seg_mask_present_mask"]
+            except (IndexError, KeyError) as exc:
+                print(f"Ground truth for frame {idx} unavailable ({type(exc).__name__}: {exc})")
+            gt_keypoints_tensor = build_gt_keypoints_tensor(
+                gt_dataset,
+                gt_keypoints_raw,
+                idx,
+                instance_number,
+                dataset.index_json["keypoint_list"],
+            )
+
         kpt_present_mask = instance_sample['kpt_present_mask']
         seg_mask_present_mask = instance_sample['seg_mask_present_mask']
 
-        # CLAUDE FIX: frames with insufficient detections are no longer discarded. They are
-        # deferred ("pending") and retroactively filled in by interpolation once a later frame
-        # with sufficient detections is reconstructed (see the gap handling below). The
-        # sufficiency criteria themselves are unchanged.
+        # Frames with insufficient detections are deferred and later filled by interpolation
+        # once a subsequent valid reconstruction provides the second endpoint.
         if len([
-                view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask 
+                view_with_seg_mask for view_with_seg_mask in seg_mask_present_mask
                 if view_with_seg_mask == True
             ]) < 2:
             print(
@@ -1544,7 +2034,7 @@ def reconstruct(
             pbar.update()
             continue
         if len([
-                view_with_kpts for view_with_kpts in kpt_present_mask 
+                view_with_kpts for view_with_kpts in kpt_present_mask
                 if any(kpt_present == True for kpt_present in view_with_kpts)
             ]) < 2:
             print(
@@ -1568,11 +2058,8 @@ def reconstruct(
         # --------------------------
         # reconstruct
 
-        # initialize from previous solution if available
-        # CLAUDE FIX: after a run of deferred frames the last stored pose is separated from this
-        # frame by an unknown amount of motion, which makes it a poor warm start. Force
-        # `init = None` so this frame goes through the same triangulation+Procrustes
-        # initialization as the very first frame of a run.
+        # Initialize from the previous directly emitted solution. After a pending detection
+        # gap we deliberately use Procrustes initialization rather than warming across the gap.
         if pending_gap_frames and parameters:
             print(
                 f"Frame {idx}: gap of {len(pending_gap_frames)} frame(s) detected, "
@@ -1615,18 +2102,16 @@ def reconstruct(
             global_t_est,
         ]
 
-        # --------------------------
-        # CLAUDE FIX: retroactively fill the detection gap that preceded this frame, if any.
-        # The gap is emitted BEFORE this frame's own entry so `parameters`, `sample_data`,
-        # `pose_time_series_frames` and the metric lists all stay in chronological order and
-        # `init = parameters[-1]` for the next frame still refers to this frame.
+        # Retroactively fill a preceding detection gap before emitting the current frame.
+        # This preserves chronological ordering in parameters, sample_data, time series, and
+        # all metric lists; the current valid frame remains the final warm-start entry.
         if pending_gap_frames:
             if parameters:
                 frame_a = sample_data[-1][4]
                 frame_a_entry = parameters[-1]
                 print(
                     f"Backfilling frames {pending_gap_frames} via interpolation between "
-                    f"frame {frame_a} and frame {idx} ({len(pending_gap_frames)} frame(s))"
+                    f"frame {frame_a} and {idx} ({len(pending_gap_frames)} frame(s))"
                 )
                 frame_span, sample_offsets = _gap_interpolation_layout(
                     frame_a, idx, pending_gap_frames
@@ -1643,11 +2128,11 @@ def reconstruct(
                             f"({type(exc).__name__}: {exc}); storing pose without saved images"
                         )
                         gap_sample = None
+
                     _emit_frame(
                         frame_idx=gap_frame_idx,
                         entry=gap_entry,
                         instance_sample=gap_sample,
-                        # interpolated frames were never optimized, so there are no losses
                         final_losses=None,
                         is_interpolated=True,
                     )
@@ -1666,8 +2151,13 @@ def reconstruct(
             final_losses=final_losses,
             world_outputs=(vertices_world_est, keypoints_world_est),
             is_interpolated=False,
+            gt_keypoints_tensor=gt_keypoints_tensor,
+            gt_masks_full_tensor=gt_masks_full_tensor,
+            gt_seg_mask_present_mask=gt_seg_mask_present_mask,
         )
-        elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (time.perf_counter() - run_start_wall_time_sec)
+        elapsed_wall_time_sec = cached_elapsed_wall_time_sec + (
+            time.perf_counter() - run_start_wall_time_sec
+        )
 
         cache_payload = {
             "parameters": parameters,
@@ -1678,6 +2168,7 @@ def reconstruct(
             "last_frame": idx,
             "frame_indices": list(frame_indices),
             "dataset_dir": dataset_dir,
+            "gt_dataset_dir": gt_dataset_dir,
             "mesh_path": mesh_path,
             "instance_number": instance_number,
             "elapsed_wall_time_sec": elapsed_wall_time_sec,
@@ -1694,9 +2185,6 @@ def reconstruct(
             break
 
     # reconstruction done (or paused)
-    # CLAUDE FIX: a gap that is still open when the frame list runs out (or when the run is
-    # paused) has no right-hand endpoint to interpolate towards, so those frames are left
-    # unfilled and reported instead of silently disappearing.
     if pending_gap_frames:
         print(
             f"{len(pending_gap_frames)} trailing frame(s) {pending_gap_frames} had insufficient "
