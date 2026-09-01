@@ -33,13 +33,13 @@ bl_info = {
 import csv
 import pickle
 import bpy
-import bmesh
 import os
 import json
 import shutil
 import re
 import glob
 import math
+import time
 from collections import defaultdict
 from mathutils import Vector, Matrix
 from mathutils.bvhtree import BVHTree
@@ -66,6 +66,41 @@ armature_pose_toggle_cache = {
     "armature_name": None,
     "bone_mats": {},
 }
+
+# SPEEDUP (S1): the evaluated-mesh extraction depends on the FRAME only, never on the camera,
+# but the render queue visits every camera for every frame. Holding the last extraction lets all
+# cameras of one frame share a single to_mesh()/vertex-group scan. Keyed by
+# (collection, object, frame, keypoint tuple); a single slot is enough because the queue is
+# ordered frame-major (see TimedRender.execute).
+_deformed_mesh_cache = {"key": None, "value": None}
+
+
+def invalidate_deformed_mesh_cache():
+    _deformed_mesh_cache["key"] = None
+    _deformed_mesh_cache["value"] = None
+
+
+def get_deformed_mesh_data_cached(deps, collection_name, object_name, kpt_list, frame):
+    """get_deformed_mesh_data() memoised on (object, frame, keypoints).
+
+    `frame` must identify the evaluated state; TimedRender invalidates the cache whenever it
+    calls frame_set, so a stale entry cannot outlive the frame it was built for.
+    """
+    key = (collection_name, object_name, int(frame), tuple(kpt_list))
+    if _deformed_mesh_cache["key"] == key and _deformed_mesh_cache["value"] is not None:
+        return _deformed_mesh_cache["value"]
+    value = get_deformed_mesh_data(deps, collection_name, object_name, kpt_list)
+    _deformed_mesh_cache["key"] = key
+    _deformed_mesh_cache["value"] = value
+    return value
+
+
+# SPEEDUP (S4): datablocks for the material-override binary render. Creating two materials, a
+# world and their node trees -- and removing them again -- for every single mask render is pure
+# overhead; they are identical every time, so they are built once and reused for the whole run.
+_mask_render_datablocks = {"white": None, "black": None, "world": None}
+
+EMPTY_KPT_SET = frozenset()
 
 # conversion matrices between conventions
 BLENDER_CAM_2_CV_CAM = Matrix((
@@ -202,6 +237,31 @@ class SYNTH_PropertyGroup(PropertyGroup):
         description="Seconds between render queue checks",
         default=0.35,
         min=0.01
+    )
+
+    seconds_per_timer_tick: FloatProperty(
+        name="Work Per Tick (s)",
+        description=(
+            "How long the render queue is allowed to keep working before handing control back "
+            "to Blender. The Timer Interval is idle time paid ONCE PER BATCH instead of once "
+            "per queue item, so raising this cuts the fixed overhead of long queues. Lower it "
+            "if the UI feels unresponsive or ESC reacts too slowly"
+        ),
+        default=2.0,
+        min=0.0
+    )
+
+    use_persistent_render_data: BoolProperty(
+        name="Persistent Render Data",
+        description=(
+            "Keep the synced scene in memory between renders (Cycles: Performance > Final "
+            "Render > Persistent Data). Avoids re-syncing the whole scene for every frame and "
+            "every camera, which is a large speedup for long queues, at the cost of higher "
+            "memory use. Off by default: the binary pass swaps every material in the file twice "
+            "per frame, so check a handful of masks against a non-persistent run before "
+            "enabling it for a full dataset. Restored after the run"
+        ),
+        default=False
     )
 
     render_binary: BoolProperty(
@@ -502,69 +562,112 @@ def get_deformed_mesh_data(deps, collection_name, object_name, kpt_list):
     # -> docs: create a Mesh data-block from the current state of the object. The object owns the data-block. 
     # The result is temporary and cannot be used by objects from the main database.
     mesh_eval = obj_eval.to_mesh(preserve_all_data_layers=True, depsgraph=deps)
-    bm = bmesh.new()
-    bm.from_mesh(mesh_eval)
+
+    n_verts = len(mesh_eval.vertices)
+    n_polys = len(mesh_eval.polygons)
+
+    # SPEEDUP (S2a): pull coordinates, normals and polygon areas out in bulk with foreach_get
+    # instead of one Python attribute access per element, and derive the world-space coordinates
+    # with a single (N,3) matrix product instead of one `Matrix @ Vector` per vertex.
+    co_flat = np.empty(n_verts * 3, dtype=np.float64)
+    mesh_eval.vertices.foreach_get('co', co_flat)
+    co_local = co_flat.reshape(-1, 3)
+
+    nrm_flat = np.empty(n_verts * 3, dtype=np.float64)
+    mesh_eval.vertices.foreach_get('normal', nrm_flat)
+    nrm_local = nrm_flat.reshape(-1, 3)
+
+    m = np.array(obj2world, dtype=np.float64)                  # 4x4, row-major
+    co_world = co_local @ m[:3, :3].T + m[:3, 3]
+    co_world_t = [tuple(c) for c in co_world.tolist()]         # built once, shared below
+
+    areas = np.empty(n_polys, dtype=np.float64)
+    mesh_eval.polygons.foreach_get('area', areas)
+    areas = areas.tolist()
+
+    # Polygon vertex indices in bulk. loop_total/loop_start + the loop-vertex array reproduces
+    # `poly.vertices` for n-gons without touching each polygon from Python.
+    loop_total = np.empty(n_polys, dtype=np.int32)
+    loop_start = np.empty(n_polys, dtype=np.int32)
+    mesh_eval.polygons.foreach_get('loop_total', loop_total)
+    mesh_eval.polygons.foreach_get('loop_start', loop_start)
+    n_loops = len(mesh_eval.loops)
+    loop_verts = np.empty(n_loops, dtype=np.int32)
+    mesh_eval.loops.foreach_get('vertex_index', loop_verts)
+    loop_verts_l = loop_verts.tolist()
+    loop_total_l = loop_total.tolist()
+    loop_start_l = loop_start.tolist()
 
     faces = []
-    for poly in mesh_eval.polygons:
-        face_data = {
-            "id":   poly.index,
-            "area": poly.area,
-            "verts": [vid for vid in poly.vertices]
-        }
-        faces.append(face_data)
+    for i in range(n_polys):
+        s = loop_start_l[i]
+        faces.append({
+            "id":    i,
+            "area":  areas[i],
+            "verts": loop_verts_l[s:s + loop_total_l[i]],
+        })
 
-    vertices = [
-        {
-            "id": v.index,
-            "co": tuple(v.co)
-        }
-        for v in mesh_eval.vertices
-    ]
-    normals  = [(tuple(v.co), tuple(v.normal))   for v in bm.verts]
-    bm.free()
+    co_local_t = [tuple(c) for c in co_local.tolist()]
+    vertices = [{"id": i, "co": co} for i, co in enumerate(co_local_t)]
+    normals = [(co_local_t[i], tuple(nv)) for i, nv in enumerate(nrm_local.tolist())]
 
-    # build a mapping group-name -> list of vertex indices in that group
-    kpt_2_verts_objco = {}
-    for vg in obj_eval.vertex_groups:
-        if vg.name in kpt_list:
-            # find all vertices in mesh_eval whose group indices include vg.index
-            verts_in_group = [
-                vi for vi, v in enumerate(mesh_eval.vertices)
-                if any(g.group == vg.index for g in v.groups)
-            ]
-            kpt_2_verts_objco[vg.name] = verts_in_group
+    # SPEEDUP (S2b): the old code scanned ALL vertices once per vertex group and ran an inner
+    # `any(g.group == ...)` over each vertex's group memberships -- O(V * G * groups_per_vertex).
+    # One pass over the vertices fills every group at once.
+    wanted_group_index_2_name = {
+        vg.index: vg.name for vg in obj_eval.vertex_groups if vg.name in kpt_list
+    }
+    kpt_2_verts_objco = {name: [] for name in wanted_group_index_2_name.values()}
+    if wanted_group_index_2_name:
+        for vi, v in enumerate(mesh_eval.vertices):
+            for g in v.groups:
+                name = wanted_group_index_2_name.get(g.group)
+                if name is not None:
+                    kpt_2_verts_objco[name].append(vi)
 
-    # now get their coords in world space:
     kpt_2_verts_worldco = {
-        kpt: [{
-                "id": i, "co": tuple(obj2world @ mesh_eval.vertices[i].co)
-            } for i in idx_list
-        ]
+        kpt: [{"id": i, "co": co_world_t[i]} for i in idx_list]
         for kpt, idx_list in kpt_2_verts_objco.items()
     }
 
-    # Keypoint → world-space faces (strictly associated)
-    kpt_2_faces_worldco = {}
+    # Keypoint -> world-space faces (strictly associated: every vertex of the face belongs to the
+    # keypoint).
+    # SPEEDUP (S2c): the old form was O(faces * keypoints) with a fresh `set()` allocation per
+    # (face, keypoint) pair. Inverting the mapping to vertex -> owning keypoints and intersecting
+    # the owner sets of a face's vertices makes it O(total face corners), independent of the
+    # number of keypoints. World coordinates are looked up from the precomputed table instead of
+    # being re-transformed per face corner (shared vertices were transformed once per incident
+    # face before).
+    vert_2_kpts = defaultdict(set)
     for kpt, idx_list in kpt_2_verts_objco.items():
-        verts_set = set(idx_list)
-        face_list = []
-        for face in faces:
-            # strict: all face verts must be in the keypoint's vertices
-            if set(face["verts"]).issubset(verts_set):
-                # build list of world‐space coords for this face
-                coords = [
-                    tuple(obj2world @ mesh_eval.vertices[i].co)
-                    for i in face["verts"]
-                ]
-                face_list.append({"coords": coords, "area": face["area"]})
-        kpt_2_faces_worldco[kpt] = face_list
+        for vi in idx_list:
+            vert_2_kpts[vi].add(kpt)
 
-    # CLAUDE FIX (B1): `bm.free()` was called a second time here on a BMesh that had already been
-    # freed a few lines above. The duplicate call raises ReferenceError, which propagated out of
+    kpt_2_faces_worldco = {kpt: [] for kpt in kpt_2_verts_objco}
+    if vert_2_kpts:
+        for face in faces:
+            fverts = face["verts"]
+            if not fverts:
+                continue
+            owners = vert_2_kpts.get(fverts[0])
+            if not owners:
+                continue
+            for vi in fverts[1:]:
+                owners = owners & vert_2_kpts.get(vi, EMPTY_KPT_SET)
+                if not owners:
+                    break
+            if not owners:
+                continue
+            entry = {"coords": [co_world_t[i] for i in fverts], "area": face["area"]}
+            for kpt in owners:
+                kpt_2_faces_worldco[kpt].append(entry)
+
+    # CLAUDE FIX (B1): `bm.free()` used to be called a second time here on a BMesh that had
+    # already been freed above. The duplicate call raises ReferenceError, which propagated out of
     # this function and was swallowed by the broad `except` in TimedRender.handle_render_item --
-    # silently dropping every keypoint label for every frame.
-    # docs: The object owns the mesh data-block. To force free it use to_mesh_clear(). 
+    # silently dropping every keypoint label for every frame. The BMesh is gone entirely now: it
+    # only ever fed `normals`, which foreach_get('normal') gives for free.
+    # docs: The object owns the mesh data-block. To force free it use to_mesh_clear().
     obj_eval.to_mesh_clear()
     
     return faces, vertices, normals, kpt_2_verts_worldco, kpt_2_faces_worldco
@@ -967,24 +1070,44 @@ def get_avg_kpt_coords_3d(kpt2verts_co:dict):
 # VISIBILITY / OCCLUSION
 # =============================================================================
 
-def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-4):
+def is_vertex_occluded(deps, cam_obj, vertex_co_world, eps=1e-4, cache=None):
+    """Ray-cast occlusion test for one world-space point.
+
+    SPEEDUP (S3a): `cache` is an optional dict shared across one (camera, frame). Keypoint faces
+    share their corner vertices with every neighbouring face of the same keypoint, so the very
+    same point used to be ray-cast once per incident face -- and again by the
+    `draw_every_keypoint_vertex` overlay. Memoising on the exact coordinate tuple removes those
+    duplicates without changing a single result.
+    """
+    if cache is not None:
+        key = tuple(vertex_co_world)
+        hit_cached = cache.get(key)
+        if hit_cached is not None:
+            return hit_cached
+
     if deps is None:
         deps = bpy.context.evaluated_depsgraph_get()
     cam_co = cam_obj.matrix_world.translation
     dir_vec = (Vector(vertex_co_world) - cam_co)
     dist_to_pt = dir_vec.length
     if dist_to_pt < eps:
-        return False
-    dir_vec.normalize()
-    origin = cam_co + dir_vec * eps
-    hit, hit_loc, _, _, hit_obj, _ = bpy.context.scene.ray_cast(deps, origin, dir_vec)
-    if not hit:
-        return False
-    dist_hit = (hit_loc - origin).length
-    return dist_hit < (dist_to_pt - eps)
+        result = False
+    else:
+        dir_vec.normalize()
+        origin = cam_co + dir_vec * eps
+        hit, hit_loc, _, _, hit_obj, _ = bpy.context.scene.ray_cast(deps, origin, dir_vec)
+        if not hit:
+            result = False
+        else:
+            dist_hit = (hit_loc - origin).length
+            result = dist_hit < (dist_to_pt - eps)
+
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
-def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
+def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj, occlusion_cache=None):
     """
     For each keypoint, kpt_2_faces_worldco[kpt] is a list of faces,
     each face is a list of world-space (x,y,z) tuples.
@@ -996,6 +1119,33 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
 
     kpt_2_visibility_pct = {}
     kpt_2_visible_faces  = defaultdict(list)
+
+    if deps is None:
+        deps = bpy.context.evaluated_depsgraph_get()
+    if occlusion_cache is None:
+        occlusion_cache = {}
+
+    # SPEEDUP (S3b): hoist the invariants out of the inner loop -- the camera position, the eps
+    # offset and the bound ray_cast method were re-resolved for every corner of every face.
+    eps = 1e-4
+    cam_co = cam_obj.matrix_world.translation.copy()
+    ray_cast = bpy.context.scene.ray_cast
+
+    def occluded(coord):
+        cached = occlusion_cache.get(coord)
+        if cached is not None:
+            return cached
+        dir_vec = Vector(coord) - cam_co
+        dist_to_pt = dir_vec.length
+        if dist_to_pt < eps:
+            result = False
+        else:
+            dir_vec.normalize()
+            origin = cam_co + dir_vec * eps
+            hit, hit_loc, _, _, _, _ = ray_cast(deps, origin, dir_vec)
+            result = bool(hit) and (hit_loc - origin).length < (dist_to_pt - eps)
+        occlusion_cache[coord] = result
+        return result
 
     for kpt, face_list in kpt_2_faces_worldco.items():
         total_area   = 0.0
@@ -1016,7 +1166,7 @@ def get_keypoint_visibility_from_faces(deps, kpt_2_faces_worldco, cam_obj):
             # keypoints were labelled as fully visible.
             all_visible = True
             for coord in face_coords:
-                if is_vertex_occluded(deps, cam_obj, Vector(coord)):
+                if occluded(coord):
                     all_visible = False
                     break
 
@@ -1101,6 +1251,140 @@ def project_world_point_with_cam_matrix(P, world_coord):
 # MASK RENDERING & YOLO LABEL WRITERS
 # =============================================================================
 
+def get_mask_render_datablocks():
+    """Return the (white emission, black emission, black world) datablocks, creating them once.
+
+    SPEEDUP (S4a): these were built from scratch -- four node trees plus their links -- and then
+    removed again on every single mask render. They are constant, so they are created lazily and
+    reused for the whole run; `free_mask_render_datablocks()` drops them when the queue drains.
+    """
+    cached = _mask_render_datablocks
+
+    def _alive(db):
+        try:
+            _ = db.name if db is not None else None
+            return db is not None
+        except ReferenceError:
+            return False
+
+    if not _alive(cached.get("white")):
+        white_em = bpy.data.materials.new(name="SYNTH_tmp_white_emission")
+        white_em.use_nodes = True
+        ntw = white_em.node_tree
+        for n in list(ntw.nodes):
+            ntw.nodes.remove(n)
+        emis = ntw.nodes.new('ShaderNodeEmission')
+        emis.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+        outm = ntw.nodes.new('ShaderNodeOutputMaterial')
+        ntw.links.new(emis.outputs['Emission'], outm.inputs['Surface'])
+        cached["white"] = white_em
+
+    if not _alive(cached.get("black")):
+        black_em = bpy.data.materials.new(name="SYNTH_tmp_black_emission")
+        black_em.use_nodes = True
+        ntb = black_em.node_tree
+        for n in list(ntb.nodes):
+            ntb.nodes.remove(n)
+        bemis = ntb.nodes.new('ShaderNodeEmission')
+        bemis.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+        outbm = ntb.nodes.new('ShaderNodeOutputMaterial')
+        ntb.links.new(bemis.outputs['Emission'], outbm.inputs['Surface'])
+        cached["black"] = black_em
+
+    if not _alive(cached.get("world")):
+        try:
+            black_world = bpy.data.worlds.new(name="SYNTH_tmp_black_world")
+            black_world.use_nodes = True
+            for nd in list(black_world.node_tree.nodes):
+                black_world.node_tree.nodes.remove(nd)
+            bg = black_world.node_tree.nodes.new('ShaderNodeBackground')
+            bg.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+            outw = black_world.node_tree.nodes.new('ShaderNodeOutputWorld')
+            black_world.node_tree.links.new(bg.outputs['Background'], outw.inputs['Surface'])
+            cached["world"] = black_world
+        except Exception:
+            cached["world"] = None
+
+    return cached.get("white"), cached.get("black"), cached.get("world")
+
+
+def free_mask_render_datablocks():
+    """Drop the reusable mask datablocks once the render queue is done."""
+    for key, collection in (("white", bpy.data.materials),
+                            ("black", bpy.data.materials),
+                            ("world", bpy.data.worlds)):
+        db = _mask_render_datablocks.get(key)
+        _mask_render_datablocks[key] = None
+        try:
+            if db is not None and db.users == 0:
+                collection.remove(db, do_unlink=True)
+        except Exception:
+            pass
+
+
+class binary_render_settings:
+    """Temporarily switch the scene to the cheapest settings that still give an exact mask.
+
+    SPEEDUP (S5): the binary pass renders flat emission shaders against a black world, so its
+    result is identical at one sample and needs no denoising, no ray bounces and no colour
+    management. It is also a 1-channel image, so writing it as 8-bit BW PNG with low compression
+    saves both the encode and the subsequent OpenCV decode. Everything is restored on exit, so
+    the beauty pass keeps the user's settings.
+    """
+
+    def __init__(self, scene, sampling=True):
+        self.scene = scene
+        # The compositor path renders the *shaded* scene and then blows it out to white, so a
+        # one-sample render could leave noise holes inside the silhouette. Only the material
+        # override path is guaranteed noise-free, hence the switch.
+        self.sampling = sampling
+        self.saved = []
+
+    def _set(self, owner, attr, value):
+        try:
+            self.saved.append((owner, attr, getattr(owner, attr)))
+            setattr(owner, attr, value)
+        except Exception:
+            if self.saved and self.saved[-1][0] is owner and self.saved[-1][1] == attr:
+                self.saved.pop()
+
+    def __enter__(self):
+        scene = self.scene
+        img = scene.render.image_settings
+        self._set(img, 'file_format', 'PNG')
+        self._set(img, 'color_mode', 'BW')
+        self._set(img, 'color_depth', '8')
+        self._set(img, 'compression', 15)
+
+        if not self.sampling:
+            return self
+
+        engine = getattr(scene.render, 'engine', '')
+        if engine == 'CYCLES' and hasattr(scene, 'cycles'):
+            cy = scene.cycles
+            self._set(cy, 'samples', 1)
+            self._set(cy, 'use_denoising', False)
+            self._set(cy, 'use_adaptive_sampling', False)
+            self._set(cy, 'max_bounces', 0)
+            self._set(cy, 'use_light_tree', False)
+        elif engine.startswith('BLENDER_EEVEE') and hasattr(scene, 'eevee'):
+            ee = scene.eevee
+            self._set(ee, 'taa_render_samples', 1)
+            self._set(ee, 'use_gtao', False)
+            self._set(ee, 'use_bloom', False)
+            self._set(ee, 'use_ssr', False)
+        return self
+
+    def __exit__(self, *exc):
+        for owner, attr, value in reversed(self.saved):
+            try:
+                setattr(owner, attr, value)
+            except Exception:
+                pass
+        self.saved.clear()
+        return False
+
+
 def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
     """
     Render a binary mask (white target, black occluders) WITHOUT requiring a prepared compositor.
@@ -1116,27 +1400,7 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
 
     out_abspath = bpy.path.abspath(out_path)
 
-    # --- create temp materials ------------------------------------------------
-    white_em = bpy.data.materials.new(name="SYNTH_tmp_white_emission")
-    white_em.use_nodes = True
-    ntw = white_em.node_tree
-    # clear nodes (be defensive)
-    for n in list(ntw.nodes):
-        ntw.nodes.remove(n)
-    emis = ntw.nodes.new('ShaderNodeEmission')
-    emis.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-    outm = ntw.nodes.new('ShaderNodeOutputMaterial')
-    ntw.links.new(emis.outputs['Emission'], outm.inputs['Surface'])
-
-    black_em = bpy.data.materials.new(name="SYNTH_tmp_black_emission")
-    black_em.use_nodes = True
-    ntb = black_em.node_tree
-    for n in list(ntb.nodes):
-        ntb.nodes.remove(n)
-    bemis = ntb.nodes.new('ShaderNodeEmission')
-    bemis.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
-    outbm = ntb.nodes.new('ShaderNodeOutputMaterial')
-    ntb.links.new(bemis.outputs['Emission'], outbm.inputs['Surface'])
+    white_em, black_em, black_world = get_mask_render_datablocks()
 
     # --- save state -----------------------------------------------------------
     orig_filepath = scene.render.filepath
@@ -1149,43 +1413,42 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
     # objects while mutating `o.data.materials`, so two objects sharing one mesh had that mesh's
     # slot list cleared and re-appended twice -- duplicating slots and, because clearing resets
     # every polygon's material_index to 0, destroying per-face material assignments. Snapshot and
-    # restore per unique mesh datablock, including material_index.
-    all_mesh_objects = [o for o in bpy.data.objects if o.type == 'MESH']
+    # restore per unique mesh datablock.
+    #
+    # SPEEDUP (S4b): the fix above snapshotted and rewrote EVERY polygon's material_index of
+    # EVERY mesh in the file, twice per mask render -- an O(total scene polygons) Python loop for
+    # each frame and each camera. Overwriting the existing slots in place instead of clearing the
+    # slot list keeps the slot count, so material_index is never touched at all and only the slot
+    # pointers have to be restored. Meshes with no slot at all get one appended and removed.
     mesh_to_objects = defaultdict(list)
-    for o in all_mesh_objects:
-        mesh_to_objects[o.data].append(o)
-    orig_materials = {
-        me: ([slot for slot in me.materials], [poly.material_index for poly in me.polygons])
-        for me in mesh_to_objects
-    }
+    for o in bpy.data.objects:
+        if o.type == 'MESH':
+            mesh_to_objects[o.data].append(o)
+    orig_materials = {me: list(me.materials) for me in mesh_to_objects}
+
+    target_mesh = target_obj.data
 
     # Save world and set black background (optional but ensures no stray background)
     orig_world = scene.world
-    black_world = None
-    try:
-        black_world = bpy.data.worlds.new(name="SYNTH_tmp_black_world")
-        black_world.use_nodes = True
-        # clear nodes
-        for nd in list(black_world.node_tree.nodes):
-            black_world.node_tree.nodes.remove(nd)
-        bg = black_world.node_tree.nodes.new('ShaderNodeBackground')
-        bg.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
-        outw = black_world.node_tree.nodes.new('ShaderNodeOutputWorld')
-        black_world.node_tree.links.new(bg.outputs['Background'], outw.inputs['Surface'])
-        scene.world = black_world
-    except Exception:
-        # if creating a new world fails, keep original world
-        black_world = None
+    if black_world is not None:
+        try:
+            scene.world = black_world
+        except Exception:
+            pass
 
     # --- assign materials: target -> white, others -> black --------------------
     try:
         for me, objs in mesh_to_objects.items():
-            is_target = any(o.name == target_obj.name for o in objs)
+            is_target = me is target_mesh
             if is_target and len(objs) > 1:
                 print(f"SYNTH warning: mesh '{me.name}' is shared by the target object and "
                       f"{len(objs) - 1} other object(s); they cannot be masked separately.")
-            me.materials.clear()
-            me.materials.append(white_em if is_target else black_em)
+            mat = white_em if is_target else black_em
+            if len(me.materials) == 0:
+                me.materials.append(mat)
+            else:
+                for i in range(len(me.materials)):
+                    me.materials[i] = mat
 
         # ensure output dir exists
         os.makedirs(os.path.dirname(out_abspath), exist_ok=True)
@@ -1197,18 +1460,22 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
         except Exception:
             pass
 
-        bpy.ops.render.render(write_still=True)
+        # SPEEDUP (S5): every surface in the scene is now a flat emission shader lit by nothing,
+        # so the mask image is noise-free at one sample. Rendering it with the beauty pass's
+        # sample count (and its denoiser) is wasted work -- often the single largest cost of the
+        # whole run.
+        with binary_render_settings(scene):
+            bpy.ops.render.render(write_still=True)
 
     finally:
         # --- restore materials ------------------------------------------------
-        for me, (mats, face_indices) in orig_materials.items():
+        for me, mats in orig_materials.items():
             try:
-                me.materials.clear()
-                for m in mats:
-                    me.materials.append(m)
-                # materials.clear() resets every polygon's material_index to 0
-                for poly, idx in zip(me.polygons, face_indices):
-                    poly.material_index = idx
+                if not mats:
+                    me.materials.clear()
+                    continue
+                for i, m in enumerate(mats):
+                    me.materials[i] = m
             except Exception:
                 pass
 
@@ -1226,19 +1493,13 @@ def render_binary_mask_keep_occluders_black(scene, target_obj, out_path):
         except Exception:
             pass
 
-        # cleanup temporary materials/world if unused
-        for datablock, collection in ((white_em, bpy.data.materials),
-                                      (black_em, bpy.data.materials),
-                                      (black_world, bpy.data.worlds)):
-            try:
-                if datablock is not None and datablock.users == 0:
-                    collection.remove(datablock, do_unlink=True)
-            except Exception:
-                pass
 
-
-def get_mask_polygons_from_binary_image(img_path):
-    mask = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+def get_mask_polygons_from_binary_image(img_path, mask=None):
+    """SPEEDUP (S6): `mask` lets the caller pass an already-decoded grayscale image. The mask PNG
+    used to be decoded twice per frame and view -- once here and once in
+    recon_dataset_read_binary_mask -- for no reason."""
+    if mask is None:
+        mask = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         return []
     _, thresh = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
@@ -1413,6 +1674,12 @@ def write_pose_labels_yolo(instances, instances_vis_status, kpt_order, image_wid
 #      separate keypoints_gt.pickle that only the evaluation code reads.
 # =============================================================================
 
+RECON_VIEW_SUBDIRS = ('origin', 'cropped', 'mask', 'mask_full',
+                      'bbox-masked_image', 'keypoints_results')
+
+# Directories already created this session, so the per-frame writer can skip the makedirs calls.
+_recon_created_view_dirs = set()
+
 RECON_FILES_CSV_HEADER = ['frame', 'file_loc', 'category', 'sub_index', 'folder']
 RECON_FILES_CROP_CSV_HEADER = ['frame', 'file_loc', 'category', 'sub_index', 'folder', 'bbox']
 
@@ -1441,9 +1708,13 @@ def recon_dataset_crop_and_pad(image, mask, bbox):
     return crop_img, crop_mask
 
 
-def recon_dataset_read_binary_mask(mask_path):
-    """Read the rendered GT mask as a 0/1 uint8 array, or None if it is unreadable."""
-    img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+def recon_dataset_read_binary_mask(mask_path, img=None):
+    """Read the rendered GT mask as a 0/1 uint8 array, or None if it is unreadable.
+
+    SPEEDUP (S6): accepts an already-decoded grayscale image to avoid a second PNG decode of the
+    very same file."""
+    if img is None:
+        img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
     _, binary = cv2.threshold(img, 127, 1, cv2.THRESH_BINARY)
@@ -1465,8 +1736,12 @@ def recon_dataset_write_frame(
     that the loader would happily accept.
     """
     view_dir = os.path.join(root, view_name)
-    for sub in ('origin', 'cropped', 'mask', 'mask_full', 'bbox-masked_image', 'keypoints_results'):
-        os.makedirs(os.path.join(view_dir, sub), exist_ok=True)
+    # SPEEDUP (S8): the six directories are the same for every frame of a view; creating them per
+    # frame cost six filesystem calls each time for nothing.
+    if view_dir not in _recon_created_view_dirs:
+        for sub in RECON_VIEW_SUBDIRS:
+            os.makedirs(os.path.join(view_dir, sub), exist_ok=True)
+        _recon_created_view_dirs.add(view_dir)
 
     origin_name = f"{view_name}_{frame}.png"
     origin_rel = f"{view_name}/origin/{origin_name}"
@@ -1475,10 +1750,16 @@ def recon_dataset_write_frame(
     files_row = [frame, origin_rel, 'origin', 0, view_name]
     crop_rows = []
 
-    has_instance = gt_mask_binary is not None and int(gt_mask_binary.sum()) > 0
-    if has_instance:
+    # SPEEDUP (S7): `gt_mask_binary.sum()` accumulated the whole full-resolution array into an
+    # int64 just to answer "is anything set". cv2.boundingRect already reports an empty mask as a
+    # zero-sized rectangle and is the value we need anyway, so one pass replaces two.
+    bbox = None
+    if gt_mask_binary is not None:
         x, y, w, h = cv2.boundingRect(gt_mask_binary)
-        bbox = [int(x), int(y), int(x + w), int(y + h)]
+        if w > 0 and h > 0:
+            bbox = [int(x), int(y), int(x + w), int(y + h)]
+    has_instance = bbox is not None
+    if has_instance:
         origin_img = cv2.imread(str(origin_image_path), cv2.IMREAD_COLOR)
         crop_img, crop_mask = recon_dataset_crop_and_pad(origin_img, gt_mask_binary, bbox)
 
@@ -1582,7 +1863,7 @@ def recon_dataset_finalize(root, state, kpt_list, report=None):
 
     for view_name, view_state in state['views'].items():
         view_dir = os.path.join(root, view_name)
-        for sub in ('origin', 'cropped', 'mask', 'mask_full', 'bbox-masked_image', 'keypoints_results'):
+        for sub in RECON_VIEW_SUBDIRS:
             os.makedirs(os.path.join(view_dir, sub), exist_ok=True)
 
         files_csv_path = os.path.join(view_dir, 'files.csv')
@@ -1687,13 +1968,22 @@ using opencv's contour detection can create a silhouette annotation from the bin
     cancel_render = False
     total = 0
     # Accumulated reconstruction-dataset rows, keyed by view name. Held in memory across the
-    # whole queue because the modal operator handles one (camera, frame, mode) per timer tick,
+    # whole queue because the modal operator drains the queue in batches across timer ticks,
     # and index.json / the CSVs can only be written once every view is known.
     recon_state = None
     # Bridges _annotate_frame (which runs on the 'regular' queue item) to _render_and_write_mask
     # (which runs on the following 'binary' item for the same camera and frame). The GT mask and
     # the GT keypoints for one (view, frame) never exist inside the same call.
     recon_pending_keypoints = None
+    # Ray-cast memo, valid for one (camera, frame); see _annotate_frame.
+    _occlusion_cache = None
+    _occlusion_cache_key = None
+    # scene.render.use_persistent_data as it was before the run, or None if untouched.
+    _saved_persistent_data = None
+    # The render-size/UI mismatch warning is emitted at most once per run.
+    _size_warning_reported = False
+    # Whether the run has already forced a frame_set; see handle_render_item.
+    _first_frame_set_done = False
 
     def make_prefix_cam_frame(self, cam_name, frame_number):
         return f"{camera_name_to_view_name(cam_name)}_{str(frame_number).zfill(4)}"
@@ -1721,16 +2011,29 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
         modes = ["regular"] + (["binary"] if p.render_binary else [])
 
+        # `resolve()` hits bpy.path.abspath and was called three times per queue item; the four
+        # directories are constant for the whole run.
+        render_dir_os = resolve(p.render_out_dir)
+        mask_dir_os = resolve(p.mask_label_dir)
+        kpt_dir_os = resolve(p.kpt_label_dir)
+
+        enabled_cams = [cam for cam in cam_objects if cam.name in enabled_camera_names]
+
         skipped_count = 0
-        for cam in cam_objects:
-            if cam.name not in enabled_camera_names:
-                continue
-            for frame_index in range(scene.frame_start, scene.frame_end + 1):
+        # SPEEDUP (S1b): the queue is built FRAME-major (frame -> camera -> mode) rather than
+        # camera-major. The evaluated mesh, its vertex-group scan and its keypoint faces depend
+        # only on the frame, so ordering this way lets every camera of a frame reuse one
+        # extraction (see get_deformed_mesh_data_cached) and lets scene.frame_set -- a full
+        # depsgraph re-evaluation -- run once per frame instead of once per (camera, frame).
+        # Nothing downstream depends on the order: the CSVs are sorted in recon_dataset_finalize
+        # and the YOLO/video steps look files up by name.
+        for frame_index in range(scene.frame_start, scene.frame_end + 1):
+            for cam in enabled_cams:
                 for mode in modes:
                     render_prefix = self.make_prefix_cam_frame(cam.name, frame_index)
-                    render_path_os = os.path.join(resolve(p.render_out_dir), render_prefix + ".png")
-                    mask_label_path_os = os.path.join(resolve(p.mask_label_dir), render_prefix + ".txt")
-                    kpt_label_path_os = os.path.join(resolve(p.kpt_label_dir), render_prefix + ".txt")
+                    render_path_os = os.path.join(render_dir_os, render_prefix + ".png")
+                    mask_label_path_os = os.path.join(mask_dir_os, render_prefix + ".txt")
+                    kpt_label_path_os = os.path.join(kpt_dir_os, render_prefix + ".txt")
                     if (
                             (not os.path.exists(render_path_os))
                             or ((not os.path.exists(mask_label_path_os)) if p.render_binary else True)
@@ -1743,8 +2046,8 @@ using opencv's contour detection can create a silhouette annotation from the bin
                             'render_prefix_cam_frame':  render_prefix,
                             'render_path_bl':           os.path.join(p.render_out_dir, render_prefix + ".png"),
                             'render_path_os':           render_path_os,
-                            'mask_annot_path':          os.path.join(resolve(p.mask_label_dir), render_prefix + ".png"),
-                            'kpt_annot_path':           os.path.join(resolve(p.kpt_label_dir),  render_prefix + ".png"),
+                            'mask_annot_path':          os.path.join(mask_dir_os, render_prefix + ".png"),
+                            'kpt_annot_path':           os.path.join(kpt_dir_os,  render_prefix + ".png"),
                             'mask_label_path':          mask_label_path_os,
                             'kpt_label_path':           kpt_label_path_os,
                         })
@@ -1753,6 +2056,22 @@ using opencv's contour detection can create a silhouette annotation from the bin
 
         self.total = len(self.render_queue)
         self.report({'INFO'}, f"Queued {self.total} renders (skipped {skipped_count})")
+
+        invalidate_deformed_mesh_cache()
+        self._size_warning_reported = False
+        self._first_frame_set_done = False
+
+        # SPEEDUP (S9): Cycles re-syncs the whole scene for every bpy.ops.render.render call.
+        # Persistent data keeps the synced scene between renders, which is the standard win for
+        # rendering many frames of one scene -- at the cost of holding it in memory, hence the
+        # toggle. Restored in cleanup().
+        self._saved_persistent_data = None
+        if p.use_persistent_render_data:
+            try:
+                self._saved_persistent_data = scene.render.use_persistent_data
+                scene.render.use_persistent_data = True
+            except Exception:
+                self._saved_persistent_data = None
 
         # add timer
         self.timer_event = context.window_manager.event_timer_add(p.event_timer_interval, window=context.window)
@@ -1766,6 +2085,18 @@ using opencv's contour detection can create a silhouette annotation from the bin
             except Exception:
                 pass
             self.timer_event = None
+
+        # Release everything the speedups kept alive for the duration of the queue.
+        if getattr(self, '_saved_persistent_data', None) is not None:
+            try:
+                context.scene.render.use_persistent_data = self._saved_persistent_data
+            except Exception:
+                pass
+            self._saved_persistent_data = None
+        invalidate_deformed_mesh_cache()
+        self._occlusion_cache = None
+        self._occlusion_cache_key = None
+        free_mask_render_datablocks()
 
 
     # CLAUDE FIX (B5): one source of truth for the annotated image size. The out-of-bounds test
@@ -1802,15 +2133,34 @@ using opencv's contour detection can create a silhouette annotation from the bin
         if not cam_obj:
             self.report({'ERROR'}, f"Camera {cam_name} not found")
             return
-        scene.camera = cam_obj
-        scene.frame_set(frame_index)
+
+        # SPEEDUP (S10): frame_set() re-evaluates the entire depsgraph (armature, modifiers,
+        # constraints, physics). With the frame-major queue the two modes and all cameras of one
+        # frame ask for the same frame in a row, so it only has to run on an actual change --
+        # which also keeps the cached mesh extraction valid for the whole frame. Assigning
+        # scene.camera likewise tags the scene for an update, so it is guarded too.
+        if scene.camera is not cam_obj:
+            scene.camera = cam_obj
+        if scene.frame_current != frame_index or not self._first_frame_set_done:
+            # The very first item always forces the update, so a run can never start from a
+            # depsgraph the scene happens to be sitting on but that was never evaluated.
+            self._first_frame_set_done = True
+            scene.frame_set(frame_index)
+            invalidate_deformed_mesh_cache()
+            self._occlusion_cache = None
+            self._occlusion_cache_key = None
 
         img_w, img_h = self._annotation_image_size(scene)
         if (img_w, img_h) != (int(p.image_width_px), int(p.image_height_px)):
-            self.report({'WARNING'},
-                        f"scene render size {img_w}x{img_h} differs from the UI fields "
-                        f"{int(p.image_width_px)}x{int(p.image_height_px)}; labels follow the "
-                        f"rendered size. Press 'Apply And Save Settings' to sync them.")
+            # Reported once instead of once per queue item; the condition cannot change mid-run
+            # without the user editing the scene, and thousands of identical warnings are their
+            # own kind of slow.
+            if not getattr(self, '_size_warning_reported', False):
+                self._size_warning_reported = True
+                self.report({'WARNING'},
+                            f"scene render size {img_w}x{img_h} differs from the UI fields "
+                            f"{int(p.image_width_px)}x{int(p.image_height_px)}; labels follow the "
+                            f"rendered size. Press 'Apply And Save Settings' to sync them.")
 
         # CLAUDE FIX (B6): the queue holds one item per (camera, frame, mode), but the beauty
         # render and the whole keypoint/label pipeline used to run for BOTH modes -- every frame
@@ -1846,11 +2196,23 @@ using opencv's contour detection can create a silhouette annotation from the bin
         try:
             deps = bpy.context.evaluated_depsgraph_get()
 
+            # SPEEDUP (S1c): shared across every camera of this frame -- see
+            # get_deformed_mesh_data_cached and the frame-major queue in execute().
             faces, vertices, normals, kpt_2_verts_list_world, kpt_2_faces_list_world = \
-                get_deformed_mesh_data(deps, p.collection_name, p.object_name, kpt_list)
+                get_deformed_mesh_data_cached(deps, p.collection_name, p.object_name,
+                                              kpt_list, scene.frame_current)
+
+            # One ray-cast memo per (camera, frame): the visibility pass and the optional
+            # per-vertex overlay below hit the same coordinates repeatedly.
+            occl_key = (cam_obj.name, scene.frame_current)
+            if getattr(self, '_occlusion_cache_key', None) != occl_key:
+                self._occlusion_cache_key = occl_key
+                self._occlusion_cache = {}
+            occlusion_cache = self._occlusion_cache
 
             kpt_2_visibility_pct, kpt_2_visible_faces = (
-                get_keypoint_visibility_from_faces(deps, kpt_2_faces_list_world, cam_obj)
+                get_keypoint_visibility_from_faces(deps, kpt_2_faces_list_world, cam_obj,
+                                                   occlusion_cache=occlusion_cache)
                 if p.check_keypoint_visibility
                 else (
                     {k: 1.0 for k in kpt_2_verts_list_world.keys()},
@@ -1930,7 +2292,8 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 visible_verts = []
                 for vertex_list in kpt_2_verts_list_world.values():
                     for vertex in vertex_list:
-                        if (not is_vertex_occluded(deps, cam_obj, Vector(vertex["co"]))
+                        if (not is_vertex_occluded(deps, cam_obj, vertex["co"],
+                                                   cache=occlusion_cache)
                                 if p.check_keypoint_visibility else True):
                             vertex_bl_cam = P @ Vector(tuple(vertex["co"]) + (1,))
                             if abs(vertex_bl_cam.z) < EPS:
@@ -2036,13 +2399,19 @@ using opencv's contour detection can create a silhouette annotation from the bin
             scene.node_tree.nodes["Brightness/Contrast"].inputs[1].default_value = 50
             scene.node_tree.nodes["Brightness/Contrast"].inputs[2].default_value = 100
             scene.render.filepath = mask_annot_out_file_path
-            bpy.ops.render.render(write_still=True)
+            # Single-channel 8-bit output only; the sample count is left alone because the
+            # compositor path renders the shaded scene and noise would punch holes in the mask.
+            with binary_render_settings(scene, sampling=False):
+                bpy.ops.render.render(write_still=True)
         else:
             render_binary_mask_keep_occluders_black(
                 scene, get_target_object(scene), mask_annot_out_file_path)
 
         if os.path.exists(mask_annot_out_file_path):
-            polygons = get_mask_polygons_from_binary_image(mask_annot_out_file_path)
+            # SPEEDUP (S6b): decode the freshly written mask PNG once and hand the array to both
+            # consumers; it used to be read from disk twice per view and frame.
+            mask_gray = cv2.imread(str(mask_annot_out_file_path), cv2.IMREAD_GRAYSCALE)
+            polygons = get_mask_polygons_from_binary_image(mask_annot_out_file_path, mask=mask_gray)
             # NOTE: this must happen BEFORE the draw_polygons call below. When
             # create_annotated_images is on, draw_polygons *overwrites* mask_annot_out_file_path
             # with an annotated copy of the beauty render, destroying the binary GT mask in
@@ -2050,7 +2419,7 @@ using opencv's contour detection can create a silhouette annotation from the bin
             if self.recon_state is not None and view_name is not None:
                 self._recon_write_frame(
                     context, view_name, frame_index, cam_obj, render_out_file_path_os,
-                    recon_dataset_read_binary_mask(mask_annot_out_file_path),
+                    recon_dataset_read_binary_mask(mask_annot_out_file_path, img=mask_gray),
                     image_size or (img_w, img_h),
                 )
             if p.create_annotated_images:
@@ -2131,11 +2500,22 @@ using opencv's contour detection can create a silhouette annotation from the bin
                 return {'FINISHED'}
 
             if not self.rendering:
-                qitem = self.render_queue.pop(0)
-                # try:
-                self.handle_render_item(context, qitem)
-                # except Exception as e:
-                #     self.report({'WARNING'}, f"Render failed for item: {e}")
+                # SPEEDUP (S11): one item per timer tick meant `event_timer_interval` seconds of
+                # pure idle waiting per item -- 0.35 s by default, i.e. ~35 min of nothing for a
+                # 6-camera 500-frame run, and it dominates entirely once the cheap items (the
+                # annotation-only pass, or resumed runs whose renders already exist) are counted.
+                # Items are now drained until the tick's time budget is spent; ESC is still
+                # handled between batches.
+                budget = max(0.0, context.scene.synth_props.seconds_per_timer_tick)
+                t0 = time.perf_counter()
+                while self.render_queue and not self.cancel_render:
+                    qitem = self.render_queue.pop(0)
+                    # try:
+                    self.handle_render_item(context, qitem)
+                    # except Exception as e:
+                    #     self.report({'WARNING'}, f"Render failed for item: {e}")
+                    if time.perf_counter() - t0 >= budget:
+                        break
 
         return {'PASS_THROUGH'}
 
@@ -2288,6 +2668,8 @@ class SYNTH_OT_apply_settings(Operator):
             'COLLECTION_NAME': p.collection_name,
             'OBJECT_NAME': p.object_name,
             'EVENT_TIMER_INTERVAL': p.event_timer_interval,
+            'SECONDS_PER_TIMER_TICK': p.seconds_per_timer_tick,
+            'use_persistent_render_data': p.use_persistent_render_data,
             'render_binary': p.render_binary,
             'use_compositor': p.use_compositor,
             'create_annotated_images': p.create_annotated_images,
@@ -2361,6 +2743,8 @@ class SYNTH_OT_load_config(Operator):
             'COLLECTION_NAME': 'collection_name',
             'OBJECT_NAME': 'object_name',
             'EVENT_TIMER_INTERVAL': 'event_timer_interval',
+            'SECONDS_PER_TIMER_TICK': 'seconds_per_timer_tick',
+            'use_persistent_render_data': 'use_persistent_render_data',
             'render_binary': 'render_binary',
             'use_compositor': 'use_compositor',
             'create_annotated_images': 'create_annotated_images',
@@ -4298,7 +4682,11 @@ class SYNTH_PT_main_panel(Panel):
             box.prop(p, 'reconstruction_dataset_out_dir')
             if not p.render_binary:
                 box.label(text="Needs 'Render Binary Masks' enabled.", icon='ERROR')
+        box = layout.box()
+        box.label(text="Performance")
         box.prop(p, 'event_timer_interval')
+        box.prop(p, 'seconds_per_timer_tick')
+        box.prop(p, 'use_persistent_render_data')
         row = layout.row()
         row.operator('synth.apply_settings', icon='CHECKMARK')
         row.operator('synth.load_config', icon='IMPORT')
