@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import csv
+import itertools
 import json
 import math
 import random
@@ -73,11 +74,58 @@ NON_METRIC_KEYS = frozenset(
     {
         "optimizer_losses",
         "interpolated_frames",
+        "blocked_frames",
         "timing",
         "total_duration_min",
         "seconds_per_frame",
     }
 )
+
+# --------------------------------------------------------------------------
+# Blocked frames
+# --------------------------------------------------------------------------
+#
+# A blocked frame is one the reconstruction pipeline emitted -- it has a full row
+# in every per-frame metric array -- but whose pose it did not obtain by fitting
+# the optimizer to observations of that frame. Currently that means a pose
+# gap-filled by interpolation across a detection gap, but the reason travels with
+# each record, so a new one needs no change here.
+#
+# They are EXCLUDED from every statistic by default. A straight-line guess across
+# a gap is not something the reconstruction produced, so scoring it measures the
+# interpolation instead. Worse, it is not neutral: the runs with the most
+# gap-filled frames are exactly the view combinations whose detections failed
+# most, so including them flatters the weakest combinations and biases the
+# sweep's central question.
+#
+# The list comes from the metrics file itself, as "blocked_frames":
+#
+#   [{"frame_number": 72,
+#     "frame_index_in_this_reconstruction_run": 7,
+#     "reason_blocked": "interpolated_pose_gap_fill"}, ...]
+#
+# `frame_index_in_this_reconstruction_run` is what this script uses: the per-view
+# arrays in collected_metrics.json are positional and carry no frame numbers, so
+# the index is the only key that addresses them. It is recorded by the producer at
+# emission time rather than re-derived here, because it is not generally
+# recoverable after the fact -- the arrays are dense over PROCESSED frames, and a
+# frame dropped for an unavailable sample leaves no trace in them.
+#
+# Excluded frames still count as AVAILABLE in the coverage ratio rho: they were
+# requested and the pipeline produced a row for them, so rho keeps meaning "of
+# everything this run set out to measure, how much reached the analysis", and a
+# run that had to interpolate half its frames does not silently report the same
+# rho as one that fitted every frame.
+#
+# A run whose blocked_frames field is missing is analysed unfiltered, with one
+# warning naming it -- never silently, and never by guessing an alignment.
+
+# One-element list rather than a bare bool: build_report() needs to describe the policy the
+# run actually used, and this keeps that out of its signature without a rebinding global.
+EXCLUDE_BLOCKED = [True]
+BLOCKED_FRAMES_KEY = "blocked_frames"
+BLOCKED_INDEX_FIELD = "frame_index_in_this_reconstruction_run"
+
 
 # The metric whose keys define the run's view set; any discovered entry not
 # keyed by those views is rejected rather than analysed as if it were.
@@ -99,6 +147,10 @@ class MetricSpec:
     # the reconstruction, i.e. it scores the detector or the GT alone. Its
     # variation across #views is then group composition, not a fitting effect.
     combination_invariant: bool = False
+    # False for the 3D metrics: they are measured on the fused reconstruction and
+    # have one value per (run, frame), so 'which view' is not a question that can
+    # be asked of them. Figures keyed by view are skipped for such a metric.
+    view_axis: bool = True
 
 
 # Registry order is report order: reconstruction quality first, then the
@@ -213,6 +265,83 @@ METRIC_REGISTRY: Dict[str, MetricSpec] = {
         orientation="diagnostic, no preferred direction",
         combination_invariant=True,
     ),
+    # --- 3D, world space (collected_3d_metrics.json) ------------------------
+    # Registered after the 2D block so that registry order stays report order and
+    # the 2D metrics keep supplying build_report()'s reference view set.
+    "IoU_3d_volumetric": MetricSpec(
+        label="volumetric 3D IoU(reconstruction, GT)",
+        description=(
+            "Monte-Carlo occupancy estimate of Vol(GT and R) / Vol(GT or R) between the fitted "
+            "template and the ground-truth mesh, both in world space. Unlike the 2D silhouette "
+            "IoU this cannot be satisfied by a fit that only looks right from the cameras: it "
+            "penalises depth and thickness errors no view constrains. A ratio of two volumes, so "
+            "it is scale free and is deliberately not body-length normalised."
+        ),
+        view_axis=False,
+    ),
+    "keypoint_distance_3d_bl": MetricSpec(
+        label="3D keypoint distance [body lengths]",
+        description=(
+            "Euclidean distance between each keypoint's world-space vertex-group centroid on the "
+            "reconstruction and on the GT mesh, divided by the per-frame GT body length. This is "
+            "the 3D counterpart of keypoint_L2_distance_to_gt and is normalised the same way, so "
+            "the two are on one scale; it is an absolute world-space error, not a reprojection, "
+            "so a fit that is wrong in depth cannot hide behind a camera."
+        ),
+        orientation="lower is better",
+        view_axis=False,
+    ),
+    "body_length_3d_m": MetricSpec(
+        label="GT body length [m]",
+        description=(
+            "The 3D scale normaliser itself: world-space mouth tip to caudal peduncle distance on "
+            "the GT mesh, with the GT mesh AABB diagonal as a flagged fallback. A diagnostic, not "
+            "a quality score. It should be near constant across a sweep, since every run is scored "
+            "against the same ground-truth animation; drift or a step means some runs fell back to "
+            "the AABB and their body-length figures are not on the same scale as the rest."
+        ),
+        orientation="diagnostic, no preferred direction",
+        combination_invariant=True,
+        view_axis=False,
+    ),
+    "volume_ratio_3d_recon_over_gt": MetricSpec(
+        label="volume ratio recon / GT",
+        description=(
+            "Occupied volume of the reconstruction over that of the GT mesh, per frame. Scale "
+            "fidelity: 1.0 is correct, below 1 the fit is shrunken and above 1 inflated. Read it "
+            "beside the IoU, which a systematically over- or under-scaled fit depresses without "
+            "saying in which direction. Dimensionless, so the body lengths cancel."
+        ),
+        orientation="1.0 is correct, either direction is worse",
+        view_axis=False,
+    ),
+    "MPVE_3d_bl": MetricSpec(
+        label="MPVE [body lengths]",
+        description=(
+            "Mean per-vertex Euclidean error of the fused reconstruction in world space, divided "
+            "by the per-frame GT body length. Uses exact vertex-index correspondence."
+        ),
+        orientation="lower is better",
+        view_axis=False,
+    ),
+    "MPJPE_3d_keypoint_bl": MetricSpec(
+        label="MPJPE (keypoint centroids) [body lengths]",
+        description=(
+            "Mean per-frame Euclidean error over configured keypoint centroids, divided by the "
+            "per-frame GT body length. This is the keypoint-centroid MPJPE variant."
+        ),
+        orientation="lower is better",
+        view_axis=False,
+    ),
+    "MPJPE_3d_joint_bl": MetricSpec(
+        label="MPJPE (bone heads) [body lengths]",
+        description=(
+            "Mean per-frame Euclidean error over real armature bone heads, divided by the per-frame "
+            "GT body length. This is the skeleton-joint MPJPE variant."
+        ),
+        orientation="lower is better",
+        view_axis=False,
+    ),
 }
 
 
@@ -243,6 +372,47 @@ def metric_sort_key(metric: str) -> Tuple[int, str]:
 # count is taken from the prefix only.
 RUN_KEY_PATTERN = re.compile(r"^k(\d+)__")
 
+# --------------------------------------------------------------------------
+# The 3D metrics in collected_3d_metrics.json
+# --------------------------------------------------------------------------
+#
+# synthetic_data_generator_ui.py's 'Batch 3D Metrics from PTS2 Dir' operator
+# writes a second collection beside the one this script's positional argument
+# points at:
+#
+#   <out_root>/metrics_collected/collected_metrics.json   2D, image space
+#   <out_root>/collected_3d_metrics.json                  3D, world space
+#
+# Both are keyed by the same combo_folder_name() leaves, so RUN_KEY_PATTERN,
+# parse_n_views() and every grouping below apply to the 3D file unchanged and a
+# 3D run lines up one-to-one with its 2D counterpart. The 3D file is picked up
+# automatically when it sits at that default location, and its metrics enter the
+# same cell table, summary and plots as the 2D ones.
+#
+# TWO STRUCTURAL DIFFERENCES, both handled explicitly further down:
+#
+# (1) NO VIEW AXIS. A volumetric IoU between two world-space meshes is one number
+#     per (run, frame), not per (run, view, frame): the 3D metrics score the
+#     reconstruction itself, after all views have been fused, so there is no view
+#     to attribute a value to. They are tagged with the sentinel view VIEW_3D and
+#     MetricSpec.view_axis=False, and the figures keyed by view are skipped for
+#     them rather than drawn with one meaningless column. Everything that varies
+#     with the number of views -- which is the actual question a view-combination
+#     sweep asks -- still works.
+#
+# (2) NESTED FRAME RECORDS. A 2D run is metric -> view -> [value per frame]. A 3D
+#     run is two blocks, each {meta, summary, frames}, whose frames[] are lists of
+#     dicts keyed by "frame". THREE_D_SCALARS / THREE_D_KEYPOINTS below flatten
+#     them into the flat per-frame arrays the rest of this script expects; the
+#     precomputed "summary" in the file is deliberately ignored, because this
+#     script pools raw frame values across runs and would otherwise be averaging
+#     averages over unequal frame counts.
+#
+# UNITS: every 3D length is read in GT BODY LENGTHS, never metres. A metre depends
+# on how large the fish was modelled and is not comparable across scenes, nor with
+# the 2D keypoint error, which is already normalised by gt_body_length_px. The IoU
+# is a ratio of volumes and is scale free to begin with.
+
 # Mirrors sweep_view_combinations.MAX_LEAF_NAME_LEN, for the same reason: stay
 # clear of the 255-byte ext4 filename limit.
 MAX_PLOT_NAME_LEN = 200
@@ -254,6 +424,9 @@ GROUPING_OVERALL = "overall"
 GROUPING_PER_VIEW = "per_view_overall"
 GROUPING_PER_VIEW_PER_N = "per_view_per_n_views"
 GROUPING_PER_N = "per_n_views"
+
+DISTRIBUTION_POINTS = "points"  # one marker per raw frame value
+DISTRIBUTION_BOXES = "boxes"  # one box per colour group instead of the markers
 
 DEFAULT_PRIMARY_COLOR = "#40E0D0"  # turquoise
 # Debian's fonts-linuxlibertine installs the family as 'Linux Biolinum O'; the
@@ -337,20 +510,64 @@ def classify_metric(metric_data: Any, view_names: Sequence[str]) -> Optional[str
     return None
 
 
+def blocked_positions(
+    run_metrics: Dict[str, Any], run_key: str
+) -> Tuple[Optional[frozenset], Dict[str, int]]:
+    """(positions to drop, count per reason) for one run's per-frame arrays.
+
+    Returns (None, {}) when the run cannot be filtered -- the metrics file predates
+    blocked_frames -- which the caller must treat as 'analyse unfiltered and say so', NOT as
+    'nothing was blocked'. An empty frozenset is the different, benign answer: the field is
+    present and no frame was blocked.
+    """
+    raw = run_metrics.get(BLOCKED_FRAMES_KEY)
+    if raw is None:
+        return None, {}
+    if not isinstance(raw, list):
+        warn(f"{run_key}: '{BLOCKED_FRAMES_KEY}' is {type(raw).__name__}, not a list; "
+             f"treating the run as unfilterable.")
+        return None, {}
+
+    positions, by_reason, malformed = set(), {}, 0
+    for entry in raw:
+        if not isinstance(entry, dict) or not isinstance(entry.get(BLOCKED_INDEX_FIELD), int):
+            malformed += 1
+            continue
+        positions.add(entry[BLOCKED_INDEX_FIELD])
+        reason = str(entry.get("reason_blocked", "unspecified"))
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    if malformed:
+        warn(f"{run_key}: {malformed} blocked-frame record(s) lack an integer "
+             f"'{BLOCKED_INDEX_FIELD}' and were ignored; those frames stay in the statistics.")
+    return frozenset(positions), by_reason
+
+
+def _keep(values: Sequence[Any], drop: Optional[frozenset]) -> Iterator[Any]:
+    """Yield the values whose position is not excluded."""
+    if not drop:
+        yield from values
+        return
+    for position, value in enumerate(values):
+        if position not in drop:
+            yield value
+
+
 def _iter_scalar_samples(
-    metric: str, metric_data: Dict[str, Any], n_views: int, run_key: str
+    metric: str, metric_data: Dict[str, Any], n_views: int, run_key: str,
+    drop: Optional[frozenset] = None,
 ) -> Iterator[Sample]:
     for view, values in metric_data.items():
         if not isinstance(values, list):
             warn(f"{run_key}: '{metric}' / '{view}' is not a frame list; skipping it.")
             continue
         view_name = sys.intern(str(view))
-        for value in values:
+        for value in _keep(values, drop):
             yield Sample(metric, None, view_name, n_views, _to_float(value))
 
 
 def _iter_keypoint_samples(
-    metric: str, metric_data: Dict[str, Any], n_views: int, run_key: str
+    metric: str, metric_data: Dict[str, Any], n_views: int, run_key: str,
+    drop: Optional[frozenset] = None,
 ) -> Iterator[Sample]:
     for view, keypoints in metric_data.items():
         if not isinstance(keypoints, dict):
@@ -362,19 +579,28 @@ def _iter_keypoint_samples(
                 warn(f"{run_key}: '{metric}' / '{view}' / '{keypoint}' is not a frame list; skipping it.")
                 continue
             keypoint_name = sys.intern(str(keypoint))
-            for value in values:
+            for value in _keep(values, drop):
                 yield Sample(metric, keypoint_name, view_name, n_views, _to_float(value))
 
 
 def iter_samples(
-    collected: Dict[str, Any], wanted_metrics: Optional[Sequence[str]] = None
+    collected: Dict[str, Any], wanted_metrics: Optional[Sequence[str]] = None,
+    exclude_blocked: bool = True, availability: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> Iterator[Sample]:
     """
     Stream every run's per-frame values as tidy samples. A run with an
     unparseable key or a malformed payload is warned about and skipped rather
     than aborting the analysis, as is an individual malformed metric entry.
+
+    Blocked frames are dropped by position unless `exclude_blocked` is False; see the
+    'Blocked frames' block near the top of this file. `availability`, if given, is filled
+    with the per-run frame accounting rho is computed from -- excluded frames stay counted
+    as available there, which is the whole point of tracking it separately from the samples.
     """
     n_runs = 0
+    n_dropped = 0
+    reasons: Dict[str, int] = {}
+    unfilterable = []
     for run_key, run_metrics in collected.items():
         n_views = parse_n_views(run_key)
         if n_views is None:
@@ -391,6 +617,35 @@ def iter_samples(
             continue
 
         n_runs += 1
+
+        # The run's frame count, from the reference metric: every per-view array is the same
+        # length by construction, and this is the denominator rho is built on.
+        n_available = max(
+            (len(v) for v in reference.values() if isinstance(v, list)), default=0
+        )
+
+        drop: Optional[frozenset] = frozenset()
+        run_reasons: Dict[str, int] = {}
+        if exclude_blocked:
+            drop, run_reasons = blocked_positions(run_metrics, run_key)
+            if drop is None:
+                # Predates blocked_frames. Analysed unfiltered, named in one summary warning
+                # after the loop rather than once per metric.
+                unfilterable.append(run_key)
+                drop = frozenset()
+            else:
+                n_dropped += len(drop)
+                for reason, count in run_reasons.items():
+                    reasons[reason] = reasons.get(reason, 0) + count
+
+        if availability is not None:
+            availability[run_key] = {
+                "n_available": int(n_available),
+                "n_blocked_excluded": int(len(drop)),
+                "n_used": int(max(n_available - len(drop), 0)),
+                "blocked_filterable": run_key not in unfilterable,
+            }
+
         for metric in sorted(set(run_metrics) - NON_METRIC_KEYS, key=metric_sort_key):
             if wanted_metrics is not None and metric not in wanted_metrics:
                 continue
@@ -400,11 +655,231 @@ def iter_samples(
                 continue
             metric_name = sys.intern(metric)
             if kind == SCALAR:
-                yield from _iter_scalar_samples(metric_name, run_metrics[metric], n_views, run_key)
+                yield from _iter_scalar_samples(metric_name, run_metrics[metric], n_views,
+                                                run_key, drop)
             else:
-                yield from _iter_keypoint_samples(metric_name, run_metrics[metric], n_views, run_key)
+                yield from _iter_keypoint_samples(metric_name, run_metrics[metric], n_views,
+                                                  run_key, drop)
 
     log(f"Read {n_runs} run(s).")
+    if exclude_blocked and n_dropped:
+        log(f"Excluded {n_dropped} blocked frame position(s) across {n_runs} run(s) "
+            f"({', '.join(f'{k}: {v}' for k, v in sorted(reasons.items()))}).")
+    if unfilterable:
+        warn(
+            f"{len(unfilterable)} run(s) have no '{BLOCKED_FRAMES_KEY}' field, so blocked "
+            f"frames CANNOT be located in their per-frame arrays and are included in the "
+            f"statistics: {', '.join(unfilterable[:3])}"
+            f"{' ...' if len(unfilterable) > 3 else ''}. Re-run the reconstruction to record "
+            f"it, or pass --no-exclude-blocked to make every run's treatment uniform."
+        )
+
+
+# --------------------------------------------------------------------------
+# 3D sample extraction (collected_3d_metrics.json)
+# --------------------------------------------------------------------------
+
+# Sentinel view for the metrics that have no view axis (see the block above).
+# Short and not a legal camera stem, so it can never collide with a real view.
+VIEW_3D = "3d"
+
+# Default location relative to the 2D file: collect_results() writes
+# metrics_collected/collected_metrics.json, the batch operator writes
+# collected_3d_metrics.json one level up from it.
+DEFAULT_3D_NAME = "collected_3d_metrics.json"
+
+
+@dataclass(frozen=True)
+class ThreeDScalar:
+    """One scalar metric read out of a per-frame record of a 3D block.
+
+    `block` is the top-level key of the run entry, `field` the per-frame key, and
+    `divide_by` an optional second field the value is divided by, which is how the
+    volume ratio is derived without the writer having to store it.
+    """
+
+    block: str
+    field: str
+    divide_by: Optional[str] = None
+
+
+# Adding a metric that is already in the file is one line here plus a
+# METRIC_REGISTRY entry. The body-length-cubed volumes (vol_gt_bl3,
+# vol_recon_bl3, vol_intersection_bl3, vol_union_bl3) are written by the operator
+# and can be surfaced the same way; they are left out by default because the IoU
+# and the ratio below already answer what they would be read for.
+THREE_D_SCALARS: Dict[str, ThreeDScalar] = {
+    "IoU_3d_volumetric": ThreeDScalar("volumetric_iou", "iou"),
+    "volume_ratio_3d_recon_over_gt": ThreeDScalar(
+        "volumetric_iou", "vol_recon", divide_by="vol_gt"
+    ),
+    "body_length_3d_m": ThreeDScalar("volumetric_iou", "body_length_m"),
+}
+
+# metric -> (block, per-frame field holding {keypoint: value}). '_bl' by
+# construction: metres are in the file too but must not be plotted, since they are
+# not comparable across scenes.
+THREE_D_KEYPOINTS: Dict[str, Tuple[str, str]] = {
+    "keypoint_distance_3d_bl": ("keypoint_distances", "per_keypoint_bl"),
+}
+
+
+# Batch MPVE/MPJPE are stored using the same nested metric blocks as the
+# standalone evaluators. These sources flatten the relevant per-frame scalar
+# into the same Sample shape used by the rest of the analyzer.
+# Path format:
+#   (metric block, optional sub-block, frame field path...)
+THREE_D_NESTED_SCALARS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "MPVE_3d_bl": (
+        ("mpve",),
+        ("variants", "body_length_normalised", "mean"),
+    ),
+    "MPJPE_3d_keypoint_bl": (
+        ("mpjpe", "keypoint"),
+        ("body_length_normalised", "global"),
+    ),
+    "MPJPE_3d_joint_bl": (
+        ("mpjpe", "joint"),
+        ("body_length_normalised", "global"),
+    ),
+}
+
+
+def _nested_value(mapping: Any, path: Sequence[str]) -> Any:
+    """Read a nested dictionary field, returning None for malformed/missing data."""
+    value = mapping
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _3d_frames(run: Dict[str, Any], block: str, run_key: str) -> List[Dict[str, Any]]:
+    """The frames[] of one block of one run, or [] with a warning if unusable."""
+    payload = run.get(block)
+    if payload is None:
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("frames"), list):
+        warn(f"{run_key}: 3D block '{block}' has no frames list; skipping it.")
+        return []
+    return [f for f in payload["frames"] if isinstance(f, dict)]
+
+
+def _ratio(numerator: Any, denominator: Any) -> float:
+    """numerator / denominator as a float, NaN on anything non-finite or zero."""
+    num, den = _to_float(numerator), _to_float(denominator)
+    if math.isnan(num) or math.isnan(den) or den == 0.0:
+        return float("nan")
+    value = num / den
+    return value if math.isfinite(value) else float("nan")
+
+
+def _3d_blocked(frame: Dict[str, Any]) -> bool:
+    """Whether one 3D per-frame record is flagged blocked by the Blender evaluator."""
+    return bool(frame.get("blocked"))
+
+
+def iter_3d_samples(
+    collected: Dict[str, Any], wanted_metrics: Optional[Sequence[str]] = None,
+    exclude_blocked: bool = True,
+) -> Iterator[Sample]:
+    """Stream collected_3d_metrics.json as tidy samples on the sentinel view.
+
+    Frames the operator could not score are present in the file as explicit nulls
+    (a degenerate mesh, a zero-volume occupancy, a frame whose L_body was
+    unmeasurable). They are emitted as NaN rather than dropped, so that a run's
+    frame count stays honest and _finite() filters them exactly like a missing 2D
+    frame.
+    """
+    n_runs = 0
+    n_blocked = 0
+    no_stamp = []
+    for run_key, run in collected.items():
+        n_views = parse_n_views(run_key)
+        if n_views is None:
+            warn(f"{run_key}: 3D run key does not start with 'k<N>__'; skipping run.")
+            continue
+        if not isinstance(run, dict):
+            warn(f"{run_key}: 3D payload is not an object; skipping run.")
+            continue
+        n_runs += 1
+
+        # The batch operator SCORES every frame and flags the blocked ones, so the filtering
+        # happens here, per row, exactly as it does for the 2D metrics -- one policy, one flag,
+        # applied at one place. The run-level record is read only for the accounting and to
+        # notice a run whose provenance is unknown.
+        marker = run.get("blocked_frames")
+        if isinstance(marker, dict):
+            n_blocked += len(marker.get("records") or [])
+            if not marker.get("stamp_present", True):
+                no_stamp.append(run_key)
+        elif marker is None:
+            no_stamp.append(run_key)
+
+        for metric, source in THREE_D_SCALARS.items():
+            if wanted_metrics is not None and metric not in wanted_metrics:
+                continue
+            metric_name = sys.intern(metric)
+            for frame in _3d_frames(run, source.block, run_key):
+                if exclude_blocked and _3d_blocked(frame):
+                    continue
+                if source.divide_by is None:
+                    value = _to_float(frame.get(source.field))
+                else:
+                    value = _ratio(frame.get(source.field), frame.get(source.divide_by))
+                yield Sample(metric_name, None, VIEW_3D, n_views, value)
+
+        for metric, (block, frame_field) in THREE_D_KEYPOINTS.items():
+            if wanted_metrics is not None and metric not in wanted_metrics:
+                continue
+            metric_name = sys.intern(metric)
+            for frame in _3d_frames(run, block, run_key):
+                if exclude_blocked and _3d_blocked(frame):
+                    continue
+                per_keypoint = frame.get(frame_field)
+                if not isinstance(per_keypoint, dict):
+                    continue
+                for keypoint, value in per_keypoint.items():
+                    yield Sample(
+                        metric_name, sys.intern(str(keypoint)), VIEW_3D, n_views,
+                        _to_float(value),
+                    )
+        
+        for metric, (block_path, field_path) in THREE_D_NESTED_SCALARS.items():
+            if wanted_metrics is not None and metric not in wanted_metrics:
+                continue
+            metric_name = sys.intern(metric)
+
+            payload = run
+            for key in block_path:
+                payload = payload.get(key) if isinstance(payload, dict) else None
+            if not isinstance(payload, dict) or not isinstance(payload.get("frames"), list):
+                # MPJPE's keypoint/joint block may legitimately be absent (for
+                # example when the configured keypoint list is empty), so this
+                # is a quiet absence rather than a malformed-file warning.
+                continue
+
+            for frame in payload["frames"]:
+                if not isinstance(frame, dict):
+                    continue
+                if exclude_blocked and _3d_blocked(frame):
+                    continue
+                value = _nested_value(frame, field_path)
+                yield Sample(metric_name, None, VIEW_3D, n_views, _to_float(value))
+
+    if collected:
+        log(f"Read {n_runs} 3D run(s).")
+        if n_blocked:
+            log(f"{n_blocked} blocked frame(s) recorded across the 3D runs"
+                f"{' and excluded' if exclude_blocked else ', all included'}.")
+        if no_stamp:
+            warn(
+                f"{len(no_stamp)} 3D run(s) carry no blocked-frame record, so it is not known "
+                f"whether any of their frames were blocked: {', '.join(no_stamp[:3])}"
+                f"{' ...' if len(no_stamp) > 3 else ''}. Their per-frame rows are used as-is, "
+                f"which may pool unfiltered 3D values beside filtered 2D ones."
+            )
 
 
 def build_cell_table(samples: Iterator[Sample]) -> CellTable:
@@ -559,9 +1034,49 @@ def summarize(cells: CellTable) -> Dict[str, Any]:
     return summary
 
 
+def coverage_report(availability: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+    """Frame accounting and the coverage ratio rho, overall and per run.
+
+    rho = n_used / n_available. Blocked frames stay in the DENOMINATOR: they were requested
+    and the pipeline produced a row for them, so rho keeps meaning 'of everything this run set
+    out to measure, how much reached the analysis'. Were they dropped from both terms instead,
+    every run would report rho = 1.0 and a run that had to interpolate half its frames would be
+    indistinguishable from one that fitted all of them -- which is exactly the difference
+    between view combinations that this sweep exists to measure.
+    """
+    if not availability:
+        return {}
+    available = sum(r["n_available"] for r in availability.values())
+    used = sum(r["n_used"] for r in availability.values())
+    blocked = sum(r["n_blocked_excluded"] for r in availability.values())
+    unfilterable = sorted(k for k, r in availability.items() if not r["blocked_filterable"])
+    return {
+        "definition": "coverage_rho = n_used / n_available; blocked frames stay in n_available",
+        "n_available": available,
+        "n_used": used,
+        "n_blocked_excluded": blocked,
+        "coverage_rho": (used / available) if available else None,
+        "n_runs_without_blocked_field": len(unfilterable),
+        "runs_without_blocked_field": unfilterable,
+        "per_run": {
+            key: {**row, "coverage_rho": (row["n_used"] / row["n_available"])
+                  if row["n_available"] else None}
+            for key, row in sorted(availability.items())
+        },
+    }
+
+
 def build_report(summary: Dict[str, Any], cells: CellTable, source: Path) -> Dict[str, Any]:
     """Summary plus the provenance needed to read it without the source file."""
-    reference_table = cells[(next(iter(summary)), None)]
+    # meta['views'] must describe the sweep's cameras, so the reference table is
+    # taken from a metric that actually has a view axis. Falling back to the first
+    # metric keeps a 3D-only run working: its view set is then [VIEW_3D], which is
+    # the honest answer rather than a fabricated camera list.
+    reference_metric = next(
+        (m for m in summary if spec_for(m).view_axis), next(iter(summary))
+    )
+    reference_table = cells[(reference_metric, None)]
+    view_less = sorted(m for m in summary if not spec_for(m).view_axis)
     return {
         "meta": {
             "source": str(source),
@@ -572,6 +1087,20 @@ def build_report(summary: Dict[str, Any], cells: CellTable, source: Path) -> Dic
             "groupings": [GROUPING_OVERALL, GROUPING_PER_VIEW, GROUPING_PER_VIEW_PER_N, GROUPING_PER_N],
             "nan_policy": (
                 "missing/undefined frames are excluded from every statistic, never zero-filled"
+            ),
+            "blocked_frame_policy": (
+                "excluded: frames the reconstruction did not obtain by fitting the optimizer "
+                "to that frame are dropped from every statistic, but still count as available "
+                "in coverage_rho"
+                if EXCLUDE_BLOCKED[0] else
+                "included: every frame is aggregated, blocked or not"
+            ),
+            "view_less_metrics": view_less,
+            "view_less_note": (
+                f"these are measured on the fused 3D reconstruction and have one value per "
+                f"(run, frame), not per view; they carry the sentinel view '{VIEW_3D}' and their "
+                f"'{GROUPING_PER_VIEW}' / '{GROUPING_PER_VIEW_PER_N}' groupings are that single "
+                f"sentinel, not a comparison across cameras"
             ),
         },
         "metrics": summary,
@@ -802,6 +1331,14 @@ class Style:
     dpi: int
     fmt: str
     max_points: int
+    # How the raw distribution beside each summary box is rendered: one point
+    # per frame value, or one box per colour group.
+    distribution_style: str = DISTRIBUTION_POINTS
+    # Draw values outside their group's 1.5 x IQR fence? Affects the figures
+    # only; metrics_summary.json / .csv always cover every finite value.
+    drop_fliers: bool = False
+    value_labels: bool = True
+    captions: bool = True
     _palettes: Dict[str, List[RGB]] = field(default_factory=dict)
 
     def apply(self) -> None:
@@ -898,6 +1435,15 @@ def _figure_width(n_positions: int, per_position: float, minimum: float) -> floa
     return max(minimum, per_position * n_positions)
 
 
+def _label_headroom(ax: Axes, style: Style, fraction: float = 0.14, below: float = 0.0) -> None:
+    """Room around the drawn data for the mean/median labels and the title."""
+    if not style.value_labels:
+        return
+    low, high = ax.get_ylim()
+    span = high - low
+    ax.set_ylim(low - below * span, high + fraction * span)
+
+
 CAPTION_FONT_SIZE = 6.5
 CAPTION_CHARS_PER_INCH = 21  # at CAPTION_FONT_SIZE, close enough for wrapping
 
@@ -910,6 +1456,10 @@ def _save(fig: Figure, ax: Axes, out_path: Path, title: str, caption: str, style
     to that extent instead of relying on matplotlib's word wrapping.
     """
     ax.set_title(title)
+    if not style.captions:
+        fig.savefig(out_path, format=style.fmt)
+        plt.close(fig)
+        return
     fig.canvas.draw()
     extent = fig.get_tightbbox(fig.canvas.get_renderer())
     wrapped = "\n".join(
@@ -928,6 +1478,75 @@ def _save(fig: Figure, ax: Axes, out_path: Path, title: str, caption: str, style
     )
     fig.savefig(out_path, format=style.fmt)
     plt.close(fig)
+
+
+def iqr_fence(values: Sequence[float]) -> Tuple[float, float]:
+    """
+    Tukey's 1.5 x IQR fence, the same rule matplotlib's whiskers use. Returns an
+    infinite fence for fewer than two values, where no fence is defined.
+    """
+    if len(values) < 2:
+        return (float("-inf"), float("inf"))
+    q1, _q2, q3 = quantiles(values, n=4, method="inclusive")
+    reach = 1.5 * (q3 - q1)
+    return (q1 - reach, q3 + reach)
+
+
+def _for_display(values: Sequence[float], style: Style) -> List[float]:
+    """
+    The values a figure draws for one group: all of them, or only those inside
+    the group's own fence when --drop-fliers is set. Statistics are never taken
+    from this, so trimming the figure cannot silently trim the reported numbers.
+    """
+    if not style.drop_fliers:
+        return list(values)
+    low, high = iqr_fence(values)
+    return [v for v in values if low <= v <= high]
+
+
+def _whisker_top(values: Sequence[float]) -> float:
+    """Upper whisker cap: the largest value inside the fence, as drawn."""
+    if not values:
+        return float("nan")
+    low, high = iqr_fence(values)
+    inside = [v for v in values if low <= v <= high]
+    return max(inside) if inside else max(values)
+
+
+def _format_value(value: float) -> str:
+    """Compact fixed-significance number for an on-figure label."""
+    return "n/a" if value is None or math.isnan(value) else f"{value:.3g}"
+
+
+def _annotate_stats(
+    ax: Axes,
+    position: float,
+    anchor: float,
+    stats: Dict[str, float],
+    style: Style,
+    fontsize: float = 6.0,
+    rotation: float = 0.0,
+) -> None:
+    """
+    Print the group's mean and median above its box. The numbers come from the
+    summary, i.e. from every finite value, so they agree with metrics_summary.*
+    even when --drop-fliers has narrowed what the figure shows.
+    """
+    if not style.value_labels or math.isnan(anchor):
+        return
+    separator = "  " if rotation else "\n"
+    ax.annotate(
+        f"mean {_format_value(stats['mean'])}{separator}med {_format_value(stats['median'])}",
+        (position, anchor),
+        textcoords="offset points",
+        xytext=(0, 4),
+        ha="center",
+        va="bottom",
+        fontsize=fontsize,
+        rotation=rotation,
+        color="#222222",
+        zorder=5,
+    )
 
 
 def _thin(values: Sequence[float], limit: int, rng: random.Random) -> List[float]:
@@ -994,9 +1613,10 @@ def _draw_strip(
     sub_width = width / n_groups
     for index, ((_key, values), color) in enumerate(zip(groups, colors)):
         total += len(values)
-        if not values:
+        drawable = _for_display(values, style)
+        if not drawable:
             continue
-        shown = _thin(values, style.max_points, rng)
+        shown = _thin(drawable, style.max_points, rng)
         drawn += len(shown)
         centre = position + offset + (index - (n_groups - 1) / 2.0) * sub_width
         jitter = [centre + rng.uniform(-0.38, 0.38) * sub_width for _ in shown]
@@ -1005,10 +1625,65 @@ def _draw_strip(
     return drawn, total
 
 
-def _distribution_legend(ax: Axes, title: str, labels: Sequence[str], colors: Sequence[RGB]) -> None:
-    """Colour key for the points, plus the box's median and mean symbols."""
+def _draw_group_boxes(
+    ax: Axes,
+    position: float,
+    groups: Sequence[Tuple[Any, List[float]]],
+    colors: Sequence[RGB],
+    style: Style,
+    offset: float = STRIP_OFFSET,
+    width: float = STRIP_WIDTH,
+) -> Tuple[int, int]:
+    """
+    One box per colour group, side by side in the band beside the summary box:
+    the --distribution-style=boxes counterpart of the point strip. Returns
+    (represented, total) values, equal because a box represents all of them.
+    """
+    total = 0
+    n_groups = max(len(groups), 1)
+    sub_width = width / n_groups
+    for index, ((_key, values), color) in enumerate(zip(groups, colors)):
+        total += len(values)
+        shown = _for_display(values, style)
+        if not shown:
+            continue
+        centre = position + offset + (index - (n_groups - 1) / 2.0) * sub_width
+        _draw_boxes(ax, [centre], [shown], color, width=sub_width * 0.68)
+    return total, total
+
+
+def _draw_distribution(
+    ax: Axes,
+    position: float,
+    groups: Sequence[Tuple[Any, List[float]]],
+    colors: Sequence[RGB],
+    rng: random.Random,
+    style: Style,
+    offset: float = STRIP_OFFSET,
+    width: float = STRIP_WIDTH,
+) -> Tuple[int, int]:
+    """Render the per-group distribution in whichever style was requested."""
+    if style.distribution_style == DISTRIBUTION_BOXES:
+        return _draw_group_boxes(ax, position, groups, colors, style, offset, width)
+    return _draw_strip(ax, position, groups, colors, rng, style, offset, width)
+
+
+def _distribution_legend(
+    ax: Axes, title: str, labels: Sequence[str], colors: Sequence[RGB], style: Style
+) -> None:
+    """Colour key for the distribution, plus the box's median and mean symbols."""
+    boxes = style.distribution_style == DISTRIBUTION_BOXES
     handles = [
-        Line2D([], [], marker="o", linestyle="none", markersize=3.5, color=color, label=label)
+        Line2D(
+            [], [],
+            marker="s" if boxes else "o",
+            linestyle="none",
+            markersize=4.0 if boxes else 3.5,
+            markerfacecolor=tint(color, 0.80) if boxes else color,
+            markeredgecolor=color,
+            color=color,
+            label=label,
+        )
         for label, color in zip(labels, colors)
     ]
     handles += [
@@ -1099,14 +1774,25 @@ def fig_line_vs_n_views(table, spec, block, style, rng) -> FigureResult:
     n_values = n_views_of(table)
     stats = block[GROUPING_PER_N]
 
+    means = [stats[str(k)]["mean"] for k in n_values]
+    medians = [stats[str(k)]["median"] for k in n_values]
+
     fig, ax = plt.subplots(figsize=(4.8, 3.5))
-    ax.plot(n_values, [stats[str(k)]["mean"] for k in n_values], marker="o",
-            color=style.primary, label="mean")
-    ax.plot(n_values, [stats[str(k)]["median"] for k in n_values], marker="s",
-            markerfacecolor="white", linestyle="--",
+    ax.plot(n_values, means, marker="o", color=style.primary, label="mean")
+    ax.plot(n_values, medians, marker="s", markerfacecolor="white", linestyle="--",
             color=_with_lightness(style.primary, 0.28), label="median")
+    if style.value_labels:
+        # Means above their marker, medians below, so the two never collide.
+        for series, offset, valign in ((means, 5, "bottom"), (medians, -6, "top")):
+            for k, value in zip(n_values, series):
+                ax.annotate(
+                    _format_value(value), (k, value), textcoords="offset points",
+                    xytext=(0, offset), ha="center", va=valign, fontsize=6.0,
+                    color="#222222",
+                )
     ax.set_xticks(n_values)
     _axis_cosmetics(ax, spec.label, "number of views in the reconstruction")
+    _label_headroom(ax, style, 0.10, below=0.08)
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
     return fig, ax, len(n_values), 0, 0
 
@@ -1121,14 +1807,17 @@ def fig_box_per_view(table, spec, block, style, rng) -> FigureResult:
     fig, ax = plt.subplots(figsize=(_figure_width(len(views), 1.30, 5.2), 3.8))
     drawn = total = 0
     for position, view in enumerate(views):
-        _draw_boxes(ax, [position], [pooled(table, view=view)], style.primary)
+        shown = _for_display(pooled(table, view=view), style)
+        _draw_boxes(ax, [position], [shown], style.primary)
         groups = [(k, _finite(table.get((view, k), []))) for k in n_values]
-        d, t = _draw_strip(ax, position, groups, colors, rng, style)
+        d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
+        _annotate_stats(ax, position, _whisker_top(shown), stats[view], style)
     ax.set_xticks(list(range(len(views))))
     ax.set_xticklabels([_view_label(v, stats[v]["n_samples"]) for v in views])
     _axis_cosmetics(ax, spec.label, "view")
-    _distribution_legend(ax, "#views", [str(k) for k in n_values], colors)
+    _distribution_legend(ax, "#views", [str(k) for k in n_values], colors, style)
+    _label_headroom(ax, style)
     return fig, ax, len(views), drawn, total
 
 
@@ -1142,23 +1831,38 @@ def fig_box_per_view_and_n_views(table, spec, block, style, rng) -> FigureResult
 
     width = _figure_width(len(views) * max(len(n_values), 1), 0.48, 5.6)
     fig, ax = plt.subplots(figsize=(width, max(3.8, min(width * 0.36, 5.4))))
+    # In box mode the cell box already is the group box, so the band beside it
+    # would only duplicate it: the cell boxes are then simply centred.
+    as_boxes = style.distribution_style == DISTRIBUTION_BOXES
     drawn = total = boxes = 0
     for view_index, view in enumerate(views):
         for k_index, (k, color) in enumerate(zip(n_values, colors)):
             values = _finite(table.get((view, k), []))
-            if not values:
+            shown = _for_display(values, style)
+            if not shown:
                 continue
             position = view_index - span / 2 + step * (k_index + 0.5)
-            _draw_boxes(ax, [position - step * 0.20], [values], color, width=step * 0.34)
-            d, t = _draw_strip(
-                ax, position, [(k, values)], [color], rng, style,
-                offset=step * 0.22, width=step * 0.34,
+            box_position = position if as_boxes else position - step * 0.20
+            _draw_boxes(ax, [box_position], [shown], color, width=step * 0.34)
+            if not as_boxes:
+                d, t = _draw_strip(
+                    ax, position, [(k, values)], [color], rng, style,
+                    offset=step * 0.22, width=step * 0.34,
+                )
+                drawn, total = drawn + d, total + t
+            else:
+                drawn, total = drawn + len(values), total + len(values)
+            boxes += 1
+            _annotate_stats(
+                ax, box_position, _whisker_top(shown),
+                block[GROUPING_PER_VIEW_PER_N][view][str(k)], style,
+                fontsize=5.0, rotation=90.0,
             )
-            drawn, total, boxes = drawn + d, total + t, boxes + 1
     ax.set_xticks(list(range(len(views))))
     ax.set_xticklabels([_view_label(v) for v in views])
     _axis_cosmetics(ax, spec.label, "view")
-    _distribution_legend(ax, "#views", [str(k) for k in n_values], colors)
+    _distribution_legend(ax, "#views", [str(k) for k in n_values], colors, style)
+    _label_headroom(ax, style, 0.20)
     return fig, ax, boxes, drawn, total
 
 
@@ -1172,14 +1876,17 @@ def fig_box_vs_n_views(table, spec, block, style, rng) -> FigureResult:
     fig, ax = plt.subplots(figsize=(_figure_width(len(n_values), 1.2, 4.6), 3.8))
     drawn = total = 0
     for position, k in enumerate(n_values):
-        _draw_boxes(ax, [position], [pooled(table, n_views=k)], style.primary)
+        shown = _for_display(pooled(table, n_views=k), style)
+        _draw_boxes(ax, [position], [shown], style.primary)
         groups = [(view, _finite(table.get((view, k), []))) for view in views]
-        d, t = _draw_strip(ax, position, groups, colors, rng, style)
+        d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
+        _annotate_stats(ax, position, _whisker_top(shown), stats[str(k)], style)
     ax.set_xticks(list(range(len(n_values))))
     ax.set_xticklabels([f"{k}\nn = {stats[str(k)]['n_samples']}" for k in n_values])
     _axis_cosmetics(ax, spec.label, "number of views in the reconstruction")
-    _distribution_legend(ax, "view", list(views), colors)
+    _distribution_legend(ax, "view", list(views), colors, style)
+    _label_headroom(ax, style)
     return fig, ax, len(n_values), drawn, total
 
 
@@ -1197,14 +1904,17 @@ def _fig_box_overall(table, spec, block, style, rng, colour_by: str) -> FigureRe
         legend_title = "view"
     colors = style.palette(colour_by, len(keys))
 
-    fig, ax = plt.subplots(figsize=(3.4, 3.6))
-    _draw_boxes(ax, [0.0], [pooled(table)], style.primary, width=0.26)
-    drawn, total = _draw_strip(ax, 0.0, groups, colors, rng, style)
+    fig, ax = plt.subplots(figsize=(3.6, 3.6))
+    shown = _for_display(pooled(table), style)
+    _draw_boxes(ax, [0.0], [shown], style.primary, width=0.26)
+    drawn, total = _draw_distribution(ax, 0.0, groups, colors, rng, style)
+    _annotate_stats(ax, 0.0, _whisker_top(shown), block[GROUPING_OVERALL], style)
     ax.set_xticks([0.14])
     ax.set_xticklabels([f"all runs pooled\nn = {block[GROUPING_OVERALL]['n_samples']}"])
     ax.set_xlim(-0.28, 0.58)
     _axis_cosmetics(ax, spec.label)
-    _distribution_legend(ax, legend_title, labels, colors)
+    _distribution_legend(ax, legend_title, labels, colors, style)
+    _label_headroom(ax, style)
     return fig, ax, 1, drawn, total
 
 
@@ -1221,11 +1931,21 @@ def fig_box_overall_by_view(table, spec, block, style, rng) -> FigureResult:
 # --------------------------------------------------------------------------
 
 
+# Wording and file-name tokens of the two distribution styles, so that a figure
+# is never described as showing points when it shows boxes.
+DISTRIBUTION_TOKENS: Dict[str, Dict[str, str]] = {
+    DISTRIBUTION_POINTS: {"file": "all_points", "noun": "points"},
+    DISTRIBUTION_BOXES: {"file": "per_group_boxes", "noun": "boxes"},
+}
+
+
 @dataclass(frozen=True)
 class FigureKind:
     """
-    One figure recipe. `filename_kind` is the self-describing file-name stem;
-    `what` becomes the caption's first sentence, stating exactly what is pooled.
+    One figure recipe. `filename_kind` is the self-describing file-name stem and
+    may carry the {file}/{noun} distribution tokens; `what` becomes the caption's
+    first sentence, stating exactly what is pooled. `boxes_overrides` replaces
+    any of those texts when --distribution-style=boxes changes what is drawn.
     """
 
     filename_kind: str
@@ -1235,6 +1955,29 @@ class FigureKind:
     plot_kind: str
     grouping: str
     point_colouring: str
+    boxes_overrides: Optional[Dict[str, str]] = None
+    # Only these react to --distribution-style and --drop-fliers; the mean/median
+    # summaries do not, and must not claim in their caption that they do.
+    draws_distribution: bool = False
+    # True when the figure puts views on the x axis or splits by view. Skipped for
+    # a metric with MetricSpec.view_axis=False, where it would draw one column
+    # labelled with the sentinel view and imply a comparison that does not exist.
+    # Figures that only vary over #views are kept: that is the sweep's question,
+    # and the 3D metrics answer it.
+    requires_view_axis: bool = False
+
+    def resolve(self, style: Style) -> Dict[str, str]:
+        """The file-name stem and index/caption texts for the active style."""
+        tokens = DISTRIBUTION_TOKENS[style.distribution_style]
+        fields = {
+            "filename_kind": self.filename_kind,
+            "what": self.what,
+            "plot_kind": self.plot_kind,
+            "point_colouring": self.point_colouring,
+        }
+        if style.distribution_style == DISTRIBUTION_BOXES and self.boxes_overrides:
+            fields.update(self.boxes_overrides)
+        return {key: value.format(**tokens) for key, value in fields.items()}
 
 
 FIGURE_KINDS: Tuple[FigureKind, ...] = (
@@ -1247,6 +1990,7 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
         "mean/median summary",
         GROUPING_PER_VIEW,
         "not applicable",
+        requires_view_axis=True,
     ),
     FigureKind(
         "bar_mean_and_median_per_view_grouped_by_number_of_views",
@@ -1257,6 +2001,7 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
         "mean/median summary",
         GROUPING_PER_VIEW_PER_N,
         "bars coloured by #views",
+        requires_view_axis=True,
     ),
     FigureKind(
         "line_mean_and_median_versus_number_of_views",
@@ -1268,7 +2013,7 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
         "not applicable",
     ),
     FigureKind(
-        "box_iqr_with_all_points_per_view__points_coloured_by_number_of_views",
+        "box_iqr_with_{file}_per_view__{noun}_coloured_by_number_of_views",
         fig_box_per_view,
         "distribution per view",
         "The box spans the interquartile range with the median as a line, whiskers at 1.5 x IQR "
@@ -1276,10 +2021,18 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
         "sub-band per number of views.",
         "box plot (IQR) with all raw points",
         GROUPING_PER_VIEW,
-        "points coloured by #views",
+        "{noun} coloured by #views",
+        draws_distribution=True,
+        requires_view_axis=True,
+        boxes_overrides={
+            "what": "The wide box spans the interquartile range of the view with the median as a "
+                    "line, whiskers at 1.5 x IQR and the mean as a diamond; beside it one narrow "
+                    "box per number of views splits the same values by combination size.",
+            "plot_kind": "box plot (IQR) with a box per group",
+        },
     ),
     FigureKind(
-        "box_iqr_with_all_points_per_view_and_number_of_views__points_coloured_by_number_of_views",
+        "box_iqr_with_{file}_per_view_and_number_of_views__{noun}_coloured_by_number_of_views",
         fig_box_per_view_and_n_views,
         "distribution per view and #views",
         "One box per (view, number of views) cell, with that cell's raw frame values drawn beside "
@@ -1287,35 +2040,62 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
         "box plot (IQR) with all raw points",
         GROUPING_PER_VIEW_PER_N,
         "boxes and points coloured by #views",
+        draws_distribution=True,
+        requires_view_axis=True,
+        boxes_overrides={
+            "what": "One box per (view, number of views) cell, coloured by combination size. This "
+                    "grouping is already one box per group, so no second band is drawn beside it.",
+            "plot_kind": "box plot (IQR) with a box per group",
+            "point_colouring": "boxes coloured by #views",
+        },
     ),
     FigureKind(
-        "box_iqr_with_all_points_versus_number_of_views__points_coloured_by_view",
+        "box_iqr_with_{file}_versus_number_of_views__{noun}_coloured_by_view",
         fig_box_vs_n_views,
         "distribution versus #views",
         "One box per combination size, pooling all of its views, with every raw frame value drawn "
         "beside it in one sub-band per view.",
         "box plot (IQR) with all raw points",
         GROUPING_PER_N,
-        "points coloured by view",
+        "{noun} coloured by view",
+        draws_distribution=True,
+        boxes_overrides={
+            "what": "One wide box per combination size, pooling all of its views, with one narrow "
+                    "box per view beside it splitting the same values by view.",
+            "plot_kind": "box plot (IQR) with a box per group",
+        },
     ),
     FigureKind(
-        "box_iqr_with_all_points_all_runs_pooled__points_coloured_by_number_of_views",
+        "box_iqr_with_{file}_all_runs_pooled__{noun}_coloured_by_number_of_views",
         fig_box_overall_by_n_views,
         "distribution over all runs",
         "A single box over every run, view and frame; the raw values beside it are grouped and "
         "coloured by the number of views of the run they come from.",
         "box plot (IQR) with all raw points",
         GROUPING_OVERALL,
-        "points coloured by #views",
+        "{noun} coloured by #views",
+        draws_distribution=True,
+        boxes_overrides={
+            "what": "A single box over every run, view and frame, with one box per combination "
+                    "size beside it splitting the same values.",
+            "plot_kind": "box plot (IQR) with a box per group",
+        },
     ),
     FigureKind(
-        "box_iqr_with_all_points_all_runs_pooled__points_coloured_by_view",
+        "box_iqr_with_{file}_all_runs_pooled__{noun}_coloured_by_view",
         fig_box_overall_by_view,
         "distribution over all runs",
         "The same pooled box, with the raw values grouped and coloured by the view they come from.",
         "box plot (IQR) with all raw points",
         GROUPING_OVERALL,
-        "points coloured by view",
+        "{noun} coloured by view",
+        draws_distribution=True,
+        requires_view_axis=True,
+        boxes_overrides={
+            "what": "The same pooled box, with one box per view beside it splitting the same "
+                    "values by view.",
+            "plot_kind": "box plot (IQR) with a box per group",
+        },
     ),
 )
 
@@ -1346,7 +2126,9 @@ def _plot_path(plots_dir: Path, measure_stem: str, kind: str, style: Style) -> P
     return plots_dir / name
 
 
-def _caption(spec: MetricSpec, what: str, drawn: int, total: int) -> str:
+def _caption(
+    spec: MetricSpec, what: str, drawn: int, total: int, style: Style, draws_distribution: bool
+) -> str:
     """Figure caption: what is pooled, what the metric is, how to read it."""
     parts = [
         what,
@@ -1354,6 +2136,17 @@ def _caption(spec: MetricSpec, what: str, drawn: int, total: int) -> str:
         f"Orientation: {spec.orientation}. Missing or undefined frames (NaN, null) are excluded, "
         "not zero-filled.",
     ]
+    if not spec.view_axis:
+        parts.append(
+            "Measured on the fused 3D reconstruction, so this quantity has one value per (run, "
+            f"frame) and no per-view breakdown; where a view appears it is the placeholder "
+            f"'{VIEW_3D}', not a camera."
+        )
+    if style.drop_fliers and draws_distribution:
+        parts.append(
+            "Values outside their group's 1.5 x IQR fence are omitted from the figure; the "
+            "mean and median labels, and metrics_summary.json / .csv, still cover every value."
+        )
     if spec.combination_invariant:
         parts.append(
             "Note: per (frame, view) this quantity does not depend on the view combination, so "
@@ -1384,26 +2177,37 @@ def plot_measure(
 
     rows: List[Dict[str, Any]] = []
     for kind in FIGURE_KINDS:
+        if kind.requires_view_axis and not spec.view_axis:
+            # Drawing it would produce a single column labelled with the sentinel
+            # view and invite the reader to compare cameras that were never
+            # separable for this metric. Skipped silently: it is a property of the
+            # metric, not a fault, and warning once per measure per figure would
+            # bury the real warnings.
+            continue
         # One generator per figure: identical thinning for identical inputs,
         # independent of the order the figures happen to be rendered in.
         rng = random.Random(STRIP_RNG_SEED)
-        path = _plot_path(plots_dir, stem, kind.filename_kind, style)
+        resolved = kind.resolve(style)
+        path = _plot_path(plots_dir, stem, resolved["filename_kind"], style)
         title = f"{subject}: {kind.title}"
         fig, ax, n_groups, drawn, total = kind.builder(table, spec, block, style, rng)
-        _save(fig, ax, path, title, _caption(spec, kind.what, drawn, total), style)
+        caption = _caption(
+            spec, resolved["what"], drawn, total, style, kind.draws_distribution
+        )
+        _save(fig, ax, path, title, caption, style)
         rows.append(
             {
                 "filename": path.name,
                 "metric": metric,
                 "keypoint": keypoint or "",
-                "plot_kind": kind.plot_kind,
+                "plot_kind": resolved["plot_kind"],
                 "grouping": kind.grouping,
-                "point_colouring": kind.point_colouring,
+                "point_colouring": resolved["point_colouring"],
                 "n_groups": n_groups,
                 "n_points_drawn": drawn,
                 "n_points_total": total,
                 "orientation": spec.orientation,
-                "description": f"{title}. {kind.what}",
+                "description": f"{title}. {resolved['what']}",
             }
         )
     return rows
@@ -1449,6 +2253,34 @@ def load_collected_metrics(path: Path) -> Dict[str, Any]:
     return collected
 
 
+def load_collected_3d_metrics(
+    path: Optional[Path], explicit: bool
+) -> Tuple[Dict[str, Any], Optional[Path]]:
+    """Load collected_3d_metrics.json, or ({}, None) when there is none to load.
+
+    A missing file is fatal only when the user named it: the 3D metrics come from a
+    separate Blender pass that a sweep may simply not have run yet, so the default
+    location is probed and the analysis proceeds 2D-only if it is not there.
+    """
+    if path is None:
+        return {}, None
+    resolved = path.expanduser()
+    if not resolved.is_file():
+        if explicit:
+            raise SystemExit(f"{resolved}: 3D metrics file not found.")
+        log(f"3D metrics       : none at {resolved} (2D only)")
+        return {}, None
+    with resolved.open() as fp:
+        collected = json.load(fp)
+    if not isinstance(collected, dict):
+        raise SystemExit(f"{resolved}: expected a JSON object mapping run key -> 3D metrics.")
+    if not collected:
+        warn(f"{resolved}: no 3D runs in the file; ignoring it.")
+        return {}, None
+    log(f"3D metrics        : {resolved}")
+    return collected, resolved
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1469,6 +2301,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUT_DIR,
         help=f"Directory for the summary and the plots. Default: {DEFAULT_OUT_DIR}",
+    )
+    parser.add_argument(
+        "--collected-3d-metrics",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the batch operator's collected_3d_metrics.json. Default: "
+            f"'{DEFAULT_3D_NAME}' resolved one level above the collected metrics file's "
+            "directory, which is where 'Batch 3D Metrics from PTS2 Dir' writes it; silently "
+            "skipped when absent. Its runs are matched to the 2D ones by run key and its "
+            "metrics ("
+            + ", ".join(list(THREE_D_SCALARS) + list(THREE_D_KEYPOINTS) + list(THREE_D_NESTED_SCALARS))
+            + ") are summarised and plotted alongside them."
+        ),
+    )
+    parser.add_argument(
+        "--no-3d-metrics",
+        action="store_true",
+        help="Ignore collected_3d_metrics.json even if it is present.",
+    )
+    parser.add_argument(
+        "--exclude-blocked",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Exclude blocked frames -- those the reconstruction emitted but did not obtain by "
+            "fitting the optimizer to that frame, currently poses gap-filled by interpolation "
+            "across a detection gap. On by default: scoring them measures the interpolation, "
+            "and because the runs with the most gap-filled frames are the view combinations "
+            "whose detections failed most, including them flatters exactly the weakest "
+            "combinations. Excluded frames are still counted as available in the coverage "
+            "ratio rho. Use --no-exclude-blocked to score every frame."
+        ),
     )
     parser.add_argument(
         "--metrics",
@@ -1514,6 +2380,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Figure file format. Default: png.",
     )
     parser.add_argument(
+        "--distribution-style",
+        default=DISTRIBUTION_POINTS,
+        choices=[DISTRIBUTION_POINTS, DISTRIBUTION_BOXES],
+        help=(
+            "How the distribution beside each summary box is drawn: 'points' plots every raw "
+            f"frame value, 'boxes' replaces them with one box per colour group, giving several "
+            f"boxes side by side. Default: {DISTRIBUTION_POINTS}."
+        ),
+    )
+    parser.add_argument(
+        "--drop-fliers",
+        action="store_true",
+        help=(
+            "Omit values outside their group's 1.5 x IQR fence from the figures, in both "
+            "distribution styles. The summary files and the mean/median labels are unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--no-value-labels",
+        action="store_true",
+        help="Do not print the mean and median next to each box and line marker.",
+    )
+    parser.add_argument(
+        "--no-captions",
+        action="store_true",
+        help=(
+            "Do not print the descriptive caption under each figure. Titles, axis labels and "
+            "plots_index.csv still describe every figure."
+        ),
+    )
+    parser.add_argument(
         "--max-points-per-group",
         type=int,
         default=1500,
@@ -1542,13 +2439,59 @@ def main(argv: Optional[List[str]] = None) -> None:
     log(f"Collected metrics : {collected_path}")
     log(f"Output directory  : {out_dir}")
 
+    EXCLUDE_BLOCKED[0] = bool(args.exclude_blocked)
+
     collected = load_collected_metrics(collected_path)
-    cells = build_cell_table(iter_samples(collected, args.metrics))
+
+    explicit_3d = args.collected_3d_metrics is not None
+    if args.no_3d_metrics:
+        if explicit_3d:
+            raise SystemExit("--collected-3d-metrics and --no-3d-metrics are contradictory.")
+        path_3d = None
+    elif explicit_3d:
+        path_3d = args.collected_3d_metrics
+    else:
+        path_3d = collected_path.parent.parent / DEFAULT_3D_NAME
+    collected_3d, resolved_3d = load_collected_3d_metrics(path_3d, explicit_3d)
+
+    if collected_3d:
+        only_2d = sorted(set(collected) - set(collected_3d))
+        only_3d = sorted(set(collected_3d) - set(collected))
+        # Not fatal in either direction: a sweep may have been re-run partially, and
+        # the groupings pool per metric, so a run missing on one side simply does not
+        # contribute there. It has to be visible, though, or a metric silently
+        # summarising a different subset of runs than its neighbour looks comparable.
+        if only_2d:
+            warn(f"{len(only_2d)} run(s) have 2D metrics but no 3D ones, e.g. {only_2d[0]}")
+        if only_3d:
+            warn(f"{len(only_3d)} run(s) have 3D metrics but no 2D ones, e.g. {only_3d[0]}")
+
+    # Filled by the sample iterators as a side channel: rho needs the frames that were
+    # EXCLUDED as well as the ones that were kept, and those never reach the cell table.
+    availability: Dict[str, Dict[str, int]] = {}
+
+    # One table over both sources: same Sample shape, same run keys, so every
+    # grouping, summary and figure downstream treats them identically.
+    cells = build_cell_table(
+        itertools.chain(
+            iter_samples(collected, args.metrics,
+                         exclude_blocked=args.exclude_blocked,
+                         availability=availability),
+            # No availability side channel: the 3D runs share the 2D run keys, so they would
+            # collide in one map, and rho is a statement about a run's per-frame ARRAYS. The
+            # 3D files carry their own coverage block, computed at the source in Blender.
+            iter_3d_samples(collected_3d, args.metrics,
+                            exclude_blocked=args.exclude_blocked),
+        )
+    )
     if not cells:
         raise SystemExit("No usable per-view metrics found; nothing to summarize.")
 
     summary = summarize(cells)
     report = build_report(summary, cells, collected_path)
+    if resolved_3d is not None:
+        report["meta"]["source_3d"] = str(resolved_3d)
+    report["meta"]["frame_availability"] = coverage_report(availability)
     log("Metrics           : " + ", ".join(summary))
     write_summary(report, out_dir)
 
@@ -1562,6 +2505,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         dpi=args.dpi,
         fmt=args.plot_format,
         max_points=args.max_points_per_group,
+        distribution_style=args.distribution_style,
+        drop_fliers=args.drop_fliers,
+        value_labels=not args.no_value_labels,
+        captions=not args.no_captions,
     )
     style.apply()
     log(f"Figure font       : {style.font_family or plt.rcParams['font.family']}")

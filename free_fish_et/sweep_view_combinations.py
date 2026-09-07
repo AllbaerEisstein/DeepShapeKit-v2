@@ -96,7 +96,34 @@ def load_base_config(path: Path) -> Dict[str, Any]:
             + ", ".join(sorted(duplicates))
         )
 
+    validate_gt_config(config, path)
+
     return config
+
+
+def validate_gt_config(config: Dict[str, Any], config_path: Path) -> None:
+    """
+    Mirror DSKv2_demo.PipelineGUI.gather_config's reconstruct_from_gt check here too, so a
+    sweep that would spawn dozens of combinations fails once, up front, instead of once per
+    spawned subprocess after each has already paid for the interpreter start-up and imports.
+
+    reconstruct_from_gt/ground_truth_dataset are ordinary keys in the base config JSON:
+    build_combo_config deep-copies the whole base dict and only overwrites videos,
+    view_weights and final_output_folder, so both fields (and therefore GT-scored or
+    GT-driven sweeps) pass through to every combination unchanged with no sweep-specific
+    wiring required.
+    """
+    if not config.get("reconstruct_from_gt"):
+        return
+    gt_dir = config.get("ground_truth_dataset")
+    if not gt_dir:
+        raise SystemExit(
+            f"{config_path}: reconstruct_from_gt is true but ground_truth_dataset is not set."
+        )
+    if not (Path(gt_dir).expanduser() / "index.json").is_file():
+        raise SystemExit(
+            f"{config_path}: ground_truth_dataset '{gt_dir}' does not contain an index.json."
+        )
 
 
 def parse_view_weights(raw: Any, n_views: int, config_path: Path) -> List[str]:
@@ -191,6 +218,26 @@ def combo_run_records(
     return records
 
 
+def pts2_dataset_name(base: Dict[str, Any]) -> str:
+    """
+    The `{dataset_name}` component of the pose_time_series filename, exactly as
+    `_save_pose_time_series_json` derives it: `os.path.basename(os.path.normpath(dataset_dir))`
+    of whatever `dataset_dir` reconstruct() was actually called with.
+
+    That is NOT always `config.dataset_folder_name`. run_pipeline points `dataset_dir` at
+    `config.ground_truth_dataset` instead of `config.dataset_folder()` whenever
+    `reconstruct_from_gt` is set (Task C), so the basename of the *reconstruction* dataset
+    dir changes too. Using `dataset_folder_name` unconditionally here would make
+    collect_results report every GT-driven run's pose_time_series file as missing even
+    though it was written under the correct, different name.
+    """
+    if base.get("reconstruct_from_gt"):
+        gt_dir = base.get("ground_truth_dataset")
+        if gt_dir:
+            return os.path.basename(os.path.normpath(str(gt_dir)))
+    return base.get("dataset_folder_name", "dataset")
+
+
 def result_file_paths(run_dir: Path, instance_number: int, dataset_name: str) -> Dict[str, Path]:
     """
     Locations reconstruct() and _save_pose_time_series_json() write into
@@ -220,9 +267,16 @@ def collect_results(
     Safe to call standalone against an already-completed sweep (that's the
     --skip-existing + --collect-results use case): it only reads what each run
     already produced and never launches anything.
+
+    Metrics are copied whole: every key multiview_reconstruction_edit.py's reconstruct()
+    happens to have written into metrics_instance_{instance_number}.json -- including the
+    GT-referenced 2D metrics (keypoint_PCK_AUC_to_gt, contour_HD95_to_gt,
+    keypoint_detection_coverage, keypoint_L2_distance_to_gt, the hit/miss/hallucination/
+    correct-absence rates, gt_body_length_px) when ground_truth_dataset was set for the
+    sweep -- ends up in collected_metrics.json with no metric-name list to keep in sync here.
     """
     instance_number = base.get("instance_number", 0)
-    dataset_name = base.get("dataset_folder_name", "dataset")
+    dataset_name = pts2_dataset_name(base)
 
     metrics_dir = out_root / "metrics_collected"
     pts2_dir = out_root / "pts2_collected"
@@ -282,6 +336,24 @@ def collect_results(
 # --------------------------------------------------------------------------
 # Process orchestration
 # --------------------------------------------------------------------------
+
+
+def resolve_prep_steps(prep_steps: Sequence[str], gt_mode: bool) -> List[str]:
+    """
+    extract/masks/keypoints have nothing to act on when the sweep is driven from a fixed
+    ground-truth dataset (Task C): run_pipeline drops all three unconditionally whenever
+    reconstruct_from_gt is set, so honouring --prep here would only spend a full interpreter
+    start-up plus the reconstruct() import chain on a subprocess that immediately no-ops with
+    a warning buried in a per-run log file. Caught here instead, once, with one clear message.
+    """
+    if gt_mode and prep_steps:
+        log(
+            "Base config has reconstruct_from_gt=true; extract/masks/keypoints do not apply "
+            "to a fixed ground-truth dataset (there is nothing to detect), so the requested "
+            "--prep steps (" + ", ".join(prep_steps) + ") will be skipped."
+        )
+        return []
+    return list(prep_steps)
 
 
 def build_command(
@@ -466,6 +538,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     prep_steps = [PREP_STEP_ALIASES[s] for s in args.prep]
     prep_steps = [s for s in CANONICAL_STEP_ORDER if s in set(prep_steps)]
+    gt_mode = bool(base.get("reconstruct_from_gt"))
+    prep_steps = resolve_prep_steps(prep_steps, gt_mode)
 
     log(f"Base config      : {base_path}")
     log(f"Views ({n_views})        : " + ", ".join(f"[{i}] {s}" for i, s in enumerate(stems)))
@@ -473,6 +547,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     log(f"Output root      : {out_root}")
     log(f"Prep steps       : {', '.join(prep_steps) if prep_steps else '(none)'}")
     log(f"Parallel jobs    : {args.jobs}")
+    if base.get("ground_truth_dataset"):
+        mode = "reconstruct_from_gt (fitter driven from GT)" if gt_mode else "score real detections against GT"
+        log(f"Ground truth     : {base['ground_truth_dataset']} ({mode})")
 
     # ---- Combination enumeration -----------------------------------------
     combos = [

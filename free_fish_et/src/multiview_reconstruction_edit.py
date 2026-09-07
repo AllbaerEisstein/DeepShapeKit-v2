@@ -1390,6 +1390,49 @@ def _clear_reconstruction_cache(cache_path: str) -> None:
         print(f"Warning: failed to remove reconstruction cache '{cache_path}': {exc}")
 
 
+# --------------------------------------------------------------------------
+# Blocked frames
+# --------------------------------------------------------------------------
+#
+# A "blocked" frame is one that WAS emitted -- it has a pose and a full row in
+# every per-frame metric array -- but whose pose was not produced by fitting the
+# optimizer to observations of that frame. Downstream consumers must be able to
+# leave such frames out of an accuracy aggregate without having to re-derive
+# which ones they are.
+#
+# The record is deliberately self-describing and carries BOTH identifiers:
+#
+#   frame_number                          the real frame index in the source video
+#   frame_index_in_this_reconstruction_run position in this run's per-frame arrays
+#   reason_blocked                        why, from BLOCK_REASON_* below
+#
+# Both identifiers are needed because neither alone is usable everywhere. The
+# per-view metric arrays in metrics_instance_N.json are positional and carry no
+# frame numbers, so a consumer of those needs the index; a consumer working in
+# frame-number space (the Blender add-on, which scores an animation by frame)
+# needs the number. Recording both here means neither side has to reconstruct
+# the mapping, which is not generally possible after the fact: the arrays are
+# dense over PROCESSED frames, and a frame dropped for an unavailable sample
+# leaves no trace in them at all.
+#
+# The list is written to the metrics JSON *and* to the pose_time_series/2 meta
+# block. They are the same list: _emit_frame appends to pose_time_series_frames
+# and to every metric array in the same call, so position i means the same frame
+# in both files, and shipping it in both means neither consumer needs the other
+# file to interpret its own.
+
+BLOCK_REASON_INTERPOLATED = "interpolated_pose_gap_fill"
+
+
+def _blocked_frame_record(frame_number: int, run_index: int, reason: str) -> dict:
+    """One entry of the blocked_frames list. See the block comment above."""
+    return {
+        "frame_number": int(frame_number),
+        "frame_index_in_this_reconstruction_run": int(run_index),
+        "reason_blocked": str(reason),
+    }
+
+
 def _save_pose_time_series_json(
     outdir: str,
     dataset_dir: str,
@@ -1398,6 +1441,7 @@ def _save_pose_time_series_json(
     instance_number: int,
     frame_payloads: list[dict],
     dataset_meta: dict,
+    blocked_frames: Optional[list[dict]] = None,
 ) -> None:
     if not frame_payloads:
         return
@@ -1442,6 +1486,8 @@ def _save_pose_time_series_json(
         "frame_start": int(frame_start),
         "frame_end": int(frame_end),
         "frame_indices": processed_frames,
+        # Same list as the metrics JSON's; position i here is position i there.
+        "blocked_frames": [dict(entry) for entry in (blocked_frames or [])],
         "mesh_file": mesh_path,
     }
 
@@ -1474,6 +1520,12 @@ def _save_pose_time_series_json(
         }
         if payload.get("scale") is not None:
             frame_dict["scale"] = payload["scale"]
+        # CLAUDE FIX: _emit_frame sets frame_payload["interpolated"], but this dict was built
+        # from a fixed key whitelist that omitted it, so the flag never reached the file and
+        # any consumer looking for it silently saw an unflagged sequence. Propagated here so a
+        # reader holding only the pts2 file can still tell, without needing meta.blocked_frames.
+        if payload.get("interpolated"):
+            frame_dict["interpolated"] = True
         time_val = time_from_frame(frame_dict["frame"])
         if time_val is None:
             time_val = float(frame_dict["frame"] - frame_start)
@@ -1748,6 +1800,11 @@ def reconstruct(
             },
             "optimizer_losses": {name: [] for name in optimizer_loss_names},
             "interpolated_frames": [],
+            # See the 'Blocked frames' block above _save_pose_time_series_json. Kept beside
+            # interpolated_frames rather than replacing it: that field is a plain list of frame
+            # numbers other tooling already reads, while this one is the general, self-describing
+            # record every future block reason will also be reported through.
+            "blocked_frames": [],
         }
         for name in gt_scalar_metric_names:
             fresh[name] = {view_name: [] for view_name in dataset.views}
@@ -1760,6 +1817,7 @@ def reconstruct(
 
     def _ensure_metrics_schema(metrics_dict: dict) -> dict:
         metrics_dict.setdefault("interpolated_frames", [])
+        metrics_dict.setdefault("blocked_frames", [])
         metrics_dict.setdefault("IoU_mask_detection_and_gt", {})
         metrics_dict.setdefault("IoU_reconstruction_and_gt", {})
         metrics_dict.setdefault("IoU_reconstruction_and_mask_detection", {})
@@ -1964,6 +2022,21 @@ def reconstruct(
 
         if is_interpolated and int(frame_idx) not in metrics["interpolated_frames"]:
             metrics["interpolated_frames"].append(int(frame_idx))
+
+        if is_interpolated and not any(
+            entry.get("frame_number") == int(frame_idx)
+            for entry in metrics["blocked_frames"]
+        ):
+            # run_index is taken AFTER _append_frame_metrics, so it is the position this frame
+            # just took in every per-frame array: len - 1, not len. pose_time_series_frames is
+            # the reference because it is appended exactly once per emitted frame in this same
+            # function, and it survives a cache resume with the metric arrays, so the two stay
+            # in step across a paused/resumed run.
+            metrics["blocked_frames"].append(_blocked_frame_record(
+                frame_number=int(frame_idx),
+                run_index=len(pose_time_series_frames) - 1,
+                reason=BLOCK_REASON_INTERPOLATED,
+            ))
 
         processed_frames.add(frame_idx)
 
@@ -2231,6 +2304,7 @@ def reconstruct(
         instance_number=instance_number,
         frame_payloads=pose_time_series_frames,
         dataset_meta=dataset.index_json,
+        blocked_frames=metrics.get("blocked_frames", []),
     )
 
     with open(os.path.join(outdir, f"metrics_instance_{instance_number}.json"), "w") as metrics_out_json:

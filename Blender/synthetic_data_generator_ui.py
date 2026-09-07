@@ -385,13 +385,27 @@ class SYNTH_PropertyGroup(PropertyGroup):
         default=True
     )
 
-    kpt_dist_warn_threshold: FloatProperty(
-        name="Keypoint Dist Warn (m)",
+    kpt_dist_warn_threshold_bl: FloatProperty(
+        name="Keypoint Dist Warn (BL)",
         description="If > 0, the final report is raised to WARNING when the largest per-keypoint "
-                    "distance over the sequence exceeds this value. Regression gate; 0 disables",
+                    "distance over the sequence exceeds this many GT body lengths. Regression "
+                    "gate; 0 disables. Renamed from the old metres-valued "
+                    "'kpt_dist_warn_threshold' when the 3D metrics moved to body lengths -- a "
+                    "value carried over from a .blend saved before that change would silently "
+                    "mean something ~10x different, so the old name is deliberately not reused",
         default=0.0,
-        min=0.0,
-        unit='LENGTH'
+        min=0.0
+    )
+
+    pts2_batch_dir: StringProperty(
+        name="PTS2 Batch Dir",
+        description="Directory of pose_time_series/2 JSONs -- typically the 'pts2_collected' "
+                    "folder written by sweep_view_combinations.py's collect_results(). Every "
+                    "*.json in it is imported, scored against the target mesh and deleted again; "
+                    "the results are written to collected_3d_metrics.json one level up, next to "
+                    "the folder itself",
+        subtype='DIR_PATH',
+        default="//"
     )
 
     # Reconstruction evaluation (MPVE / MPJPE / per-bone SO(3) geodesic error)
@@ -3781,6 +3795,78 @@ def _pts_disconnect_bones(context, arm_obj, report=None):
             pass
 
 
+# --- blocked frames ---------------------------------------------------------
+#
+# A blocked frame is one the reconstruction pipeline emitted but did NOT produce by
+# fitting the optimizer to observations of that frame -- currently only gap-filled
+# interpolated poses, but the reason is carried per record so future ones need no
+# change here. multiview_reconstruction_edit.py writes the list into both the metrics
+# JSON and the pose_time_series/2 meta; this add-on reads the pts2 copy (the file it
+# already opens) and passes it through UNINTERPRETED to the 3D metrics output.
+#
+# Blocked frames are still scored. Excluding them is the analysis step's decision, not
+# this one's: the per-frame numbers are cheap to produce, genuinely interesting when
+# asking how bad interpolation actually is, and impossible to recover later if dropped
+# here. So every frame is measured, and the flag rides along beside the measurements.
+
+_RECON_BLOCKED_PROP = "dsk_blocked_frames"
+_RECON_BLOCKED_FIELDS = ("frame_number", "frame_index_in_this_reconstruction_run",
+                         "reason_blocked")
+
+
+def _pts_blocked_records(meta, frames, report=None):
+    """meta['blocked_frames'] as a validated list of records, or [] if there is none.
+
+    Kept permissive on purpose: an unreadable or absent list means 'nothing is known to be
+    blocked', which is the correct reading of a file written before the field existed, and a
+    malformed entry is dropped individually rather than voiding the whole list. Everything
+    dropped is reported, because a silently empty blocked list looks exactly like a clean run.
+    """
+    raw = meta.get("blocked_frames")
+    if raw is None:
+        if report:
+            report({'WARNING'},
+                   "this pose time series has no 'blocked_frames' in its meta (written before "
+                   "the field existed); no frame will be flagged as blocked. Re-run the "
+                   "reconstruction to record it.")
+        return []
+    if not isinstance(raw, list):
+        if report:
+            report({'WARNING'}, f"'blocked_frames' is {type(raw).__name__}, not a list; "
+                                f"ignoring it.")
+        return []
+
+    known = {int(f["frame"]) for f in frames if isinstance(f.get("frame"), (int, float))}
+    records, dropped = [], 0
+    for entry in raw:
+        if not isinstance(entry, dict) or not all(k in entry for k in _RECON_BLOCKED_FIELDS):
+            dropped += 1
+            continue
+        try:
+            record = {
+                "frame_number": int(entry["frame_number"]),
+                "frame_index_in_this_reconstruction_run":
+                    int(entry["frame_index_in_this_reconstruction_run"]),
+                "reason_blocked": str(entry["reason_blocked"]),
+            }
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        records.append(record)
+    if dropped and report:
+        report({'WARNING'}, f"{dropped} malformed entry/entries in 'blocked_frames' were "
+                            f"ignored; each needs {list(_RECON_BLOCKED_FIELDS)}.")
+
+    # The frame NUMBER is what this add-on keys on -- it scores an animation by frame, not by
+    # array position -- so a blocked number with no matching keyframe would silently flag
+    # nothing. Worth a warning: it means the list and the frames came from different runs.
+    orphans = sorted({r["frame_number"] for r in records} - known)
+    if orphans and report:
+        report({'WARNING'}, f"blocked frame(s) {orphans[:5]} are not in this file's frame list; "
+                            f"they cannot be flagged. The blocked list may be from another run.")
+    return records
+
+
 def create_animation_from_pose_time_series(context, timeseries_path, report=None):
     """Rebuild a Blender animation from a pose_time_series/2 JSON.
 
@@ -3884,6 +3970,28 @@ def create_animation_from_pose_time_series(context, timeseries_path, report=None
         scene.frame_start = int(meta.get("frame_start", frames[0]["frame"]))
         scene.frame_end = int(meta.get("frame_end", frames[-1]["frame"]))
 
+    # Carried through verbatim from the pts2 meta, then read back by _recon_pair_context() for
+    # every 3D metric operator (single-run and batch alike) and copied into the 3D metrics file.
+    # This add-on does not decide what is blocked or why -- the reconstruction pipeline does,
+    # and re-deriving it here (e.g. by looking for the per-frame "interpolated" flag) would give
+    # a second, silently diverging definition. Frames are still SCORED normally; the list only
+    # records which of them were not optimizer-fitted, so a consumer can aggregate accordingly.
+    #
+    # Stamped on the MESH, not the armature, because _iou_find_reconstruction only ever searches
+    # MESH objects in 'Reconstructions' -- that is the one place a reader will look for it. As a
+    # JSON string rather than a native array because Blender's ID-property arrays cannot hold
+    # dicts, and reject an empty list besides (the common case: most runs block nothing).
+    blocked_records = _pts_blocked_records(meta, frames, report)
+    new_obj[_RECON_BLOCKED_PROP] = json.dumps(blocked_records)
+    if blocked_records and report:
+        by_reason = {}
+        for entry in blocked_records:
+            key = entry["reason_blocked"]
+            by_reason[key] = by_reason.get(key, 0) + 1
+        report({'INFO'}, f"{len(blocked_records)} of {len(frames)} frame(s) in "
+                         f"'{new_obj.name}' are blocked ({by_reason}); they are still scored, "
+                         f"and flagged as blocked in the 3D metrics output.")
+
     context.view_layer.update()
     return new_arm, new_obj
 
@@ -3984,6 +4092,27 @@ class SYNTH_OT_verify_pose_time_series_roundtrip(Operator, ImportHelper):
 #                      centroid = mean world-space position of a keypoint's vertex
 #                      group members, i.e. exactly get_avg_kpt_coords_3d.
 #
+# UNITS. Every length in this section is reported BOTH in metres and in GT body
+# lengths, and the body-length figure is the one to compare across runs. A metre
+# is meaningless as a quality score here: it depends on how large the artist
+# happened to model the fish, so two sweeps of the same pipeline on differently
+# scaled scenes are not comparable in metres, and neither is a 3D distance
+# against the 2D keypoint error, which analyze_metrics.py already normalises by
+# gt_body_length_px. L_body is the SAME quantity the MPVE/MPJPE section uses --
+# _recon_body_length(), || centroid('mouth tip') - centroid('caudal peduncle') ||
+# on the GT mesh -- so a body length means one thing across the whole file.
+# It is measured per frame and ALWAYS on the ground truth: taken from the
+# reconstruction, an over-scaled fit would divide its own error away.
+#
+#   dist_bl(kpt, frame) = dist(kpt, frame) / L_body(frame)
+#   vol_*_bl3(frame)    = vol_*(frame)     / L_body(frame)^3
+#
+# The IoU itself is a ratio of two volumes and is therefore ALREADY scale free;
+# normalising it would be wrong, so it is left exactly as it is. Same for the
+# occupancy counts. Metres are kept beside the body lengths rather than replaced,
+# because L_body can be unmeasurable on a frame (see body_length_source) and a
+# null normalised value with no absolute value beside it would be unreadable.
+#
 # Ray parity is preferred over bmesh.ops.intersect_boolean / the boolean modifier:
 # LBS-skinned meshes self-intersect at sharp bends, where exact CSG fails outright
 # while parity only misclassifies the small doubly-covered region.
@@ -3992,8 +4121,11 @@ class SYNTH_OT_verify_pose_time_series_roundtrip(Operator, ImportHelper):
 # (_recon_frame_payload), because obj.evaluated_get(deps).to_mesh() is by far the
 # most expensive step of the loop.
 
-VOLUMETRIC_IOU_SCHEMA = "volumetric_iou/1"
-KEYPOINT_DISTANCE_SCHEMA = "keypoint_distances/1"
+# /2: every length gained its body-length-normalised counterpart, and the frame
+# records gained body_length_m / body_length_source. A reader must be able to tell
+# a file with those fields from one without, hence the version bump.
+VOLUMETRIC_IOU_SCHEMA = "volumetric_iou/2"
+KEYPOINT_DISTANCE_SCHEMA = "keypoint_distances/2"
 
 # Fixed, deliberately non-axis-aligned ray direction: fish rigs are modelled on the world
 # axes, so an axis-aligned ray grazes coplanar fin/body geometry and breaks the parity count.
@@ -4061,20 +4193,66 @@ def _iou_action_range(obj):
         return None
 
 
-def _recon_pair_context(context, report=None):
+def _recon_blocked_frames(rec_obj, report=None):
+    """The blocked-frame records stamped on `rec_obj` by the pts2 importer.
+
+    Returns (records, stamp_present). A reconstruction imported before the stamp existed
+    reports once and yields ([], False) -- 'not recorded', which the caller keeps distinct
+    from the benign ([], True) 'recorded, and nothing was blocked'. The two look identical in
+    the output otherwise, and conflating them would let a run with unknown provenance pass as
+    a clean one.
+    """
+    raw = rec_obj.get(_RECON_BLOCKED_PROP)
+    if raw is None:
+        if report:
+            report({'WARNING'},
+                   f"'{rec_obj.name}' carries no blocked-frame stamp (imported before this was "
+                   f"recorded); no frame can be flagged as blocked. Re-run 'Create Animation "
+                   f"from Pose Time Series' to record it.")
+        return [], False
+    try:
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            raise ValueError(f"expected a list, got {type(records).__name__}")
+        return [dict(r) for r in records], True
+    except (TypeError, ValueError) as exc:
+        if report:
+            report({'WARNING'}, f"'{rec_obj.name}': unreadable blocked-frame stamp ({exc}); "
+                                f"no frame is flagged.")
+        return [], False
+
+
+def _recon_pair_context(context, report=None, rec_obj=None):
     """Common preamble of both metric operators: GT/reconstruction pairing + frame range.
 
-    Returns dict(src_obj, src_arm, rec_obj, rec_arm, kpt_list, frame_lo, frame_hi).
+    Returns dict(src_obj, src_arm, rec_obj, rec_arm, kpt_list, frame_lo, frame_hi,
+    blocked_records, blocked_by_frame, blocked_known).
     Raises ValueError on anything the caller must turn into {'CANCELLED'}.
+
+    `rec_obj` bypasses the '<name>.NNN, newest wins' search of _iou_find_reconstruction and the
+    'Reconstruction Object' property with an object the caller already holds a reference to.
+    Only the batch operator uses it: it imports one pts2 file at a time and therefore knows
+    exactly which mesh it just created, so name-based auto-detection would be both redundant and
+    wrong (a stale 'Reconstruction Object' override would silently score the wrong mesh).
+
+    `blocked_records` are the reconstruction's blocked frames, restricted to the evaluated
+    range. NOTHING is skipped because of them -- every frame in [frame_lo, frame_hi] is still
+    measured -- they are carried so each metric can mark its per-frame rows and so the run-level
+    list can be copied into the output. Resolving them HERE rather than inside each metric's
+    loop is deliberate: this is the one preamble every 3D metric operator shares, so a single
+    read-back covers the IoU, the keypoint distances, MPVE, MPJPE, the bone-rotation error and
+    the batch collector, and none of them can disagree about which frames were blocked.
     """
     scene = context.scene
     p = scene.synth_props
 
     src_obj, src_arm = _pts_find_source(context)
-    rec_obj, n_cands = _iou_find_reconstruction(src_obj, p.iou_recon_object_name.strip())
-    if n_cands > 1 and report:
-        report({'WARNING'}, f"{n_cands} reconstructions of '{src_obj.name}' found; using the "
-                            f"newest ('{rec_obj.name}'). Set 'Reconstruction Object' to override.")
+    if rec_obj is None:
+        rec_obj, n_cands = _iou_find_reconstruction(src_obj, p.iou_recon_object_name.strip())
+        if n_cands > 1 and report:
+            report({'WARNING'}, f"{n_cands} reconstructions of '{src_obj.name}' found; using the "
+                                f"newest ('{rec_obj.name}'). Set 'Reconstruction Object' to "
+                                f"override.")
     rec_arm = rec_obj.parent if (rec_obj.parent and rec_obj.parent.type == 'ARMATURE') else None
 
     # Mismatched frame ranges: intersect the scene range with both actions' keyed ranges.
@@ -4090,8 +4268,23 @@ def _recon_pair_context(context, report=None):
     if (lo, hi) != (f_start, f_end) and report:
         report({'WARNING'}, f"Frame range mismatch: evaluating the overlap [{lo}, {hi}] instead "
                             f"of the scene range [{f_start}, {f_end}].")
+
+    records, known = _recon_blocked_frames(rec_obj, report)
+    # Restricted to the evaluated range so the run-level list in the output describes exactly
+    # the frames the file reports on; a record outside [lo, hi] belongs to no row there.
+    in_range = [r for r in records
+                if isinstance(r.get("frame_number"), int) and lo <= r["frame_number"] <= hi]
+    by_frame = {r["frame_number"]: r["reason_blocked"] for r in in_range}
+    if in_range and report:
+        n_range = hi - lo + 1
+        report({'INFO'},
+               f"{len(in_range)} of {n_range} frame(s) in [{lo}, {hi}] are blocked; all are "
+               f"still scored and flagged as blocked in the output.")
+
     return {"src_obj": src_obj, "src_arm": src_arm, "rec_obj": rec_obj, "rec_arm": rec_arm,
-            "kpt_list": _recon_kpt_list(context), "frame_lo": lo, "frame_hi": hi}
+            "kpt_list": _recon_kpt_list(context), "frame_lo": lo, "frame_hi": hi,
+            "blocked_records": sorted(in_range, key=lambda r: r["frame_number"]),
+            "blocked_by_frame": by_frame, "blocked_known": known}
 
 
 def _recon_vertex_group_members(obj):
@@ -4307,6 +4500,94 @@ def _iou_frame(bvh_a, box_a, bvh_b, box_b, n_samples, seed):
     }
 
 
+# --- body-length normalisation ----------------------------------------------
+#
+# _recon_body_length() and _RECON_BODY_LENGTH_KPTS live in the MPVE/MPJPE section
+# further down. Calling forward into it is deliberate: one definition of L_body for
+# the whole file is worth more than locality, because two definitions would drift
+# and silently make the 3D distances here incomparable with the MPJPE ones there.
+
+def _iou_kpt_payload_kpt_list(src_obj, kpt_list):
+    """`kpt_list` plus whichever body-axis keypoints the GT mesh actually carries.
+
+    L_body must be measurable even when the user turned the keypoint distances off, so
+    the payload always extracts the two body-axis groups. They are appended, never
+    substituted, and _kpt_frame_distances() iterates the caller's `kpt_list`, so the extra
+    centroids widen the normaliser's coverage without adding a measured keypoint.
+    Filtering against the GT's actual vertex groups keeps get_deformed_mesh_data from
+    being asked for a group that does not exist on this template.
+    """
+    names = list(kpt_list)
+    present = {vg.name for vg in src_obj.vertex_groups}
+    for k in _RECON_BODY_LENGTH_KPTS:
+        if k in present and k not in names:
+            names.append(k)
+    return names
+
+
+def _iou_kpt_body_length(pay_gt):
+    """(L_body in metres, source) for one frame, from the GT payload alone.
+
+    payload['box'] is the world-space AABB of exactly the vertices _recon_body_length()
+    would reduce to a diagonal, so feeding it the two corners reproduces that fallback
+    bit for bit without asking _recon_frame_payload for the full (N, 3) vertex array.
+    """
+    box = pay_gt.get("box")
+    corners = None
+    if box is not None:
+        corners = np.asarray([tuple(box[0]), tuple(box[1])], dtype=np.float64)
+    return _recon_body_length(pay_gt.get("kpt_centroids") or {}, corners, None)
+
+
+def _bl_norm(value, l_body, power=1):
+    """`value` in body lengths (or BL^power), or None when L_body is unusable.
+
+    None rather than NaN: these land in JSON, where null is the file format's own
+    missing value and survives a round trip through every reader.
+    """
+    if value is None or l_body is None or not (l_body > _RECON_EPS):
+        return None
+    try:
+        out = float(value) / (float(l_body) ** power)
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _body_length_block(lengths, sources):
+    """Sequence-level summary of the normaliser itself.
+
+    Reported next to every aggregate that was divided by it: a body-length number is only
+    as trustworthy as L_body, and a run that silently fell back to the AABB diagonal on
+    most frames must be visible as such rather than inferred from a suspiciously smooth curve.
+    """
+    vals = [float(v) for v in lengths if v is not None and math.isfinite(float(v))]
+    by_source = {}
+    for s in sources:
+        by_source[s] = by_source.get(s, 0) + 1
+    block = {
+        "definition": (f"|| centroid('{_RECON_BODY_LENGTH_KPTS[0]}') - "
+                       f"centroid('{_RECON_BODY_LENGTH_KPTS[1]}') || on the GT mesh"),
+        "measured_on": "ground_truth",
+        "units": "meters",
+        "n_frames_measured": len(vals),
+        "n_frames_unavailable": len(sources) - len(vals),
+        "sources": by_source,
+    }
+    if vals:
+        ordered = sorted(vals)
+        mid = len(ordered) // 2
+        block.update({
+            "median": float(ordered[mid] if len(ordered) % 2
+                            else 0.5 * (ordered[mid - 1] + ordered[mid])),
+            "min": float(ordered[0]),
+            "max": float(ordered[-1]),
+        })
+    else:
+        block.update({"median": None, "min": None, "max": None})
+    return block
+
+
 # --- keypoint distances -----------------------------------------------------
 
 def _kpt_frame_distances(cent_gt, cent_rc, kpt_list, missing, report=None):
@@ -4332,9 +4613,18 @@ def _kpt_frame_distances(cent_gt, cent_rc, kpt_list, missing, report=None):
     return out
 
 
-def _kpt_record(frame, per_keypoint):
-    """One frames[] entry: per-keypoint distances plus this frame's mean/max."""
+def _kpt_record(frame, per_keypoint, l_body=None, l_source="unavailable", blocked_reason=None):
+    """One frames[] entry: per-keypoint distances plus this frame's mean/max.
+
+    Every distance appears twice, in metres and in body lengths; the '_bl' fields are null
+    on a frame whose L_body could not be measured. mean_bl is the mean of the per-keypoint
+    RATIOS, not mean(distance)/L_body -- identical here because L_body is one number per
+    frame, but it stays correct if L_body ever becomes per-keypoint.
+    """
     entry = {"frame": int(frame), "per_keypoint": per_keypoint}
+    per_keypoint_bl = {k: _bl_norm(v, l_body) for k, v in per_keypoint.items()}
+    per_keypoint_bl = {k: v for k, v in per_keypoint_bl.items() if v is not None}
+    entry["per_keypoint_bl"] = per_keypoint_bl
     if per_keypoint:
         worst = max(per_keypoint, key=per_keypoint.get)
         entry["mean"] = float(sum(per_keypoint.values()) / len(per_keypoint))
@@ -4344,7 +4634,21 @@ def _kpt_record(frame, per_keypoint):
         entry["mean"] = None
         entry["max"] = None
         entry["max_keypoint"] = None
+    if per_keypoint_bl:
+        worst_bl = max(per_keypoint_bl, key=per_keypoint_bl.get)
+        entry["mean_bl"] = float(sum(per_keypoint_bl.values()) / len(per_keypoint_bl))
+        entry["max_bl"] = float(per_keypoint_bl[worst_bl])
+        entry["max_bl_keypoint"] = worst_bl
+    else:
+        entry["mean_bl"] = None
+        entry["max_bl"] = None
+        entry["max_bl_keypoint"] = None
     entry["n_keypoints"] = len(per_keypoint)
+    entry["body_length_m"] = None if l_body is None else float(l_body)
+    entry["body_length_source"] = l_source
+    # Measured like any other frame; the flag only says the pose was not optimizer-fitted.
+    entry["blocked"] = blocked_reason is not None
+    entry["reason_blocked"] = blocked_reason
     return entry
 
 
@@ -4362,27 +4666,67 @@ def _kpt_dist_meta(p, ctx, lo, hi):
         "keypoint_list": list(ctx["kpt_list"]),
         "frame_start": int(lo),
         "frame_end": int(hi),
-        "units": "meters",
+        "blocked_frames": [dict(r) for r in (ctx.get("blocked_records") or [])],
+        "blocked_stamp_present": bool(ctx.get("blocked_known")),
+        "blocked_policy": ("every frame in [frame_start, frame_end] is measured; 'blocked' on a "
+                           "frame row means its pose was not produced by fitting the optimizer "
+                           "to that frame, and the consumer decides whether to aggregate it"),
+        "units": "meters; every field suffixed '_bl' is the same quantity in GT body lengths",
+        "primary_units": "body_lengths",
+        "normalisation": ("divided by the per-frame GT body length L_body; see summary."
+                          "body_length for its definition, provenance and spread"),
     }
 
 
-def _kpt_dist_finalize(records, per_kpt, missing, meta, out_path):
-    """Aggregate per keypoint / per frame, write the JSON, return the summary dict."""
+def _kpt_dist_summarize(records, per_kpt, per_kpt_bl, missing, blocked_records=()):
+    """Aggregate per keypoint / per frame. Pure: builds the summary dict, touches no file.
+
+    Split out of _kpt_dist_finalize so the batch operator can put the same summary into an
+    in-memory collection without also writing a per-run keypoint_distances_*.json.
+
+    `per_kpt` and `per_kpt_bl` are the metre and body-length series of the same keypoints.
+    They are aggregated independently rather than dividing the metre aggregate by a mean
+    L_body: the mean of the per-frame ratios is the quantity that is comparable across runs,
+    and a frame whose L_body was unmeasurable must drop out of the body-length aggregate
+    while still counting towards the metre one.
+    """
     per_kpt_summary = {}
     for k, series in per_kpt.items():
         vals = [d for _f, d in series]
         i_max = max(range(len(vals)), key=lambda j: vals[j])
-        per_kpt_summary[k] = {
+        entry = {
             "n_frames": len(vals),
             "mean": float(sum(vals) / len(vals)),
             "max": float(vals[i_max]),
             "max_frame": int(series[i_max][0]),
         }
+        series_bl = per_kpt_bl.get(k, [])
+        vals_bl = [d for _f, d in series_bl]
+        if vals_bl:
+            j_max = max(range(len(vals_bl)), key=lambda j: vals_bl[j])
+            entry.update({
+                "n_frames_bl": len(vals_bl),
+                "mean_bl": float(sum(vals_bl) / len(vals_bl)),
+                "max_bl": float(vals_bl[j_max]),
+                "max_bl_frame": int(series_bl[j_max][0]),
+            })
+        else:
+            entry.update({"n_frames_bl": 0, "mean_bl": None, "max_bl": None,
+                          "max_bl_frame": None})
+        per_kpt_summary[k] = entry
+
     all_vals = [(f["frame"], k, d) for f in records for k, d in f["per_keypoint"].items()]
+    all_bl = [(f["frame"], k, d) for f in records
+              for k, d in f.get("per_keypoint_bl", {}).items()]
     overall = {
         "n_frames": len(records),
+        "n_blocked": len(list(blocked_records)),
+        "blocked_frames": [dict(r) for r in blocked_records],
         "n_keypoints": len(per_kpt_summary),
         "skipped_keypoints": dict(missing),
+        "body_length": _body_length_block([f.get("body_length_m") for f in records],
+                                          [f.get("body_length_source", "unavailable")
+                                           for f in records]),
         "per_keypoint": per_kpt_summary,
     }
     if all_vals:
@@ -4393,10 +4737,227 @@ def _kpt_dist_finalize(records, per_kpt, missing, meta, out_path):
             "overall_max_frame": int(mx[0]),
             "overall_max_keypoint": mx[1],
         })
+    if all_bl:
+        mx = max(all_bl, key=lambda t: t[2])
+        overall.update({
+            "overall_mean_bl": float(sum(t[2] for t in all_bl) / len(all_bl)),
+            "overall_max_bl": float(mx[2]),
+            "overall_max_bl_frame": int(mx[0]),
+            "overall_max_bl_keypoint": mx[1],
+        })
+    else:
+        overall.update({"overall_mean_bl": None, "overall_max_bl": None,
+                        "overall_max_bl_frame": None, "overall_max_bl_keypoint": None})
+    return overall
+
+
+def _kpt_dist_finalize(records, per_kpt, per_kpt_bl, missing, meta, out_path,
+                       blocked_records=()):
+    """Aggregate per keypoint / per frame, write the JSON, return the summary dict."""
+    overall = _kpt_dist_summarize(records, per_kpt, per_kpt_bl, missing,
+                                  blocked_records)
     data = {"meta": meta, "summary": overall, "frames": records}
     with open(out_path, 'w') as jf:
         json.dump(data, jf, indent=2)
     return overall
+
+
+# --- shared IoU / keypoint frame loop ---------------------------------------
+#
+# The loop below is the single implementation behind THREE entry points:
+#   synth.compute_volumetric_iou     need_bvh=True,  kpt_list optionally non-empty
+#   synth.compute_keypoint_distances need_bvh=False, kpt_list non-empty
+#   synth.batch_3d_metrics           need_bvh=True,  once per imported pts2 file
+# It was factored out of the first two verbatim -- same order of operations, same
+# payload extraction, same warn-once policy -- so their JSON output is unchanged.
+# Exceptions propagate: each caller owns its own error wording and return value.
+
+def _iou_kpt_eval_pass(context, ctx, kpt_list, need_bvh, n_samples, seed, report=None):
+    """One frame_set/to_mesh pass producing the IoU frames and/or the keypoint distances.
+
+    Returns dict(iou_frames, iou_skipped, kpt_records, per_kpt, missing).
+    `kpt_list` empty disables the keypoint block; `need_bvh` False disables the IoU block
+    (and, with it, the BVHTree build -- the cheap ~2 to_mesh()-per-frame path).
+    The scene's current frame is restored on every exit path.
+    """
+    scene = context.scene
+    p = scene.synth_props
+    src_obj, rec_obj = ctx["src_obj"], ctx["rec_obj"]
+    lo, hi = int(ctx["frame_lo"]), int(ctx["frame_hi"])
+    want_kpts = bool(kpt_list)
+    # widened only for the payload extraction: L_body must be measurable even in IoU-only mode
+    payload_kpts = _iou_kpt_payload_kpt_list(src_obj, kpt_list)
+    # Blocked frames are measured like any other. The flag rides along on each row so the
+    # analysis step can drop them; dropping them here would make the per-frame numbers
+    # unrecoverable and hide how bad the gap-filled poses actually are.
+    blocked_by_frame = ctx.get("blocked_by_frame") or {}
+
+    iou_frames, iou_skipped = [], []
+    kpt_records, per_kpt, per_kpt_bl, missing = [], defaultdict(list), defaultdict(list), {}
+    degenerate_warned = False
+
+    deps = context.evaluated_depsgraph_get()
+    original_frame = scene.frame_current
+    try:
+        for frame in range(lo, hi + 1):
+            blocked_reason = blocked_by_frame.get(int(frame))
+            scene.frame_set(frame)
+            deps.update()
+
+            pay_gt = pay_rc = None
+            try:
+                # the 'not in the depsgraph' warning is a property of the setup, not of the
+                # frame, so it is only ever raised on the first one
+                rep = report if frame == lo else None
+                pay_gt = _recon_frame_payload(deps, p.collection_name, src_obj,
+                                              payload_kpts, need_bvh, rep)
+                pay_rc = _recon_frame_payload(deps, "Reconstructions", rec_obj,
+                                              payload_kpts, need_bvh, rep)
+
+                # GT-side only, per frame: the normaliser for every length below
+                l_body, l_source = _iou_kpt_body_length(pay_gt)
+
+                if want_kpts:
+                    d = _kpt_frame_distances(pay_gt["kpt_centroids"], pay_rc["kpt_centroids"],
+                                             kpt_list, missing, report)
+                    rec = _kpt_record(frame, d, l_body, l_source, blocked_reason)
+                    kpt_records.append(rec)
+                    for k, v in d.items():
+                        per_kpt[k].append((frame, v))
+                    for k, v in rec["per_keypoint_bl"].items():
+                        per_kpt_bl[k].append((frame, v))
+
+                if not need_bvh:
+                    continue
+
+                # a degenerate frame still contributes its keypoint distances above: the
+                # centroids are well defined even where the tessellation is not
+                if pay_gt["bvh"] is None or pay_rc["bvh"] is None:
+                    if not degenerate_warned:
+                        degenerate_warned = True
+                        if report:
+                            report({'WARNING'},
+                                   f"Frame {frame}: degenerate mesh (GT faces="
+                                   f"{pay_gt['n_faces']}, recon faces={pay_rc['n_faces']}); "
+                                   f"frame skipped.")
+                    iou_skipped.append(frame)
+                    iou_frames.append({"frame": int(frame), "iou": None,
+                                       "reason": "degenerate_mesh",
+                                       "body_length_m": (None if l_body is None
+                                                         else float(l_body)),
+                                       "body_length_source": l_source,
+                                       "blocked": blocked_reason is not None,
+                                       "reason_blocked": blocked_reason})
+                    continue
+
+                res = _iou_frame(pay_gt["bvh"], pay_gt["box"],
+                                 pay_rc["bvh"], pay_rc["box"], n_samples, seed)
+                if res is None:
+                    if not degenerate_warned:
+                        degenerate_warned = True
+                        if report:
+                            report({'WARNING'}, f"Frame {frame}: zero-volume occupancy; "
+                                                f"frame skipped.")
+                    iou_skipped.append(frame)
+                    iou_frames.append({"frame": int(frame), "iou": None,
+                                       "reason": "zero_volume",
+                                       "body_length_m": (None if l_body is None
+                                                         else float(l_body)),
+                                       "body_length_source": l_source,
+                                       "blocked": blocked_reason is not None,
+                                       "reason_blocked": blocked_reason})
+                    continue
+                res["frame"] = int(frame)
+                # 'iou' and the occupancy counts are ratios and stay as they are; only the
+                # four volumes carry a unit, and theirs is a cubed length
+                for key in ("vol_gt", "vol_recon", "vol_intersection", "vol_union"):
+                    res[key + "_bl3"] = _bl_norm(res.get(key), l_body, power=3)
+                res["body_length_m"] = None if l_body is None else float(l_body)
+                res["body_length_source"] = l_source
+                res["blocked"] = blocked_reason is not None
+                res["reason_blocked"] = blocked_reason
+                iou_frames.append(res)
+            finally:
+                # BVHTrees hold their own geometry copy; drop both payloads every frame so
+                # nothing accumulates over a several-hundred-frame sequence.
+                del pay_gt
+                del pay_rc
+    finally:
+        scene.frame_set(original_frame)
+
+    return {"iou_frames": iou_frames, "iou_skipped": iou_skipped,
+            "kpt_records": kpt_records, "per_kpt": per_kpt, "per_kpt_bl": per_kpt_bl,
+            "missing": missing, "blocked_records": list(ctx.get("blocked_records") or [])}
+
+
+def _iou_meta(p, ctx, lo, hi, n_samples, seed):
+    return {
+        "schema": VOLUMETRIC_IOU_SCHEMA,
+        "producer": "synthetic_data_generator_ui.py",
+        "method": "monte_carlo_occupancy_bvh_ray_parity",
+        "gt_collection": p.collection_name,
+        "gt_object": ctx["src_obj"].name,
+        "recon_object": ctx["rec_obj"].name,
+        "samples_per_frame": int(n_samples),
+        "random_seed": int(seed),
+        "ray_direction": [float(_IOU_RAY_DIR.x), float(_IOU_RAY_DIR.y), float(_IOU_RAY_DIR.z)],
+        "frame_start": int(lo),
+        "frame_end": int(hi),
+        "blocked_frames": [dict(r) for r in (ctx.get("blocked_records") or [])],
+        "blocked_stamp_present": bool(ctx.get("blocked_known")),
+        "blocked_policy": ("every frame in [frame_start, frame_end] is measured; 'blocked' on a "
+                           "frame row means its pose was not produced by fitting the optimizer "
+                           "to that frame, and the consumer decides whether to aggregate it"),
+        "units": {
+            "iou": "dimensionless ratio of volumes -- already scale free, NOT normalised",
+            "iou_stderr": "dimensionless",
+            "vol_*": "cubic meters",
+            "vol_*_bl3": "cubic GT body lengths (vol_* / L_body^3)",
+            "n_*": "sample counts, dimensionless",
+            "body_length_m": "meters",
+        },
+    }
+
+
+def _iou_summary(frames, skipped, blocked_records=()):
+    """Aggregate the IoU frame records. None when no frame produced a valid IoU.
+
+    The IoU needs no body-length normalisation, but the run's L_body is summarised here
+    anyway: it is the scale the sibling keypoint distances were divided by, and the two
+    blocks are read together.
+
+    Blocked frames ARE included in every aggregate here, because they were measured like any
+    other frame: this summary describes the whole evaluated range. `blocked_records` is carried
+    alongside so a consumer that wants accuracy-over-fitted-frames-only can recompute from
+    frames[] -- which is why every row keeps its own 'blocked' flag rather than relying on this
+    list. n_blocked is reported so the two populations are never confused.
+    """
+    vals = [f["iou"] for f in frames if f.get("iou") is not None]
+    if not vals:
+        return None
+    i_min = min(range(len(vals)), key=lambda k: vals[k])
+    i_max = max(range(len(vals)), key=lambda k: vals[k])
+    valid_frames = [f["frame"] for f in frames if f.get("iou") is not None]
+    summary = {
+        "n_frames": len(frames),
+        "n_valid": len(vals),
+        "n_skipped": len(skipped),
+        "skipped_frames": list(skipped),
+        "n_blocked": len(list(blocked_records)),
+        "blocked_frames": [dict(r) for r in blocked_records],
+        "mean_iou": float(sum(vals) / len(vals)),
+        "min_iou": float(vals[i_min]),
+        "min_iou_frame": int(valid_frames[i_min]),
+        "max_iou": float(vals[i_max]),
+        "max_iou_frame": int(valid_frames[i_max]),
+        "body_length": _body_length_block(
+            [f.get("body_length_m") for f in frames],
+            [f.get("body_length_source", "unavailable") for f in frames]),
+    }
+    for key in ("vol_gt_bl3", "vol_recon_bl3", "vol_intersection_bl3", "vol_union_bl3"):
+        series = [f[key] for f in frames if f.get(key) is not None]
+        summary["mean_" + key] = float(sum(series) / len(series)) if series else None
+    return summary
 
 
 # =============================================================================
@@ -4531,16 +5092,31 @@ def _recon_stats(values, labels=None, label_key="argmax", weights=None):
     return out
 
 
-def _recon_coverage(requested, valid, skipped):
-    """Coverage rho = n_valid / n_frames, plus every skipped frame WITH its reason."""
+def _recon_coverage(requested, valid, skipped, blocked_records=()):
+    """Coverage rho = n_valid / n_frames, plus every skipped frame WITH its reason.
+
+    Blocked frames are inside both terms: they were requested and they scored, so rho keeps its
+    meaning -- 'of everything we set out to measure, how much produced a number'. Whether to
+    aggregate them is a separate question, answered per row by frames[].blocked and summarised
+    by n_blocked here, so a reader can see at a glance how much of a run's coverage is made up
+    of poses that were not optimizer-fitted.
+    """
     n = int(len(requested))
     nv = int(len(valid))
+    blocked = [dict(r) for r in blocked_records]
     return {
         "n_frames": n,
         "n_valid": nv,
         "n_skipped": int(len(skipped)),
         "coverage_rho": (float(nv) / n) if n else None,
         "skipped_frames": [{"frame": int(f), "reason": str(r)} for f, r in skipped],
+        "n_blocked": len(blocked),
+        "blocked_frames": blocked,
+        "blocked_policy": (
+            "blocked frames are measured and counted in n_frames/n_valid/coverage_rho; the "
+            "flag records that their pose was not produced by fitting the optimizer to that "
+            "frame, leaving it to the consumer to exclude them from accuracy aggregates"
+        ),
     }
 
 
@@ -5088,8 +5664,16 @@ def _recon_eval_pass(context, ctx, want, opts, report=None):
     swing_twist = bool(opts.get("swing_twist", False))
     prior_tol = float(opts.get("prior_saturation_tol", 0.05))
 
+    # Blocked frames are evaluated like any other -- 'requested' is the full range, and rho
+    # therefore still means 'of everything we set out to score, how much scored'. The blocked
+    # list is carried through so the file can report which rows were not optimizer-fitted.
+    blocked_records = list(ctx.get("blocked_records") or [])
+    blocked_by_frame = ctx.get("blocked_by_frame") or {}
+    evaluated_range = list(range(lo, hi + 1))
+
     res = {
-        "frames": [], "requested": list(range(lo, hi + 1)), "skipped": [],
+        "frames": [], "requested": evaluated_range, "skipped": [],
+        "blocked_records": blocked_records, "blocked": [],
         "body_length": [], "body_length_source": [], "warnings": warnings,
         "roundtrip": roundtrip, "empty_keypoints": empty_kpts,
         "arm_rotation_offset_deg": [],
@@ -5111,7 +5695,12 @@ def _recon_eval_pass(context, ctx, want, opts, report=None):
     original_frame = scene.frame_current
     incidence = None
     try:
-        for frame in range(lo, hi + 1):
+        # evaluated_range, not range(lo, hi + 1): interpolated frames never enter the loop, so
+        # they cost no frame_set/to_mesh and cannot reach any per-frame array. `first` already
+        # keys off res["frames"] being empty, so the one-shot setup (n_verts, tessellation,
+        # area incidence) and the first-frame-only warnings still land on the first frame that
+        # is actually evaluated rather than on a skipped one.
+        for frame in evaluated_range:
             scene.frame_set(frame)
             deps.update()
             first = not res["frames"]
@@ -5325,6 +5914,8 @@ def _recon_eval_pass(context, ctx, want, opts, report=None):
 
             # ---- commit the frame only once every requested metric succeeded
             res["frames"].append(int(frame))
+            # parallel to res["frames"]: position i answers 'was frame i blocked'
+            res["blocked"].append(blocked_by_frame.get(int(frame)))
             res["body_length"].append(L_body if L_body else float('nan'))
             res["body_length_source"].append(L_src)
             if mpve_entry is not None:
@@ -5458,6 +6049,11 @@ def _mpve_build(res, p, ctx, lo, hi, opts):
     E = np.stack(rows).astype(np.float32) if rows else np.zeros((0, 0), dtype=np.float32)
     bl = np.asarray(res["body_length"], dtype=np.float32)
     entries = res["mpve"]["frames"]
+    # res["blocked"] is parallel to res["frames"], which is parallel to mpve["frames"] --
+    # all three are appended in the same commit step of _recon_eval_pass.
+    for entry, reason in zip(entries, res.get("blocked", [])):
+        entry["blocked"] = reason is not None
+        entry["reason_blocked"] = reason
 
     units = opts.get("mpve_units", 'meters')
     E_u = _mpve_units_array(E, bl, units)
@@ -5508,7 +6104,8 @@ def _mpve_build(res, p, ctx, lo, hi, opts):
             "definition": "vertex weight = 1/3 * sum(area of incident faces), GT mesh, per frame",
             "tessellation": res["mpve"]["tessellation"],
         },
-        "coverage": _recon_coverage(res["requested"], res["frames"], res["skipped"]),
+        "coverage": _recon_coverage(res["requested"], res["frames"], res["skipped"],
+                                     res.get("blocked_records", ())),
         "heatmap_scale": scale,
     }
     meta = _recon_meta_base(
@@ -5601,7 +6198,8 @@ def _mpjpe_build(res, p, ctx, lo, hi, opts):
                      for t in ("global", "root_relative", "pa")},
         "joint": {t: (data["joint"][t]["overall"] if joint_entries else None)
                   for t in ("global", "root_relative", "pa")},
-        "coverage": _recon_coverage(res["requested"], frames, res["skipped"]),
+        "coverage": _recon_coverage(res["requested"], frames, res["skipped"],
+                                     res.get("blocked_records", ())),
     }
     data["meta"] = _recon_meta_base(
         MPJPE_SCHEMA, "mean_per_joint_position_error_world_space_l2", p, ctx, lo, hi,
@@ -5722,7 +6320,8 @@ def _bone_rot_build(res, p, ctx, lo, hi, opts):
                           "local": per_group[g]["local"]["mean"]} for g in per_group},
         "worst_bone_global": max(real, key=lambda n: (per_bone[n]["global"]["mean"] or -1.0),
                                  default=None),
-        "coverage": _recon_coverage(res["requested"], frames, res["skipped"]),
+        "coverage": _recon_coverage(res["requested"], frames, res["skipped"],
+                                     res.get("blocked_records", ())),
         "roundtrip": res["roundtrip"],
         "armature_world_rotation_offset_deg": _recon_stats(
             res["arm_rotation_offset_deg"], labels=frames, label_key="argmax_frame"),
@@ -5772,6 +6371,26 @@ def _bone_rot_build(res, p, ctx, lo, hi, opts):
 
 # --- operators --------------------------------------------------------------
 
+def _kpt_dist_report(ks):
+    """One-line keypoint-distance report: body lengths first, metres in parentheses.
+
+    Body lengths lead because they are the comparable number; the metre value stays visible
+    so that a reader who knows the scene scale can sanity-check it. A run whose L_body was
+    never measurable reports 'n/a BL' rather than a silently absolute number.
+    """
+    mean_bl, max_bl = ks.get("overall_mean_bl"), ks.get("overall_max_bl")
+    if mean_bl is None:
+        head = (f"kpt dist mean n/a BL, max n/a BL (L_body unavailable on every frame; "
+                f"source {ks.get('body_length', {}).get('sources')})")
+    else:
+        head = (f"kpt dist mean {mean_bl:.4f} BL, max {max_bl:.4f} BL @ frame "
+                f"{ks.get('overall_max_bl_frame')} ('{ks.get('overall_max_bl_keypoint')}')")
+    mean_m, max_m = ks.get("overall_mean"), ks.get("overall_max")
+    if mean_m is not None:
+        head += f" [{mean_m:.5f} m / {max_m:.5f} m]"
+    return head
+
+
 class SYNTH_OT_compute_volumetric_iou(Operator):
     """Per-frame volumetric 3D IoU between the GT mesh and its reconstruction"""
     bl_idname = "synth.compute_volumetric_iou"
@@ -5819,102 +6438,25 @@ class SYNTH_OT_compute_volumetric_iou(Operator):
         kpt_path = os.path.join(out_dir,
                                 f"keypoint_distances_{p.collection_name}_{p.object_name}.json")
 
-        data = {
-            "meta": {
-                "schema": VOLUMETRIC_IOU_SCHEMA,
-                "producer": "synthetic_data_generator_ui.py",
-                "method": "monte_carlo_occupancy_bvh_ray_parity",
-                "gt_collection": p.collection_name,
-                "gt_object": src_obj.name,
-                "recon_object": rec_obj.name,
-                "samples_per_frame": n_samples,
-                "random_seed": seed,
-                "ray_direction": [float(_IOU_RAY_DIR.x), float(_IOU_RAY_DIR.y),
-                                  float(_IOU_RAY_DIR.z)],
-                "frame_start": int(lo),
-                "frame_end": int(hi),
-            },
-            "frames": [],
-        }
-        kpt_records, per_kpt, missing = [], defaultdict(list), {}
+        data = {"meta": _iou_meta(p, ctx, lo, hi, n_samples, seed), "frames": []}
 
-        deps = context.evaluated_depsgraph_get()
-        original_frame = scene.frame_current
-        skipped, degenerate_warned = [], False
         try:
-            for frame in range(lo, hi + 1):
-                scene.frame_set(frame)
-                deps.update()
-
-                pay_gt = pay_rc = None
-                try:
-                    rep = self.report if frame == lo else None
-                    pay_gt = _recon_frame_payload(deps, p.collection_name, src_obj,
-                                                  kpt_list, True, rep)
-                    pay_rc = _recon_frame_payload(deps, "Reconstructions", rec_obj,
-                                                  kpt_list, True, rep)
-
-                    if with_kpts:
-                        d = _kpt_frame_distances(pay_gt["kpt_centroids"], pay_rc["kpt_centroids"],
-                                                 kpt_list, missing, self.report)
-                        kpt_records.append(_kpt_record(frame, d))
-                        for k, v in d.items():
-                            per_kpt[k].append((frame, v))
-
-                    if pay_gt["bvh"] is None or pay_rc["bvh"] is None:
-                        if not degenerate_warned:
-                            degenerate_warned = True
-                            self.report({'WARNING'},
-                                        f"Frame {frame}: degenerate mesh (GT faces="
-                                        f"{pay_gt['n_faces']}, recon faces={pay_rc['n_faces']}); "
-                                        f"frame skipped.")
-                        skipped.append(frame)
-                        data["frames"].append({"frame": int(frame), "iou": None,
-                                               "reason": "degenerate_mesh"})
-                        continue
-
-                    res = _iou_frame(pay_gt["bvh"], pay_gt["box"],
-                                     pay_rc["bvh"], pay_rc["box"], n_samples, seed)
-                    if res is None:
-                        if not degenerate_warned:
-                            degenerate_warned = True
-                            self.report({'WARNING'}, f"Frame {frame}: zero-volume occupancy; "
-                                                     f"frame skipped.")
-                        skipped.append(frame)
-                        data["frames"].append({"frame": int(frame), "iou": None,
-                                               "reason": "zero_volume"})
-                        continue
-                    res["frame"] = int(frame)
-                    data["frames"].append(res)
-                finally:
-                    # BVHTrees hold their own geometry copy; drop both payloads every frame so
-                    # nothing accumulates over a several-hundred-frame sequence.
-                    del pay_gt
-                    del pay_rc
+            res_pass = _iou_kpt_eval_pass(context, ctx, kpt_list, True, n_samples, seed,
+                                          self.report)
         except Exception as exc:
             self.report({'ERROR'}, f"Computation failed at frame {scene.frame_current}: {exc}")
             return {'CANCELLED'}
-        finally:
-            scene.frame_set(original_frame)
+        data["frames"] = res_pass["iou_frames"]
+        kpt_records, per_kpt, per_kpt_bl, missing = (
+            res_pass["kpt_records"], res_pass["per_kpt"], res_pass["per_kpt_bl"],
+            res_pass["missing"])
 
-        vals = [f["iou"] for f in data["frames"] if f.get("iou") is not None]
-        if not vals:
+        summary = _iou_summary(data["frames"], res_pass["iou_skipped"],
+                               res_pass["blocked_records"])
+        if summary is None:
             self.report({'ERROR'}, "No frame produced a valid IoU.")
             return {'CANCELLED'}
-        i_min = min(range(len(vals)), key=lambda k: vals[k])
-        i_max = max(range(len(vals)), key=lambda k: vals[k])
-        valid_frames = [f["frame"] for f in data["frames"] if f.get("iou") is not None]
-        data["summary"] = {
-            "n_frames": len(data["frames"]),
-            "n_valid": len(vals),
-            "n_skipped": len(skipped),
-            "skipped_frames": skipped,
-            "mean_iou": float(sum(vals) / len(vals)),
-            "min_iou": float(vals[i_min]),
-            "min_iou_frame": int(valid_frames[i_min]),
-            "max_iou": float(vals[i_max]),
-            "max_iou_frame": int(valid_frames[i_max]),
-        }
+        data["summary"] = summary
 
         try:
             with open(iou_path, 'w') as jf:
@@ -5931,16 +6473,15 @@ class SYNTH_OT_compute_volumetric_iou(Operator):
         level = 'INFO'
         if with_kpts and kpt_records:
             try:
-                ks = _kpt_dist_finalize(kpt_records, per_kpt, missing,
-                                        _kpt_dist_meta(p, ctx, lo, hi), kpt_path)
+                ks = _kpt_dist_finalize(kpt_records, per_kpt, per_kpt_bl, missing,
+                                        _kpt_dist_meta(p, ctx, lo, hi), kpt_path,
+                                        res_pass["blocked_records"])
             except Exception as exc:
                 self.report({'WARNING'}, f"IoU written, but keypoint distances failed: {exc}")
             else:
-                msg += (f"; kpt dist mean {ks.get('overall_mean', float('nan')):.5f} m, "
-                        f"max {ks.get('overall_max', float('nan')):.5f} m @ frame "
-                        f"{ks.get('overall_max_frame')} ('{ks.get('overall_max_keypoint')}')")
-                thr = float(p.kpt_dist_warn_threshold)
-                if thr > 0.0 and ks.get("overall_max", 0.0) > thr:
+                msg += "; " + _kpt_dist_report(ks)
+                thr = float(p.kpt_dist_warn_threshold_bl)
+                if thr > 0.0 and (ks.get("overall_max_bl") or 0.0) > thr:
                     level = 'WARNING'
         self.report({level}, msg + f" -> {out_dir}")
         return {'FINISHED'}
@@ -5988,51 +6529,372 @@ class SYNTH_OT_compute_keypoint_distances(Operator):
                                 f"keypoint_distances_{p.collection_name}_{p.object_name}.json")
 
         lo, hi = ctx["frame_lo"], ctx["frame_hi"]
-        deps = context.evaluated_depsgraph_get()
-        original_frame = scene.frame_current
-        records, per_kpt, missing = [], defaultdict(list), {}
         try:
-            for frame in range(lo, hi + 1):
-                scene.frame_set(frame)
-                deps.update()
-                rep = self.report if frame == lo else None
-                # need_bvh=False: no tree build, no occupancy sampling -- this pass is ~2
-                # to_mesh() calls per frame and nothing else.
-                pay_gt = _recon_frame_payload(deps, p.collection_name, src_obj,
-                                              kpt_list, False, rep)
-                pay_rc = _recon_frame_payload(deps, "Reconstructions", rec_obj,
-                                              kpt_list, False, rep)
-                d = _kpt_frame_distances(pay_gt["kpt_centroids"], pay_rc["kpt_centroids"],
-                                         kpt_list, missing, self.report)
-                records.append(_kpt_record(frame, d))
-                for k, v in d.items():
-                    per_kpt[k].append((frame, v))
+            # need_bvh=False: no tree build, no occupancy sampling -- this pass is ~2
+            # to_mesh() calls per frame and nothing else.
+            res_pass = _iou_kpt_eval_pass(context, ctx, kpt_list, False, 0, 0, self.report)
         except Exception as exc:
             self.report({'ERROR'}, f"Keypoint distances failed at frame "
                                    f"{scene.frame_current}: {exc}")
             return {'CANCELLED'}
-        finally:
-            scene.frame_set(original_frame)
+        records, per_kpt, per_kpt_bl, missing = (
+            res_pass["kpt_records"], res_pass["per_kpt"], res_pass["per_kpt_bl"],
+            res_pass["missing"])
 
         if not per_kpt:
             self.report({'ERROR'}, "No keypoint could be measured on any frame.")
             return {'CANCELLED'}
 
         try:
-            summary = _kpt_dist_finalize(records, per_kpt, missing,
-                                         _kpt_dist_meta(p, ctx, lo, hi), out_path)
+            summary = _kpt_dist_finalize(records, per_kpt, per_kpt_bl, missing,
+                                         _kpt_dist_meta(p, ctx, lo, hi), out_path,
+                                         res_pass["blocked_records"])
         except Exception as exc:
             self.report({'ERROR'}, f"Could not write {out_path}: {exc}")
             return {'CANCELLED'}
 
-        thr = float(p.kpt_dist_warn_threshold)
-        level = 'WARNING' if (thr > 0.0 and summary.get("overall_max", 0.0) > thr) else 'INFO'
+        thr = float(p.kpt_dist_warn_threshold_bl)
+        level = 'WARNING' if (thr > 0.0 and (summary.get("overall_max_bl") or 0.0) > thr) \
+            else 'INFO'
+        bl = summary["body_length"]
+        if bl["n_frames_unavailable"]:
+            self.report({'WARNING'},
+                        f"L_body unmeasurable on {bl['n_frames_unavailable']} of "
+                        f"{summary['n_frames']} frame(s); those frames have no body-length "
+                        f"value. Sources: {bl['sources']}")
         self.report({level},
-                    f"Keypoint dist vs '{rec_obj.name}': mean "
-                    f"{summary['overall_mean']:.5f} m, max {summary['overall_max']:.5f} m "
-                    f"('{summary['overall_max_keypoint']}' @ frame "
-                    f"{summary['overall_max_frame']}) over {summary['n_frames']} frames, "
-                    f"{summary['n_keypoints']} keypoints -> {out_path}")
+                    f"vs '{rec_obj.name}': {_kpt_dist_report(summary)} over "
+                    f"{summary['n_frames']} frames, {summary['n_keypoints']} keypoints, "
+                    f"L_body median {_recon_fmt(bl['median'], ' m')} ({bl['sources']}) "
+                    f"-> {out_path}")
+        return {'FINISHED'}
+
+
+# --- batch: one pts2 file per view combination ------------------------------
+#
+# sweep_view_combinations.py's collect_results() writes, per view combination `leaf`:
+#   <out_root>/metrics_collected/metrics_{leaf}.json   (+ collected_metrics.json)
+#   <out_root>/pts2_collected/pts2_{leaf}.json
+# The metrics files hold the 2D, image-space scores; the 3D scores need Blender, because
+# they need the GT mesh the sweep never sees. This operator closes that gap: point it at
+# pts2_collected/, and it produces <out_root>/collected_3d_metrics.json keyed by exactly the
+# same `leaf` run keys, so analyze_metrics.py's RUN_KEY_PATTERN and grouping apply unchanged.
+
+# Batch output file name; sibling of pts2_collected/, mirroring collected_metrics.json.
+COLLECTED_3D_METRICS_NAME = "collected_3d_metrics.json"
+
+
+def _pts2_run_key(filename):
+    """'pts2_k4__v0-1-2-5__Top_L....json' -> 'k4__v0-1-2-5__Top_L...'.
+
+    collect_results() names the copies 'pts2_{leaf}.json' where leaf == combo_folder_name(),
+    so stripping the prefix and the extension recovers the key collected_metrics.json is
+    keyed by and analyze_metrics.RUN_KEY_PATTERN ('^k(\\d+)__') parses the view count from.
+    Both affixes are stripped defensively: a file that was renamed by hand still yields a
+    usable key rather than an exception.
+    """
+    stem = os.path.basename(filename)
+    if stem.lower().endswith(".json"):
+        stem = stem[:-len(".json")]
+    if stem.startswith("pts2_"):
+        stem = stem[len("pts2_"):]
+    return stem
+
+
+def _recon_collection_object_names():
+    """Names currently in 'Reconstructions', or an empty set if it does not exist yet."""
+    col = bpy.data.collections.get("Reconstructions")
+    return {ob.name for ob in col.objects} if col else set()
+
+
+def _recon_remove_if_orphan(datablocks, block):
+    """Delete `block` from `datablocks` once nothing references it any more.
+
+    A fake user is dropped first: bpy.data.actions.new() leaves use_fake_user set in some
+    Blender builds, which would keep every imported action alive for the whole batch and
+    defeat the point of purging.
+    """
+    if block is None:
+        return
+    try:
+        if getattr(block, "use_fake_user", False):
+            block.use_fake_user = False
+        if block.users == 0:
+            datablocks.remove(block)
+    except (ReferenceError, RuntimeError):
+        pass
+
+
+def _recon_purge_imported(context, before_names):
+    """Remove everything create_animation_from_pose_time_series added to 'Reconstructions'.
+
+    Diffing against a name snapshot taken before the import, rather than deleting the two
+    returned objects, also cleans up after a PARTIAL import: that function links the mesh and
+    the armature before it keyframes them, so an exception thrown half-way through would
+    otherwise leak both objects into the next iteration -- where _iou_find_reconstruction's
+    'highest .NNN suffix wins' rule would happily pick the wreckage.
+
+    Object data is only removed once the objects that used it are gone and its user count has
+    actually dropped to zero, so a mesh or armature shared with the GT (it never is, both are
+    .copy()s, but the check costs nothing) survives.
+    """
+    col = bpy.data.collections.get("Reconstructions")
+    if col is None:
+        return 0
+    victims = [ob for ob in col.objects if ob.name not in before_names]
+    if not victims:
+        return 0
+
+    actions, meshes, armatures = [], [], []
+    for ob in victims:
+        ad = getattr(ob, "animation_data", None)
+        if ad is not None and ad.action is not None:
+            actions.append(ad.action)
+        data = ob.data
+        if isinstance(data, bpy.types.Mesh):
+            meshes.append(data)
+        elif isinstance(data, bpy.types.Armature):
+            armatures.append(data)
+        try:
+            ob.animation_data_clear()      # drops this object's user of the action
+        except Exception:
+            pass
+
+    n = 0
+    for ob in victims:
+        try:
+            bpy.data.objects.remove(ob, do_unlink=True)
+            n += 1
+        except (ReferenceError, RuntimeError):
+            pass
+    for act in actions:
+        _recon_remove_if_orphan(bpy.data.actions, act)
+    for mesh in meshes:
+        _recon_remove_if_orphan(bpy.data.meshes, mesh)
+    for arm in armatures:
+        _recon_remove_if_orphan(bpy.data.armatures, arm)
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    return n
+
+
+def _batch_3d_metrics_one(context, rec_obj, n_samples, seed, with_kpts, report=None):
+    """Score ONE already-imported reconstruction against the GT.
+
+    The batch output keeps the existing per-metric ``{meta, summary, frames}``
+    block structure used by ``collected_3d_metrics.json``. In addition to the
+    volumetric/keypoint pass, MPVE and MPJPE are computed through the shared
+    ``_recon_eval_pass`` so the batch evaluator uses exactly the same metric
+    definitions as the standalone operators.
+    """
+    p = context.scene.synth_props
+    ctx = _recon_pair_context(context, report, rec_obj=rec_obj)
+    lo, hi = int(ctx["frame_lo"]), int(ctx["frame_hi"])
+
+    # ``with_kpts`` controls only the existing IoU-side keypoint-distance block.
+    # MPJPE has its own use of the configured keypoint list and is always included
+    # in the batch output when those keypoints exist.
+    kpt_list = ctx["kpt_list"] if with_kpts else []
+    if kpt_list:
+        # raises on a vertex-count or vertex-group mismatch -> this file is skipped
+        _recon_check_keypoint_correspondence(ctx["src_obj"], ctx["rec_obj"], kpt_list)
+
+    # Existing 3D IoU + optional keypoint-distance batch pass.
+    res_iou = _iou_kpt_eval_pass(context, ctx, kpt_list, True, n_samples, seed, report)
+
+    summary = _iou_summary(res_iou["iou_frames"], res_iou["iou_skipped"],
+                           res_iou["blocked_records"])
+    if summary is None:
+        raise ValueError("no frame produced a valid IoU (degenerate or zero-volume throughout)")
+
+    entry = {
+        "volumetric_iou": {
+            "meta": _iou_meta(p, ctx, lo, hi, n_samples, seed),
+            "summary": summary,
+            "frames": res_iou["iou_frames"],
+        },
+    }
+    if kpt_list and res_iou["per_kpt"]:
+        entry["keypoint_distances"] = {
+            "meta": _kpt_dist_meta(p, ctx, lo, hi),
+            "summary": _kpt_dist_summarize(res_iou["kpt_records"], res_iou["per_kpt"],
+                                           res_iou["per_kpt_bl"], res_iou["missing"],
+                                           res_iou["blocked_records"]),
+            "frames": res_iou["kpt_records"],
+        }
+
+    # ------------------------------------------------------------------
+    # MPVE + MPJPE
+    # ------------------------------------------------------------------
+    # These metrics do not need the SO(3) round-trip precondition. Disable
+    # round-trip loading here even if the corresponding UI property is set,
+    # because the batch feature is deliberately limited to MPVE/MPJPE.
+    metric_want = {"mpve", "mpjpe"}
+    opts = _recon_metric_opts(p, metric_want)
+    opts["roundtrip_json"] = ""
+    opts["roundtrip_required"] = False
+    # No per-vertex NPZ is written by the batch collector. _mpve_build only
+    # records the basename in meta, so keep that reference empty rather than
+    # implying that a sibling NPZ exists.
+    opts["npz_path"] = ""
+
+    # Use the configured keypoint list for MPJPE itself, independently of the
+    # IoU keypoint-distance toggle.
+    mp_ctx = dict(ctx)
+    mp_ctx["kpt_list"] = list(ctx["kpt_list"])
+
+    res_metrics = _recon_eval_pass(context, mp_ctx, metric_want, opts, report)
+
+    mpve_data, _mpve_npz, _mpve_scale = _mpve_build(
+        res_metrics, p, mp_ctx, lo, hi, opts
+    )
+    mpjpe_data = _mpjpe_build(res_metrics, p, mp_ctx, lo, hi, opts)
+
+    # _mpjpe_build stores the raw metric in metres. For the common collector
+    # schema, add the same GT-body-length normalisation used by MPVE so the
+    # analyzer can consume MPJPE as a comparable 3D length metric.
+    body_lengths = {
+        int(frame): length
+        for frame, length in zip(res_metrics["frames"], res_metrics["body_length"])
+    }
+    blocked_by_frame = {
+        int(frame): reason
+        for frame, reason in zip(res_metrics["frames"], res_metrics["blocked"])
+        if reason is not None
+    }
+    for block_name in ("keypoint", "joint"):
+        block = mpjpe_data.get(block_name)
+        if not isinstance(block, dict) or not isinstance(block.get("frames"), list):
+            continue
+        for frame_entry in block["frames"]:
+            frame = int(frame_entry["frame"])
+            l_body = body_lengths.get(frame)
+            frame_entry["body_length"] = _recon_num(l_body)
+            frame_entry["blocked"] = frame in blocked_by_frame
+            frame_entry["reason_blocked"] = blocked_by_frame.get(frame)
+            frame_entry["body_length_normalised"] = {}
+            for term in ("global", "root_relative", "pa"):
+                stats = frame_entry.get(term)
+                mean_m = stats.get("mean") if isinstance(stats, dict) else None
+                frame_entry["body_length_normalised"][term] = _bl_norm(mean_m, l_body)
+
+    entry["mpve"] = mpve_data
+    entry["mpjpe"] = mpjpe_data
+    # The run-level copy of the pipeline's blocked list, carried through unchanged from the
+    # pts2 meta. Run-level because it is a property of the reconstruction, not of any one
+    # metric, so analyze_metrics.py reads it once here instead of picking a block and hoping
+    # it was present -- while each metric block still keeps its own copy and each frame row
+    # its own flag, so no block depends on this one to be interpretable.
+    entry["blocked_frames"] = {
+        "records": [dict(r) for r in (ctx.get("blocked_records") or [])],
+        "stamp_present": bool(ctx.get("blocked_known")),
+        "frame_start": int(lo),
+        "frame_end": int(hi),
+        "policy": ("every frame in [frame_start, frame_end] was measured; these are the ones "
+                   "whose pose the reconstruction pipeline did not obtain by fitting the "
+                   "optimizer to that frame"),
+    }
+    return entry
+
+
+class SYNTH_OT_batch_3d_metrics(Operator):
+    """3D IoU + keypoint distances for every pose time series in a directory"""
+    bl_idname = "synth.batch_3d_metrics"
+    bl_label = "Batch 3D Metrics from PTS2 Dir"
+    bl_description = ("For every pose_time_series/2 JSON in 'PTS2 Batch Dir': rebuild the "
+                      "reconstruction, compute volumetric IoU/keypoint distances plus MPVE/MPJPE "
+                      "with the same metric implementations as the single-run operators, then "
+                      "delete it again. Writes collected_3d_metrics.json one level above the "
+                      "directory, keyed by view combination exactly like collected_metrics.json")
+
+    def execute(self, context):
+        scene = context.scene
+        p = scene.synth_props
+
+        batch_dir = resolve(p.pts2_batch_dir)
+        if not batch_dir or not os.path.isdir(batch_dir):
+            self.report({'ERROR'}, f"'PTS2 Batch Dir' is not a directory: {batch_dir}")
+            return {'CANCELLED'}
+        # sorted() so the run order (and therefore the report) is reproducible
+        files = sorted(glob.glob(os.path.join(batch_dir, "*.json")))
+        if not files:
+            self.report({'ERROR'}, f"No *.json in {batch_dir}")
+            return {'CANCELLED'}
+
+        # sibling of the directory, i.e. <out_root>/collected_3d_metrics.json when batch_dir is
+        # <out_root>/pts2_collected -- next to metrics_collected/collected_metrics.json's root
+        out_path = os.path.normpath(os.path.join(batch_dir, os.pardir,
+                                                 COLLECTED_3D_METRICS_NAME))
+
+        # The GT side is resolved once, before the loop: an unusable target ('Object' not set,
+        # no armature modifier, ...) is a fatal setup error, not a per-file one, and reporting
+        # it once beats repeating it for every file in the directory.
+        try:
+            _pts_find_source(context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Ground truth object unavailable: {exc}")
+            return {'CANCELLED'}
+
+        n_samples, seed = int(p.iou_sample_count), int(p.iou_random_seed)
+        with_kpts = bool(p.iou_with_keypoint_distances)
+        if with_kpts and not _recon_kpt_list(context):
+            with_kpts = False
+            self.report({'WARNING'}, "'Keypoint List' is empty; computing the IoU only.")
+
+        # create_animation_from_pose_time_series moves the scene range to each file's own
+        # range; restore the user's range once the batch is done.
+        saved_range = (int(scene.frame_start), int(scene.frame_end))
+        collected, skipped = {}, []
+
+        for path in files:
+            name = os.path.basename(path)
+            before = _recon_collection_object_names()
+            try:
+                # Cheap gate before the expensive import: a directory of pts2 files may also
+                # hold the sweep's generated configs or a stray metrics copy.
+                with open(path, 'r') as fp:
+                    schema = json.load(fp).get("meta", {}).get("schema")
+                if schema != POSE_TIME_SERIES_SCHEMA:
+                    raise ValueError(f"schema is '{schema}', expected "
+                                     f"'{POSE_TIME_SERIES_SCHEMA}'")
+
+                _new_arm, new_obj = create_animation_from_pose_time_series(
+                    context, path, report=self.report)
+                entry = _batch_3d_metrics_one(context, new_obj, n_samples, seed, with_kpts,
+                                              self.report)
+
+                run_key = _pts2_run_key(name)
+                if run_key in collected:
+                    self.report({'WARNING'}, f"duplicate run key '{run_key}' from '{name}'; "
+                                             f"the later file wins.")
+                collected[run_key] = entry
+            except Exception as exc:
+                # One bad file must not cost the other N-1 runs: report and carry on.
+                import traceback
+                traceback.print_exc()
+                self.report({'WARNING'}, f"Skipped '{name}': {exc}")
+                skipped.append(name)
+            finally:
+                # unconditional: bounded memory across a directory of several hundred files,
+                # and a clean 'Reconstructions' for the next iteration's auto-detection
+                _recon_purge_imported(context, before)
+
+        scene.frame_start, scene.frame_end = saved_range
+
+        try:
+            with open(out_path, 'w') as jf:
+                json.dump(collected, jf, indent=2)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Scored {len(collected)} run(s) but could not write "
+                                   f"{out_path}: {exc}")
+            return {'CANCELLED'}
+
+        level = 'WARNING' if skipped and not collected else 'INFO'
+        self.report({level}, f"Batch 3D metrics: {len(collected)} processed, {len(skipped)} "
+                             f"skipped, of {len(files)} file(s) -> {out_path}")
         return {'FINISHED'}
 
 
@@ -6166,7 +7028,8 @@ def _recon_metrics_execute(op, context, want):
         op.report({'ERROR'}, f"Metrics computed but writing failed: {exc}")
         return {'CANCELLED'}
 
-    cov = _recon_coverage(res["requested"], res["frames"], res["skipped"])
+    cov = _recon_coverage(res["requested"], res["frames"], res["skipped"],
+                                     res.get("blocked_records", ()))
     level = 'INFO'
     if cov["n_skipped"]:
         level = 'WARNING'
@@ -6418,10 +7281,14 @@ class SYNTH_PT_main_panel(Panel):
         row.prop(p, 'iou_random_seed')
         box.prop(p, 'iou_recon_object_name')
         box.prop(p, 'iou_with_keypoint_distances')
-        box.prop(p, 'kpt_dist_warn_threshold')
+        box.prop(p, 'kpt_dist_warn_threshold_bl')
         row = box.row(align=True)
         row.operator('synth.compute_volumetric_iou', icon='MESH_CUBE')
         row.operator('synth.compute_keypoint_distances', icon='EMPTY_AXIS')
+
+        box.prop(p, 'pts2_batch_dir')
+        row = box.row(align=True)
+        row.operator('synth.batch_3d_metrics', icon='FILE_REFRESH')
 
         box.separator()
         box.label(text="MPVE / MPJPE / Bone Rotation")
@@ -6492,6 +7359,7 @@ classes = (
     SYNTH_OT_verify_pose_time_series_roundtrip,
     SYNTH_OT_compute_volumetric_iou,
     SYNTH_OT_compute_keypoint_distances,
+    SYNTH_OT_batch_3d_metrics,
     SYNTH_OT_compute_mpve,
     SYNTH_OT_compute_mpjpe,
     SYNTH_OT_compute_bone_rotation_error,
