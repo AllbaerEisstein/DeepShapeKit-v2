@@ -58,6 +58,7 @@ from matplotlib import font_manager  # noqa: E402
 from matplotlib.axes import Axes  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.markers import MarkerStyle  # noqa: E402
 from matplotlib.ticker import AutoMinorLocator  # noqa: E402
 
 # --------------------------------------------------------------------------
@@ -510,7 +511,7 @@ DISTRIBUTION_BOXES = "boxes"  # one box per colour group instead of the markers
 DEFAULT_PRIMARY_COLOR = "#40E0D0"  # turquoise
 # Debian's fonts-linuxlibertine installs the family as 'Linux Biolinum O'; the
 # bare name is tried first so a differently packaged install also resolves.
-DEFAULT_FONT = "Linux Biolinum,Linux Biolinum O"
+DEFAULT_FONT = "Linux Biolinum O,Linux Biolinum"
 STRIP_RNG_SEED = 0  # thinning of the point strips is reproducible
 
 
@@ -1455,6 +1456,10 @@ def resolve_font(spec: str) -> Optional[str]:
             return font_manager.FontProperties(fname=str(path)).get_name()
         if candidate in installed:
             return candidate
+        candidate_lower = candidate.lower()
+        exact_casefold = next((name for name in installed if name.lower() == candidate_lower), None)
+        if exact_casefold:
+            return exact_casefold
 
     # Not in matplotlib's cache: either a font installed after the cache was
     # built, or a family whose packaged name carries a suffix, as Debian's
@@ -1501,6 +1506,12 @@ class Style:
     dynamic_y_axis: bool = False
     value_labels: bool = True
     captions: bool = True
+    monochrome: bool = False
+    box_line_width: float = 1.2
+    mean_marker: str = "x"
+    format_pixels: Optional[Tuple[int, int]] = None
+    scientific: bool = False
+    metric_is_3d: bool = False
     _palettes: Dict[str, List[RGB]] = field(default_factory=dict)
 
     def apply(self) -> None:
@@ -1523,12 +1534,20 @@ class Style:
                 "legend.title_fontsize": 7.5,
                 "axes.spines.top": False,
                 "axes.spines.right": False,
+                "axes.edgecolor": "#777777",
+                "axes.labelcolor": "black",
+                "font.style": "normal",
+                "font.weight": "normal",
                 "axes.linewidth": 0.8,
                 "axes.axisbelow": True,
                 "axes.titlelocation": "left",
                 "axes.titlepad": 7.0,
                 "xtick.direction": "out",
                 "ytick.direction": "out",
+                "xtick.color": "#777777",
+                "ytick.color": "#777777",
+                "xtick.labelcolor": "black",
+                "ytick.labelcolor": "black",
                 "xtick.major.width": 0.8,
                 "ytick.major.width": 0.8,
                 "xtick.major.size": 3.0,
@@ -1544,6 +1563,31 @@ class Style:
                 "lines.markersize": 4.0,
             }
         )
+        if self.scientific:
+            plt.rcParams.update(
+                {
+                    "font.size": 7.5,
+                    "axes.titlesize": 8.0,
+                    "axes.labelsize": 7.5,
+                    "xtick.labelsize": 6.5,
+                    "ytick.labelsize": 6.5,
+                    "legend.fontsize": 6.5,
+                    "legend.title_fontsize": 7.0,
+                    "axes.linewidth": 0.7,
+                    "xtick.major.width": 0.7,
+                    "ytick.major.width": 0.7,
+                    "xtick.major.size": 2.5,
+                    "ytick.major.size": 2.5,
+                    "grid.linewidth": 0.35,
+                    "grid.alpha": 0.18,
+                    "figure.facecolor": "white",
+                    "axes.facecolor": "white",
+                    "savefig.facecolor": "white",
+                    "pdf.fonttype": 42,
+                    "ps.fonttype": 42,
+                    "svg.fonttype": "none",
+                }
+            )
         if self.font_family:
             plt.rcParams["font.family"] = [self.font_family]
 
@@ -1551,9 +1595,19 @@ class Style:
         """Cached palette; `kind` is 'n_views' (ordinal) or 'view' (nominal)."""
         key = f"{kind}:{n}"
         if key not in self._palettes:
-            builder = sequential_palette if kind == "n_views" else categorical_palette
-            self._palettes[key] = builder(self.primary, n)
+            if self.monochrome:
+                self._palettes[key] = [self.primary] * n
+            else:
+                builder = sequential_palette if kind == "n_views" else categorical_palette
+                self._palettes[key] = builder(self.primary, n)
         return self._palettes[key]
+
+    def figure_size(self, default: Tuple[float, float]) -> Tuple[float, float]:
+        """Return figure size in inches; --format, when set, is width/height in pixels."""
+        if self.format_pixels is None:
+            return default
+        width_px, height_px = self.format_pixels
+        return width_px / self.dpi, height_px / self.dpi
 
 
 # --------------------------------------------------------------------------
@@ -1591,6 +1645,7 @@ def _axis_cosmetics(ax: AxesLike, ylabel: str, xlabel: str = "") -> None:
         ax.set_xlabel(xlabel)
     for panel in _panels_of(ax):
         panel.yaxis.set_minor_locator(AutoMinorLocator(2))
+        panel.tick_params(axis="both", which="both", colors="#777777", labelcolor="black")
         panel.grid(axis="y", which="major")
 
 
@@ -1636,7 +1691,11 @@ def _save(
     """
     ax.set_title(title)
     if not style.captions:
-        fig.savefig(out_path, format=style.fmt)
+        fig.savefig(
+            out_path,
+            format=style.fmt,
+            bbox_inches=None if style.format_pixels is not None else "tight",
+        )
         plt.close(fig)
         return
     fig.canvas.draw()
@@ -1655,7 +1714,11 @@ def _save(
         color="#3A3A3A",
         linespacing=1.35,
     )
-    fig.savefig(out_path, format=style.fmt)
+    fig.savefig(
+        out_path,
+        format=style.fmt,
+        bbox_inches=None if style.format_pixels is not None else "tight",
+    )
     plt.close(fig)
 
 
@@ -1749,15 +1812,17 @@ def _draw_boxes(
     positions: Sequence[float],
     datasets: Sequence[Sequence[float]],
     color: RGB,
+    style: Style,
     width: float = BOX_WIDTH,
 ) -> None:
     """
-    Box = interquartile range, line = median, whiskers = 1.5 x IQR, diamond =
-    mean. Fliers are suppressed because every raw point is drawn beside the box.
+    Box = interquartile range, line = median, whiskers = 1.5 x IQR, x = mean.
+    Fliers are suppressed because every raw point is drawn beside the box.
     """
     keep = [(p, list(d)) for p, d in zip(positions, datasets) if len(d) > 0]
     if not keep:
         return
+    fill_color = tint(color, 0.22) if style.metric_is_3d else color
     ax.boxplot(
         [d for _p, d in keep],
         positions=[p for p, _d in keep],
@@ -1767,16 +1832,16 @@ def _draw_boxes(
         patch_artist=True,
         showmeans=True,
         manage_ticks=False,
-        boxprops={"facecolor": tint(color, 0.80), "edgecolor": color, "linewidth": 0.9},
-        whiskerprops={"color": color, "linewidth": 0.9},
-        capprops={"color": color, "linewidth": 0.9},
-        medianprops={"color": "black", "linewidth": 1.3},
+        boxprops={"facecolor": fill_color, "edgecolor": "black", "linewidth": style.box_line_width},
+        whiskerprops={"color": "black", "linewidth": style.box_line_width},
+        capprops={"color": "black", "linewidth": style.box_line_width},
+        medianprops={"color": "black", "linewidth": style.box_line_width},
         meanprops={
-            "marker": "D",
-            "markersize": 3.0,
-            "markerfacecolor": "white",
+            "marker": style.mean_marker,
+            "markersize": 4.5,
+            "markerfacecolor": "black",
             "markeredgecolor": "black",
-            "markeredgewidth": 0.6,
+            "markeredgewidth": style.box_line_width,
         },
         zorder=3,
     )
@@ -1836,7 +1901,7 @@ def _draw_group_boxes(
         if not shown:
             continue
         centre = position + offset + (index - (n_groups - 1) / 2.0) * sub_width
-        _draw_boxes(ax, [centre], [shown], color, width=sub_width * 0.68)
+        _draw_boxes(ax, [centre], [shown], color, style, width=sub_width * 0.68)
     return total, total
 
 
@@ -1867,14 +1932,21 @@ def _draw_distribution(
 # these metrics are read as body-length ratios, a log axis distorts exactly that
 # reading, and an error of 0 is a legitimate value it cannot place at all.
 #
-# The break is proposed only when the groups really do fall into two clusters, so
-# a figure never silently gains an axis break because one whisker was long. It is
-# taken on the extent as DRAWN (whisker caps, --drop-fliers already applied), for
-# the same reason the annotations are anchored there: what is crushed is what is
-# on the page, not what is in the summary.
+# The break is proposed from the extent as DRAWN (whisker caps, --drop-fliers
+# already applied), for the same reason the annotations are anchored there: what
+# is crushed is what is on the page, not what is in the summary.
+#
+# There are two complementary split heuristics:
+#   1. A genuine empty gap between the whisker spans of groups.
+#   2. A dominant group whose upper quartile is substantially above all other
+#      groups. This catches the common MPJPE case where one box has a much wider
+#      distribution and therefore overlaps the rest with its whisker, so the old
+#      gap-only test could never fire.
 
 DYNAMIC_Y_MIN_GAP_SHARE = 0.30  # empty band, as a share of the full drawn range
 DYNAMIC_Y_MAX_BULK_SHARE = 0.45  # what the crushed cluster may occupy, same unit
+DYNAMIC_Y_DOMINANT_Q3_RATIO = 2.0  # dominant Q3 must be >= this x the next-highest Q3
+DYNAMIC_Y_DOMINANT_Q1_RATIO = 2.0  # dominant low Q1 must be <= 1/this x the next-lowest Q1
 DYNAMIC_Y_PAD_SHARE = 0.10  # slack around a panel, as a share of that panel's range
 DYNAMIC_Y_MIN_PAD_SHARE = 0.005  # floor under that slack, as a share of the whole range
 DYNAMIC_Y_HEIGHT_RATIOS = (1.0, 2.0)  # upper (the outlier) : lower (the rest)
@@ -1949,10 +2021,83 @@ def detect_y_split(
             continue
         if best is None or gap > best[0]:
             best = (gap, bulk_top, cut)
-    if best is None:
+    if best is not None:
+        _gap, bulk_top, outlier_floor = best
+        return YSplit(_padded(low, bulk_top, total), _padded(outlier_floor, high, total))
+
+    # Fallback: one dominant/wide group can be visually isolated even when its
+    # whisker overlaps the rest. Detect that from the boxes' Q3 values instead of
+    # demanding a literal empty whisker-to-whisker interval.
+    quartiles = []
+    for values in datasets:
+        finite = _finite(values)
+        if len(finite) < 2:
+            continue
+        q1, _median, q3 = quantiles(finite, n=4, method="inclusive")
+        span = _whisker_span(finite)
+        if span is not None and math.isfinite(q3):
+            quartiles.append((q1, q3, span[0], span[1]))
+
+    if len(quartiles) < 2:
         return None
-    _gap, bulk_top, outlier_floor = best
-    return YSplit(_padded(low, bulk_top, total), _padded(outlier_floor, high, total))
+
+    # Upper-side fallback: one group is much higher/wider than the others.
+    dominant_index = max(range(len(quartiles)), key=lambda i: quartiles[i][1])
+    dominant_q3 = quartiles[dominant_index][1]
+    other = [q for i, q in enumerate(quartiles) if i != dominant_index]
+    other_max_q3 = max(q[1] for q in other)
+    other_max_whisker = max(q[3] for q in other)
+
+    if other_max_q3 <= 0.0:
+        dominant_ratio = float("inf") if dominant_q3 > 0.0 else 1.0
+    else:
+        dominant_ratio = dominant_q3 / other_max_q3
+
+    # The break is placed above the entire non-dominant cluster and below the
+    # dominant box's Q3. The dominant box can therefore span the break, which is
+    # already handled by SplitAxes._mark_spanning().
+    if (
+        dominant_q3 > other_max_whisker
+        and dominant_ratio >= DYNAMIC_Y_DOMINANT_Q3_RATIO
+    ):
+        bulk_top = other_max_whisker
+        outlier_floor = dominant_q3
+        if outlier_floor > bulk_top:
+            return YSplit(
+                _padded(low, bulk_top, total),
+                _padded(outlier_floor, high, total),
+            )
+
+    # Lower-side mirror: one group is much lower/wider than the others.
+    # For non-negative metrics (the normal case here), this is the direct mirror
+    # of the Q3 test above: its Q1 must be at most 1/R times the smallest Q1 of
+    # the other groups, and its lower whisker must extend below the whole cluster.
+    dominant_low_index = min(range(len(quartiles)), key=lambda i: quartiles[i][0])
+    dominant_q1 = quartiles[dominant_low_index][0]
+    other_low = [q for i, q in enumerate(quartiles) if i != dominant_low_index]
+    other_min_q1 = min(q[0] for q in other_low)
+    other_min_whisker = min(q[2] for q in other_low)
+
+    if other_min_q1 > 0.0:
+        low_ratio = other_min_q1 / dominant_q1 if dominant_q1 > 0.0 else float("inf")
+    else:
+        low_ratio = float("inf") if dominant_q1 < other_min_q1 else 1.0
+
+    # The lower panel contains the exceptional group's lower tail. The upper
+    # panel contains the rest; the exceptional box may span the break.
+    if (
+        dominant_q1 < other_min_whisker
+        and low_ratio >= DYNAMIC_Y_DOMINANT_Q1_RATIO
+    ):
+        outlier_ceiling = other_min_whisker
+        bulk_bottom = dominant_q1
+        if outlier_ceiling > bulk_bottom:
+            return YSplit(
+                _padded(low, bulk_bottom, total),
+                _padded(outlier_ceiling, high, total),
+            )
+
+    return None
 
 
 def _draw_axis_break(top: Axes, bottom: Axes) -> None:
@@ -2082,7 +2227,9 @@ class SplitAxes:
             _mark_spanning_box(self.bottom, position, width, at_top=True)
 
 
-def _make_axes(figsize: Tuple[float, float], split: Optional[YSplit]) -> Tuple[Figure, SplitAxes]:
+def _make_axes(
+    figsize: Tuple[float, float], split: Optional[YSplit], exact_size: bool = False
+) -> Tuple[Figure, SplitAxes]:
     """
     The figure and its drawing surface: one Axes, or the two panels of a broken y
     axis with the outlier range on top, their limits set and the cuts drawn.
@@ -2094,7 +2241,7 @@ def _make_axes(figsize: Tuple[float, float], split: Optional[YSplit]) -> Tuple[F
     fig, (top, bottom) = plt.subplots(
         2, 1,
         sharex=True,
-        figsize=(figsize[0], figsize[1] * DYNAMIC_Y_FIGURE_SCALE),
+        figsize=(figsize[0], figsize[1] if exact_size else figsize[1] * DYNAMIC_Y_FIGURE_SCALE),
         gridspec_kw={
             "height_ratios": list(DYNAMIC_Y_HEIGHT_RATIOS),
             "hspace": DYNAMIC_Y_HSPACE,
@@ -2121,7 +2268,7 @@ def _distribution_legend(
             marker="s" if boxes else "o",
             linestyle="none",
             markersize=4.0 if boxes else 3.5,
-            markerfacecolor=tint(color, 0.80) if boxes else color,
+            markerfacecolor=color,
             markeredgecolor=color,
             color=color,
             label=label,
@@ -2129,9 +2276,9 @@ def _distribution_legend(
         for label, color in zip(labels, colors)
     ]
     handles += [
-        Line2D([], [], color="black", linewidth=1.3, label="median"),
-        Line2D([], [], marker="D", linestyle="none", markersize=3.0, markerfacecolor="white",
-               markeredgecolor="black", label="mean"),
+        Line2D([], [], color="black", linewidth=style.box_line_width, label="median"),
+        Line2D([], [], marker=style.mean_marker, linestyle="none", markersize=4.5,
+               markeredgewidth=style.box_line_width, color="black", label="mean"),
     ]
     ax.legend(handles=handles, title=title, loc="upper left", bbox_to_anchor=(1.01, 1.0))
 
@@ -2150,12 +2297,12 @@ def fig_bar_per_view(table, spec, block, style, rng) -> FigureResult:
     stats = block[GROUPING_PER_VIEW]
     positions = list(range(len(views)))
 
-    fig, ax = plt.subplots(figsize=(_figure_width(len(views), 1.10, 4.8), 3.5))
+    fig, ax = plt.subplots(figsize=style.figure_size((_figure_width(len(views), 1.10, 4.8), 3.5)))
     ax.bar(
         positions,
         [stats[v]["mean"] for v in views],
         width=0.62,
-        facecolor=tint(style.primary, 0.55),
+        facecolor=style.primary,
         edgecolor=style.primary,
         linewidth=0.9,
         label="mean",
@@ -2182,7 +2329,7 @@ def fig_bar_per_view_by_n_views(table, spec, block, style, rng) -> FigureResult:
     colors = style.palette("n_views", len(n_values))
     width = 0.78 / max(len(n_values), 1)
 
-    fig, ax = plt.subplots(figsize=(_figure_width(len(views), 1.45, 5.6), 3.6))
+    fig, ax = plt.subplots(figsize=style.figure_size((_figure_width(len(views), 1.45, 5.6), 3.6)))
     for index, (k, color) in enumerate(zip(n_values, colors)):
         offset = -0.39 + width * (index + 0.5)
         positions = [x + offset for x in range(len(views))]
@@ -2190,7 +2337,7 @@ def fig_bar_per_view_by_n_views(table, spec, block, style, rng) -> FigureResult:
         ax.bar(
             positions,
             [s["mean"] if s else float("nan") for s in cell_stats],
-            width=width, facecolor=tint(color, 0.35), edgecolor=color, linewidth=0.7,
+            width=width, facecolor=color, edgecolor=color, linewidth=0.7,
             label=str(k), zorder=2,
         )
         ax.scatter(
@@ -2219,10 +2366,11 @@ def fig_line_vs_n_views(table, spec, block, style, rng) -> FigureResult:
     means = [stats[str(k)]["mean"] for k in n_values]
     medians = [stats[str(k)]["median"] for k in n_values]
 
-    fig, ax = plt.subplots(figsize=(4.8, 3.5))
+    fig, ax = plt.subplots(figsize=style.figure_size((4.8, 3.5)))
     ax.plot(n_values, means, marker="o", color=style.primary, label="mean")
+    median_color = style.primary if style.monochrome else _with_lightness(style.primary, 0.28)
     ax.plot(n_values, medians, marker="s", markerfacecolor="white", linestyle="--",
-            color=_with_lightness(style.primary, 0.28), label="median")
+            color=median_color, label="median")
     if style.value_labels:
         # Means above their marker, medians below, so the two never collide.
         for series, offset, valign in ((means, 5, "bottom"), (medians, -6, "top")):
@@ -2253,11 +2401,14 @@ def fig_box_per_view(table, spec, block, style, rng) -> FigureResult:
         spanning=list(summaries.values()),
     )
 
-    fig, ax = _make_axes((_figure_width(len(views), 1.30, 5.2), 3.8), split)
+    fig, ax = _make_axes(
+        style.figure_size((_figure_width(len(views), 1.30, 5.2), 3.8)), split,
+        exact_size=style.format_pixels is not None,
+    )
     drawn = total = 0
     for position, view in enumerate(views):
         shown = summaries[view]
-        _draw_boxes(ax, [position], [shown], style.primary)
+        _draw_boxes(ax, [position], [shown], style.primary, style)
         groups = [(k, cells[(view, k)]) for k in n_values]
         d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
@@ -2285,7 +2436,10 @@ def fig_box_per_view_and_n_views(table, spec, block, style, rng) -> FigureResult
     )
 
     width = _figure_width(len(views) * max(len(n_values), 1), 0.48, 5.6)
-    fig, ax = _make_axes((width, max(3.8, min(width * 0.36, 5.4))), split)
+    fig, ax = _make_axes(
+        style.figure_size((width, max(3.8, min(width * 0.36, 5.4)))), split,
+        exact_size=style.format_pixels is not None,
+    )
     # In box mode the cell box already is the group box, so the band beside it
     # would only duplicate it: the cell boxes are then simply centred.
     as_boxes = style.distribution_style == DISTRIBUTION_BOXES
@@ -2298,7 +2452,7 @@ def fig_box_per_view_and_n_views(table, spec, block, style, rng) -> FigureResult
                 continue
             position = view_index - span / 2 + step * (k_index + 0.5)
             box_position = position if as_boxes else position - step * 0.20
-            _draw_boxes(ax, [box_position], [shown], color, width=step * 0.34)
+            _draw_boxes(ax, [box_position], [shown], color, style, width=step * 0.34)
             if not as_boxes:
                 d, t = _draw_strip(
                     ax, position, [(k, values)], [color], rng, style,
@@ -2335,11 +2489,14 @@ def fig_box_vs_n_views(table, spec, block, style, rng) -> FigureResult:
         spanning=list(summaries.values()),
     )
 
-    fig, ax = _make_axes((_figure_width(len(n_values), 1.2, 4.6), 3.8), split)
+    fig, ax = _make_axes(
+        style.figure_size((_figure_width(len(n_values), 1.2, 4.6), 3.8)), split,
+        exact_size=style.format_pixels is not None,
+    )
     drawn = total = 0
     for position, k in enumerate(n_values):
         shown = summaries[k]
-        _draw_boxes(ax, [position], [shown], style.primary)
+        _draw_boxes(ax, [position], [shown], style.primary, style)
         groups = [(view, cells[(view, k)]) for view in views]
         d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
@@ -2374,8 +2531,10 @@ def _fig_box_overall(table, spec, block, style, rng, colour_by: str) -> FigureRe
         [_for_display(values, style) for _key, values in groups], style, spanning=[shown]
     )
 
-    fig, ax = _make_axes((3.6, 3.6), split)
-    _draw_boxes(ax, [0.0], [shown], style.primary, width=0.26)
+    fig, ax = _make_axes(
+        style.figure_size((3.6, 3.6)), split, exact_size=style.format_pixels is not None
+    )
+    _draw_boxes(ax, [0.0], [shown], style.primary, style, width=0.26)
     drawn, total = _draw_distribution(ax, 0.0, groups, colors, rng, style)
     _annotate_stats(ax, 0.0, _whisker_top(shown), block[GROUPING_OVERALL], style)
     ax.set_xticks([0.14])
@@ -2410,22 +2569,25 @@ def _fig_box_per_group(
         group_stats = [stats[str(k)] for k in keys]
         tick_labels = [f"{k}\nn = {stats[str(k)]['n_samples']}" for k in keys]
         xlabel = "number of views in the reconstruction"
-        figsize = (_figure_width(len(keys), 1.2, 4.6), 3.8)
+        figsize = (_figure_width(len(keys), 0.58, 3.8), 3.8)
     else:
         stats = block[GROUPING_PER_VIEW]
         group_stats = [stats[view] for view in keys]
         tick_labels = [_view_label(view, stats[view]["n_samples"]) for view in keys]
         xlabel = "view"
-        figsize = (_figure_width(len(keys), 1.30, 5.2), 3.8)
+        figsize = (_figure_width(len(keys), 0.68, 4.2), 3.8)
 
     drawable = [_for_display(values, style) for _key, values in groups]
     split = detect_y_split(drawable, style)
 
-    fig, ax = _make_axes(figsize, split)
+    fig, ax = _make_axes(
+        style.figure_size(figsize), split, exact_size=style.format_pixels is not None
+    )
     for position, (shown, color, cell_stats) in enumerate(zip(drawable, colors, group_stats)):
         if not shown:
             continue
-        _draw_boxes(ax, [position], [shown], color)
+        box_width = 0.68 if colour_by == "n_views" else 0.72
+        _draw_boxes(ax, [position], [shown], color, style, width=box_width)
         _annotate_stats(ax, position, _whisker_top(shown), cell_stats, style)
     ax.set_xticks(list(range(len(keys))))
     ax.set_xticklabels(tick_labels)
@@ -2700,6 +2862,18 @@ def _caption(
     return "\n".join(parts)
 
 
+def _metric_is_3d(metric: str) -> bool:
+    """Whether a metric belongs to the world-space 3D metric block."""
+    return metric.startswith((
+        "IoU_3d_",
+        "keypoint_distance_3d",
+        "body_length_3d",
+        "volume_ratio_3d",
+        "MPVE_3d_",
+        "MPJPE_3d_",
+    ))
+
+
 def plot_measure(
     cells: CellTable,
     metric: str,
@@ -2739,6 +2913,7 @@ def plot_measure(
         resolved = kind.resolve(style)
         path = _plot_path(plots_dir, stem, resolved["filename_kind"], style)
         title = f"{subject}: {kind.title}"
+        style.metric_is_3d = _metric_is_3d(metric)
         fig, ax, n_groups, drawn, total = kind.builder(table, spec, block, style, rng)
         caption = _caption(
             spec, resolved["what"], drawn, total, style, kind.draws_distribution
@@ -2908,6 +3083,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--monochrome",
+        action="store_true",
+        help="Use one colour for all colour-coded groups, using --primary-color for that colour.",
+    )
+    parser.add_argument(
+        "--scientific",
+        action="store_true",
+        help=(
+            "Use a compact publication-oriented figure style: smaller typography, reduced visual "
+            "clutter, subtle grids, white backgrounds, and editable TrueType/vector text."
+        ),
+    )
+    parser.add_argument(
+        "--box-line-width",
+        type=float,
+        default=1.2,
+        metavar="POINTS",
+        help="Line width of box, whisker, cap, median and mean-cross strokes, in points. Default: 1.2.",
+    )
+    parser.add_argument(
+        "--mean-marker",
+        default="x",
+        metavar="MARKER",
+        help="Matplotlib marker used for the mean indicator. Default: 'x'.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="format_pixels",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        help="Exact output figure width and height in pixels. When set, every plot uses this size; --dpi determines the corresponding physical size.",
+    )
+    parser.add_argument(
         "--font",
         default=DEFAULT_FONT,
         metavar="FONT",
@@ -3007,6 +3216,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Validated before any work is done, so a typo fails immediately rather than
     # after the aggregation has already been written.
     primary = parse_color(args.primary_color)
+    if not math.isfinite(args.box_line_width) or args.box_line_width <= 0.0:
+        raise SystemExit("--box-line-width must be a finite value greater than 0.")
+    try:
+        MarkerStyle(args.mean_marker)
+    except (ValueError, TypeError):
+        raise SystemExit(f"--mean-marker: invalid matplotlib marker {args.mean_marker!r}.")
+    if args.format_pixels is not None and any(v <= 0 for v in args.format_pixels):
+        raise SystemExit("--format WIDTH HEIGHT must use positive pixel dimensions.")
 
     log(f"Collected metrics : {collected_path}")
     log(f"Output directory  : {out_dir}")
@@ -3083,6 +3300,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         dynamic_y_axis=args.dynamic_y_axis,
         value_labels=not args.no_value_labels,
         captions=not args.no_captions,
+        monochrome=args.monochrome,
+        box_line_width=args.box_line_width,
+        mean_marker=args.mean_marker,
+        format_pixels=tuple(args.format_pixels) if args.format_pixels is not None else None,
     )
     style.apply()
     log(f"Figure font       : {style.font_family or plt.rcParams['font.family']}")
