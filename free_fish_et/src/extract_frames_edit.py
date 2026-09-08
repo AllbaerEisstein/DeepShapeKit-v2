@@ -377,51 +377,61 @@ def polygon_to_binary_mask(polygon, image_size, mode='1', fill=1, background=0) 
     return np.array(mask_img, dtype=np.uint8)
 
 
+# CLAUDE FIX: crop_and_pad and save_crops used to be defined inside predict_masks_yolo, which
+# made them unreachable for any other producer of the same schema -- the AnyLabeling import path
+# would have had to duplicate them, and a duplicate is a copy that drifts. They are lifted to
+# module level unchanged (same padding rule, same filenames, same 0/255 scaling) and
+# predict_masks_yolo now calls these, so every writer of cropped/, mask/ and mask_full/ goes
+# through one implementation.
+def crop_and_pad(image: np.ndarray, mask: np.ndarray, bbox: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """Crop image and mask to bbox and zero-pad the short side to make the crop square."""
+    xmin, ymin, xmax, ymax = bbox
+    crop_img = image[ymin:ymax, xmin:xmax]
+    crop_mask = mask[ymin:ymax, xmin:xmax]
+
+    h, w = crop_img.shape[:2]
+    diff = abs(h - w)
+
+    if h < w:
+        pad_top = diff // 2
+        pad_bottom = diff - pad_top
+        crop_img = np.pad(crop_img, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode='constant', constant_values=0)
+        crop_mask = np.pad(crop_mask, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=0)
+    elif w < h:
+        pad_left = diff // 2
+        pad_right = diff - pad_left
+        crop_img = np.pad(crop_img, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
+        crop_mask = np.pad(crop_mask, ((0, 0), (pad_left, pad_right)), mode='constant', constant_values=0)
+
+    return crop_img, crop_mask
+
+
+def save_crops(
+    dataset_path: Path,
+    folder: str,
+    frame_counter: int,
+    det_idx: int,
+    cropped_img: np.ndarray,
+    cropped_mask: np.ndarray,
+    full_mask_np: np.ndarray,
+) -> None:
+    """Write the cropped image, the tight mask crop and the full-frame mask for one instance."""
+    base = dataset_path / folder
+
+    crop_path = os.path.join(base, 'cropped', f'image_{frame_counter}_{det_idx}.png')
+    Image.fromarray(cropped_img.astype(np.uint8)).save(crop_path)
+
+    mask_path = os.path.join(base, 'mask', f'image_{frame_counter}_{det_idx}_mask.png')
+    Image.fromarray((cropped_mask * 255).astype(np.uint8)).save(mask_path)
+
+    full_mask = (full_mask_np * 255).astype(np.uint8)
+    full_mask_path = os.path.join(base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask_full.png')
+    Image.fromarray(full_mask).save(full_mask_path)
+
+
 # TODO: Instance tracking across views
 def predict_masks_yolo(dataset_path: Path, model_path: Path, conf_threshold=0.8, frame_indices=None):
     """Infer segmentation masks for extracted frames and write files_crop.csv per view."""
-
-    def crop_and_pad(image: np.ndarray, mask: np.ndarray, bbox: list[int]) -> tuple[np.ndarray, np.ndarray]:
-        xmin, ymin, xmax, ymax = bbox
-        crop_img = image[ymin:ymax, xmin:xmax]
-        crop_mask = mask[ymin:ymax, xmin:xmax]
-
-        h, w = crop_img.shape[:2]
-        diff = abs(h - w)
-
-        if h < w:
-            pad_top = diff // 2
-            pad_bottom = diff - pad_top
-            crop_img = np.pad(crop_img, ((pad_top, pad_bottom), (0, 0), (0, 0)), mode='constant', constant_values=0)
-            crop_mask = np.pad(crop_mask, ((pad_top, pad_bottom), (0, 0)), mode='constant', constant_values=0)
-        elif w < h:
-            pad_left = diff // 2
-            pad_right = diff - pad_left
-            crop_img = np.pad(crop_img, ((0, 0), (pad_left, pad_right), (0, 0)), mode='constant', constant_values=0)
-            crop_mask = np.pad(crop_mask, ((0, 0), (pad_left, pad_right)), mode='constant', constant_values=0)
-
-        return crop_img, crop_mask
-
-    def save_crops(
-        dataset_path: Path,
-        folder: str,
-        frame_counter: int,
-        det_idx: int,
-        cropped_img: np.ndarray,
-        cropped_mask: np.ndarray,
-        full_mask_np: np.ndarray,
-    ) -> None:
-        base = dataset_path / folder
-
-        crop_path = os.path.join(base, 'cropped', f'image_{frame_counter}_{det_idx}.png')
-        Image.fromarray(cropped_img.astype(np.uint8)).save(crop_path)
-
-        mask_path = os.path.join(base, 'mask', f'image_{frame_counter}_{det_idx}_mask.png')
-        Image.fromarray((cropped_mask * 255).astype(np.uint8)).save(mask_path)
-
-        full_mask = (full_mask_np * 255).astype(np.uint8)
-        full_mask_path = os.path.join(base, 'mask_full', f'image_{frame_counter}_{det_idx}_mask_full.png')
-        Image.fromarray(full_mask).save(full_mask_path)
 
     def run_infer_mask(
         model,
@@ -614,6 +624,20 @@ def draw_kpts_on_img(kpt2xyc: Dict[str, list], img_path: Path, out_path: Path, t
     cv2.imwrite(filename=str(out_path), img=img)
 
 
+# CLAUDE FIX: the two keypoint sentinels are the contract between every producer of
+# keypoints_confs.pickle and the loss/masking logic that reads it ("instance missing" is not the
+# same as "keypoint missing"). They were local closures of detect_keypoints_yolo, so a second
+# producer could only restate them; lifted here so there is one definition to point at.
+def make_zero_kpt_dict(kpt_names: List[str]) -> dict[str, list[float]]:
+    """Instance is present but this keypoint was not localized -> conf 0."""
+    return {kpt_name: [0.0, 0.0, 0.0] for kpt_name in kpt_names}
+
+
+def make_no_instance_detected_kpt_dict(kpt_names: List[str]) -> dict[str, list[float]]:
+    """No instance at all in this frame -> conf -1 for every keypoint."""
+    return {kpt_name: [-1.0, -1.0, -1.0] for kpt_name in kpt_names}
+
+
 def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: dict[int, str], frame_indices=None):
     """Infer keypoints for bbox-masked crops and store per-frame keypoint dictionaries."""
 
@@ -625,10 +649,10 @@ def detect_keypoints_yolo(dataset_path: Path, model_path: Path, kpt_names_dict: 
     ordered_kpt_names = [kpt_names_dict[i] for i in sorted(kpt_names_dict.keys())]
 
     def make_zero_dict() -> dict[str, list[float]]:
-        return {kpt_name: [0.0, 0.0, 0.0] for kpt_name in ordered_kpt_names}
+        return make_zero_kpt_dict(ordered_kpt_names)
 
     def make_no_instance_detected_dict() -> dict[str, list[float]]:
-        return {kpt_name: [-1.0, -1.0, -1.0] for kpt_name in ordered_kpt_names}
+        return make_no_instance_detected_kpt_dict(ordered_kpt_names)
 
     views = index_json['frame_folders']
 

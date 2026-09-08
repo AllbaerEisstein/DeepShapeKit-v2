@@ -25,6 +25,7 @@ from src.extract_frames_edit import (
     extract_from_video,
     predict_masks_yolo,
 )
+from src.import_anylabeling import import_gt_from_anylabeling
 from src.multiview_reconstruction_edit import (
     reconstruct,
     render_pose_time_series,
@@ -84,6 +85,27 @@ class PipelineConfig:
     # When true, skip extract/masks/keypoints entirely and drive the fit from the GT dataset's
     # own masks and keypoints, i.e. measure the fitter in isolation from detector error.
     reconstruct_from_gt: bool = False
+    # CLAUDE FIX: "import_gt_from_anylabeling" -- where the hand-made AnyLabeling
+    # (labelme-schema) annotation JSONs live. Leave unset for the normal workflow, where the
+    # extracted frames were annotated in place and each JSON sits in <dataset>/<view>/origin/
+    # next to the PNG of the same basename; set it only when the annotations were kept
+    # somewhere else. Consumed by run_anylabeling_import(), which writes masks/keypoints into
+    # this run's dataset folder from these annotations instead of running the segmentation/pose
+    # networks. Deliberately not a pipeline step: it replaces predict_masks_yolo and
+    # detect_keypoints_yolo rather than joining them in the sequence. Independent of
+    # reconstruct_from_gt/ground_truth_dataset, which consume an already-complete dataset
+    # rather than build one.
+    anylabeling_root: Optional[str] = None
+    # Only rasterize polygons carrying these labels (comma-separated, e.g. "fish"). Empty means
+    # accept every polygon label.
+    anylabeling_mask_labels: Optional[str] = None
+    # "Keep segmasks from mask segmentation": import only the points and leave the masks as
+    # predict_masks_yolo already produced them (good masks are worth keeping; hand-relabelling
+    # them is wasted effort). Requires the 'masks' step to have already run. Keypoints are
+    # always imported from the annotations -- there is no equivalent "keep the pose model's
+    # keypoints" option in the GUI, since if the annotations are trusted enough to import at
+    # all, hand keypoints are strictly better than the pose model's.
+    keep_model_segmasks: bool = False
 
     def dataset_folder(self) -> Path:
         return Path(self.out_path) / self.dataset_folder_name
@@ -376,6 +398,62 @@ def run_pipeline(
             render_scale=config.render_scale,
             gt_dataset_dir=config.ground_truth_dataset or None,
         )
+
+
+def run_anylabeling_import(config: PipelineConfig) -> None:
+    """
+    Import hand-made AnyLabeling annotations into the dataset `extract_from_video` produced.
+
+    Deliberately *not* a member of VALID_STEPS. It is not a stage of the pipeline but a
+    substitute for two of them: it writes the same artifacts `predict_masks_yolo` and
+    `detect_keypoints_yolo` write, from annotations instead of from networks. Modelling it as a
+    step would put it in the "run all of the above" sequence next to the very steps it replaces,
+    where selecting both would have the networks overwrite the annotations (or the reverse)
+    depending on ordering.
+
+    By default the annotations are read from the dataset itself: one labelme JSON per extracted
+    frame, sharing the frame's basename, sitting in `<dataset>/<view>/origin/` next to it.
+    `config.anylabeling_root` overrides that for annotations kept elsewhere.
+
+    With `keep_model_segmasks` set, only the keypoints are imported and the masks stay as
+    `predict_masks_yolo` produced them; that requires the mask step to have already run, which
+    `import_gt_from_anylabeling` checks before writing anything.
+    """
+    dataset_folder_path = config.dataset_folder()
+    if not (dataset_folder_path / "index.json").exists():
+        raise ConfigError(
+            f"No dataset at {dataset_folder_path}: run extract_from_video first."
+        )
+
+    if not config.mesh_path:
+        raise ConfigError(
+            "mesh_path must be provided to resolve the keypoint list for the AnyLabeling import."
+        )
+    keypoint_list = read_keypoint_list(Path(config.mesh_path))
+
+    # Same frame-selection semantics as the detection steps: '*' means every extracted frame,
+    # which the importer represents as None (take the frame numbers from files.csv).
+    frame_indices: Optional[List[int]]
+    if _is_all_frames_selection(config.frame_range):
+        frame_indices = None
+    else:
+        frame_indices = parse_frame_selection(config.frame_range) if config.frame_range else None
+
+    mask_labels = (
+        [token.strip() for token in config.anylabeling_mask_labels.split(",") if token.strip()]
+        if config.anylabeling_mask_labels
+        else None
+    )
+
+    import_gt_from_anylabeling(
+        dataset_path=dataset_folder_path,
+        anylabeling_root=Path(config.anylabeling_root) if config.anylabeling_root else None,
+        kpt_list=keypoint_list,
+        frame_indices=frame_indices,
+        mask_labels=mask_labels,
+        import_masks=not config.keep_model_segmasks,
+        import_keypoints=True,
+    )
 
 
 import math
@@ -745,6 +823,28 @@ def _run_pipeline_subprocess(
         queue.put(("success", None, None))
 
 
+def _run_anylabeling_import_subprocess(
+    config_dict: Dict[str, Any],
+    queue: "mp.Queue",
+) -> None:
+    """
+    Subprocess target for the AnyLabeling import.
+
+    Mirrors `_run_pipeline_subprocess` exactly, including the (success|error, message, traceback)
+    protocol on the queue, so `_on_step_finished` / `_on_step_failed` handle its outcome without
+    knowing it is not a pipeline step. Run out-of-process for the same reason the steps are: a
+    hard failure inside OpenCV or a C extension takes down the child, not the GUI.
+    """
+    try:
+        config = PipelineConfig.from_dict(config_dict)
+        run_anylabeling_import(config)
+    except Exception as exc:  # pragma: no cover - propagated back to GUI
+        queue.put(("error", repr(exc), traceback.format_exc()))
+        raise
+    else:
+        queue.put(("success", None, None))
+
+
 class PipelineGUI:
     def __init__(self, root: "tk.Tk", config: PipelineConfig, steps: List[str]):
         self.root = root
@@ -780,6 +880,9 @@ class PipelineGUI:
         self.render_scale_var = tk.StringVar(value=str(self.config.render_scale))
         self.ground_truth_dataset_var = tk.StringVar(value=self.config.ground_truth_dataset or "")
         self.reconstruct_from_gt_var = tk.BooleanVar(value=self.config.reconstruct_from_gt)
+        self.anylabeling_root_var = tk.StringVar(value=self.config.anylabeling_root or "")
+        self.anylabeling_mask_labels_var = tk.StringVar(value=self.config.anylabeling_mask_labels or "")
+        self.keep_model_segmasks_var = tk.BooleanVar(value=self.config.keep_model_segmasks)
         self.advanced_visible = tk.BooleanVar(value=False)
         self.step_vars: Dict[str, "tk.BooleanVar"] = {
             "extract": tk.BooleanVar(value="extract" in self.steps),
@@ -919,88 +1022,249 @@ class PipelineGUI:
         self.advanced_toggle.grid(row=row, column=0, sticky="w", pady=(6, 2))
         row += 1
 
-        self.advanced_frame = ttk.Frame(main)
+        # Keep the advanced settings in a fixed-height, scrollable region so expanding one
+        # or more sections does not force the whole main window to become excessively tall.
+        self.advanced_frame = ttk.Frame(main, height=420)
+        # Keep a bounded viewport so the scrollbar is useful when one or more sections are expanded.
+        self.advanced_frame.grid_propagate(False)
         self.advanced_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        self.advanced_frame.columnconfigure(1, weight=1)
+        self.advanced_frame.columnconfigure(0, weight=1)
+        self.advanced_frame.rowconfigure(0, weight=1)
+        self.advanced_frame.grid_remove()
 
-        self._add_path_row(self.advanced_frame, 0, "Pose time series", self.pose_time_series_var, self.browse_pose_time_series)
-        self._add_path_row(self.advanced_frame, 1, "Pose time series mesh", self.pose_time_series_mesh_var, self.browse_pose_time_series_mesh)
+        advanced_canvas = tk.Canvas(self.advanced_frame, highlightthickness=0, borderwidth=0)
+        advanced_canvas.grid(row=0, column=0, sticky="nsew")
+        advanced_scrollbar = ttk.Scrollbar(
+            self.advanced_frame,
+            orient="vertical",
+            command=advanced_canvas.yview,
+        )
+        advanced_scrollbar.grid(row=0, column=1, sticky="ns")
+        advanced_canvas.configure(yscrollcommand=advanced_scrollbar.set)
+
+        advanced_content = ttk.Frame(advanced_canvas)
+        advanced_content.columnconfigure(0, weight=1)
+        advanced_window_id = advanced_canvas.create_window(
+            (0, 0), window=advanced_content, anchor="nw"
+        )
+
+        def _update_advanced_scroll_region(_event=None) -> None:
+            advanced_canvas.configure(scrollregion=advanced_canvas.bbox("all"))
+
+        def _resize_advanced_content(event) -> None:
+            advanced_canvas.itemconfigure(advanced_window_id, width=event.width)
+
+        advanced_content.bind("<Configure>", _update_advanced_scroll_region)
+        advanced_canvas.bind("<Configure>", _resize_advanced_content)
+
+        def _scroll_advanced(event) -> None:
+            advanced_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        advanced_canvas.bind_all("<MouseWheel>", _scroll_advanced)
+
+        pose_section, pose_body = self._create_collapsible_section(
+            advanced_content, "Pose time series", 0
+        )
+        self._add_path_row(
+            pose_body, 0, "Pose time series",
+            self.pose_time_series_var, self.browse_pose_time_series
+        )
+        self._add_path_row(
+            pose_body, 1, "Pose time series mesh",
+            self.pose_time_series_mesh_var, self.browse_pose_time_series_mesh
+        )
 
         deform_check = ttk.Checkbutton(
-            self.advanced_frame,
+            pose_body,
             text="Deform mesh when rendering time series",
             variable=self.pose_time_series_deform_var,
         )
         deform_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         offset_check = ttk.Checkbutton(
-            self.advanced_frame,
+            pose_body,
             text="Pose time series start is frame range start",
             variable=self.pose_time_series_offset_var,
         )
         offset_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         render_step_check = ttk.Checkbutton(
-            self.advanced_frame,
+            pose_body,
             text="Include render_pose_time_series in 'run all of the above'",
             variable=self.step_vars["render_time_series"],
         )
         render_step_check.grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         render_button = ttk.Button(
-            self.advanced_frame,
+            pose_body,
             text="render_pose_time_series",
             command=lambda: self.run_step("render_time_series"),
         )
         render_button.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.action_buttons.append(render_button)
 
-        self._add_directory_row(
-            self.advanced_frame, 6, "Ground truth dataset",
-            self.ground_truth_dataset_var, self.browse_ground_truth_dataset,
+        gt_section, gt_body = self._create_collapsible_section(
+            advanced_content, "Ground truth / AnyLabeling", 1
         )
+        self._add_directory_row(
+            gt_body, 0, "Ground truth dataset",
+            self.ground_truth_dataset_var, self.browse_ground_truth_dataset
+        )
+
         reconstruct_from_gt_check = ttk.Checkbutton(
-            self.advanced_frame,
+            gt_body,
             text="Reconstruct from GT dataset",
             variable=self.reconstruct_from_gt_var,
             command=self._sync_reconstruct_from_gt,
         )
-        reconstruct_from_gt_check.grid(row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        reconstruct_from_gt_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        optimization_frame = ttk.LabelFrame(self.advanced_frame, text="Optimization settings")
-        optimization_frame.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        optimization_frame.columnconfigure(1, weight=1)
+        anylabeling_frame = ttk.LabelFrame(
+            gt_body, text="Import GT dataset from AnyLabeling"
+        )
+        anylabeling_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        anylabeling_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(optimization_frame, text="num_iters").grid(row=0, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.num_iters_var).grid(row=0, column=1, sticky="ew", pady=2, padx=(0, 6))
+        self._add_directory_row(
+            anylabeling_frame, 0, "Annotations folder (optional)",
+            self.anylabeling_root_var, self.browse_anylabeling_root,
+        )
+        ttk.Label(
+            anylabeling_frame,
+            text=(
+                "Leave empty to read the annotations from the dataset itself: one "
+                "labelme/AnyLabeling JSON per extracted frame, sharing the frame's basename, "
+                "in <dataset>/<view>/origin/ next to it (e.g. cam-1_undistorted_690.json "
+                "beside cam-1_undistorted_690.png). Set a folder only if the annotations were "
+                "kept elsewhere. Requires 'extract_from_video' to have already run for this "
+                "dataset; the import fails loudly if a view has no annotation files."
+            ),
+            foreground="#777",
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4), padx=(6, 6))
 
-        ttk.Label(optimization_frame, text="angle_constraint_weight").grid(row=1, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.angle_constraint_weight_var).grid(row=1, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(anylabeling_frame, text="Mask labels (optional)").grid(
+            row=2, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(anylabeling_frame, textvariable=self.anylabeling_mask_labels_var).grid(
+            row=2, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+        ttk.Label(
+            anylabeling_frame, text="e.g. 'fish' - only rasterize polygons with these labels",
+            foreground="#777",
+        ).grid(row=2, column=2, sticky="w", pady=2)
 
-        ttk.Label(optimization_frame, text="smooth_weight").grid(row=2, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.smooth_weight_var).grid(row=2, column=1, sticky="ew", pady=2, padx=(0, 6))
+        keep_segmasks_check = ttk.Checkbutton(
+            anylabeling_frame,
+            text="Keep segmasks from mask segmentation",
+            variable=self.keep_model_segmasks_var,
+        )
+        keep_segmasks_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0), padx=(6, 0))
+        ttk.Label(
+            anylabeling_frame,
+            text=(
+                "Leaves the masks as predict_masks_yolo already produced them and imports only "
+                "the keypoints - useful when the detected masks are already good and only the "
+                "keypoints need hand correction. Requires 'predict_masks_yolo' to have already "
+                "run. Unticked, both masks and keypoints come from the annotations."
+            ),
+            foreground="#777",
+            wraplength=520,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 4), padx=(6, 6))
 
-        ttk.Label(optimization_frame, text="big_artic_weight").grid(row=3, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.big_artic_weight_var).grid(row=3, column=1, sticky="ew", pady=2, padx=(0, 6))
+        self.import_anylabeling_button = ttk.Button(
+            anylabeling_frame,
+            text="import_gt_from_anylabeling",
+            command=self.run_anylabeling_import,
+        )
+        self.import_anylabeling_button.grid(
+            row=5, column=0, columnspan=3, sticky="ew", pady=(4, 6), padx=(6, 6)
+        )
+        # Same disable-while-busy / re-enable-on-completion cycle as every other step button
+        # (predict_masks_yolo, reconstruct, ...); preconditions (extract_frames run, and
+        # predict_masks_yolo run if 'Keep segmasks' is ticked) are checked once the button is
+        # clicked, inside import_gt_from_anylabeling itself, and reported the same way any other
+        # step failure is: via the error dialog in _on_step_failed.
+        self.action_buttons.append(self.import_anylabeling_button)
 
-        ttk.Label(optimization_frame, text="bone_length_constraint_weight").grid(row=4, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.bone_length_constraint_weight_var).grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 6))
+        optimization_section, optimization_body = self._create_collapsible_section(
+            advanced_content, "Optimization settings", 2
+        )
+        optimization_body.columnconfigure(1, weight=1)
 
-        ttk.Label(optimization_frame, text="mask_weight").grid(row=5, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.mask_weight_var).grid(row=5, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_body, text="num_iters").grid(
+            row=0, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.num_iters_var).grid(
+            row=0, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
 
-        ttk.Label(optimization_frame, text="keypoints_weight").grid(row=6, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.keypoints_weight_var).grid(row=6, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_body, text="angle_constraint_weight").grid(
+            row=1, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.angle_constraint_weight_var).grid(
+            row=1, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
 
-        ttk.Label(optimization_frame, text="view_weights").grid(row=7, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.view_weights_var).grid(row=7, column=1, sticky="ew", pady=2, padx=(0, 6))
+        ttk.Label(optimization_body, text="smooth_weight").grid(
+            row=2, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.smooth_weight_var).grid(
+            row=2, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+
+        ttk.Label(optimization_body, text="big_artic_weight").grid(
+            row=3, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.big_artic_weight_var).grid(
+            row=3, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+
+        ttk.Label(optimization_body, text="bone_length_constraint_weight").grid(
+            row=4, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.bone_length_constraint_weight_var).grid(
+            row=4, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+
+        ttk.Label(optimization_body, text="mask_weight").grid(
+            row=5, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.mask_weight_var).grid(
+            row=5, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+
+        ttk.Label(optimization_body, text="keypoints_weight").grid(
+            row=6, column=0, sticky="w", pady=2, padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.keypoints_weight_var).grid(
+            row=6, column=1, sticky="ew", pady=2, padx=(0, 6)
+        )
+
+        # Keep the view_weights hint directly beside view_weights. It previously occupied the
+        # render_scale row, which caused the light-gray text to overlap the field below it.
+        ttk.Label(optimization_body, text="view_weights").grid(
+            row=7, column=0, sticky="w", pady=(2, 8), padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.view_weights_var).grid(
+            row=7, column=1, sticky="ew", pady=(2, 8), padx=(0, 6)
+        )
+        ttk.Label(
+            optimization_body,
+            text="Comma-separated by view index (single value broadcasts).",
+            foreground="#777",
+        ).grid(row=7, column=2, sticky="w", pady=(2, 8), padx=(6, 6))
 
         # CLAUDE FIX: silhouette renderer resolution, exposed so the render cost of the fitting
         # loop can be traded against silhouette detail without editing code.
-        ttk.Label(optimization_frame, text="render_scale (0-1)").grid(row=8, column=0, sticky="w", pady=2, padx=(6, 4))
-        ttk.Entry(optimization_frame, textvariable=self.render_scale_var).grid(row=8, column=1, sticky="ew", pady=2, padx=(0, 6))
-        ttk.Label(
-            optimization_frame,
-            text="Comma-separated by view index (single value broadcasts).",
-            foreground="#777",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 4), padx=(6, 6))
+        ttk.Label(optimization_body, text="render_scale (0-1)").grid(
+            row=8, column=0, sticky="w", pady=(2, 2), padx=(6, 4)
+        )
+        ttk.Entry(optimization_body, textvariable=self.render_scale_var).grid(
+            row=8, column=1, sticky="ew", pady=(2, 2), padx=(0, 6)
+        )
 
         self._sync_reconstruct_from_gt()
         self.advanced_frame.grid_remove()
@@ -1008,6 +1272,44 @@ class PipelineGUI:
 
         status_label = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status_label.grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+    def _create_collapsible_section(
+        self,
+        parent: "tk.Widget",
+        title: str,
+        row: int,
+    ) -> tuple["tk.Button", "ttk.Frame"]:
+        """Create an accordion-style section and return its toggle button and content frame."""
+        section_frame = ttk.Frame(parent)
+        section_frame.grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        section_frame.columnconfigure(0, weight=1)
+
+        expanded = tk.BooleanVar(value=False)
+
+        body = ttk.Frame(section_frame)
+        body.columnconfigure(1, weight=1)
+
+        def toggle() -> None:
+            if expanded.get():
+                expanded.set(False)
+                body.grid_remove()
+                toggle_button.configure(text=f"{title} >")
+            else:
+                expanded.set(True)
+                body.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+                toggle_button.configure(text=f"{title} v")
+                # Make newly exposed content immediately reachable with the scrollbar.
+                parent.update_idletasks()
+                parent.event_generate("<Configure>")
+
+        toggle_button = ttk.Button(
+            section_frame,
+            text=f"{title} >",
+            command=toggle,
+        )
+        toggle_button.grid(row=0, column=0, sticky="ew")
+
+        return toggle_button, body
 
     def _add_path_row(
         self,
@@ -1098,6 +1400,11 @@ class PipelineGUI:
     def browse_ground_truth_dataset(self) -> None:
         self._browse_directory(self.ground_truth_dataset_var, "Select ground truth dataset directory")
 
+    def browse_anylabeling_root(self) -> None:
+        self._browse_directory(
+            self.anylabeling_root_var, "Select AnyLabeling annotations folder"
+        )
+
     def _sync_reconstruct_from_gt(self) -> None:
         """Grey out the detection steps when the run is driven from the GT dataset."""
         state = tk.DISABLED if self.reconstruct_from_gt_var.get() else tk.NORMAL
@@ -1182,6 +1489,12 @@ class PipelineGUI:
                     f"{config.ground_truth_dataset}"
                 )
 
+        anylabeling_root = self.anylabeling_root_var.get().strip()
+        config.anylabeling_root = anylabeling_root or None
+        mask_labels_text = self.anylabeling_mask_labels_var.get().strip()
+        config.anylabeling_mask_labels = mask_labels_text or None
+        config.keep_model_segmasks = bool(self.keep_model_segmasks_var.get())
+
         view_weights_text = self.view_weights_var.get().strip()
         config.view_weights = view_weights_text if view_weights_text else "1"
         # validate numeric formatting early; view-count validation happens in reconstruct()
@@ -1254,6 +1567,9 @@ class PipelineGUI:
         self.render_scale_var.set(str(config.render_scale))
         self.ground_truth_dataset_var.set(config.ground_truth_dataset or "")
         self.reconstruct_from_gt_var.set(bool(config.reconstruct_from_gt))
+        self.anylabeling_root_var.set(config.anylabeling_root or "")
+        self.anylabeling_mask_labels_var.set(config.anylabeling_mask_labels or "")
+        self.keep_model_segmasks_var.set(bool(config.keep_model_segmasks))
         self._sync_reconstruct_from_gt()
         self._refresh_video_listbox()
 
@@ -1363,6 +1679,74 @@ class PipelineGUI:
                 trace = ""
 
             self.root.after(0, lambda: self._on_step_failed(run_label, exc, trace, is_sequence=is_sequence))
+
+        self.worker_thread = threading.Thread(target=task, daemon=True)
+        self.worker_thread.start()
+
+    def run_anylabeling_import(self) -> None:
+        """
+        Run the AnyLabeling import from its own button.
+
+        Mirrors `_run_steps` (busy check, gather_config, disable buttons, worker thread around a
+        subprocess, results marshalled back with `root.after`) but without going through
+        `run_pipeline`: the import is not a pipeline step, so it never appears in VALID_STEPS,
+        in `--steps`, or in "run all of the above".
+        """
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A step is already running. Please wait.")
+            return
+
+        try:
+            config = self.gather_config()
+        except ConfigError as exc:
+            messagebox.showerror("Configuration error", str(exc))
+            return
+
+        self.config = config
+        run_label = "import_gt_from_anylabeling"
+        self.set_status(f"Running {run_label}...")
+        self._set_buttons_state(tk.DISABLED)
+        # Nothing to pause: the import is not iterative and writes each frame atomically.
+        self.pause_button.configure(state=tk.DISABLED)
+        self.pause_requested = False
+        self.current_step = run_label
+
+        def task() -> None:
+            queue: mp.Queue = mp.Queue()
+            process = mp.Process(
+                target=_run_anylabeling_import_subprocess,
+                args=(config.to_dict(), queue),
+            )
+            self.worker_process = process
+            self.worker_queue = queue
+            process.start()
+            process.join()
+            exit_code = process.exitcode
+
+            try:
+                result = queue.get_nowait()
+            except Empty:
+                result = None
+            finally:
+                queue.close()
+                queue.join_thread()
+
+            self.worker_process = None
+            self.worker_queue = None
+            self.current_step = None
+
+            if exit_code == 0:
+                self.root.after(0, lambda: self._on_step_finished(run_label))
+                return
+
+            if result and result[0] == "error":
+                exc = RuntimeError(result[1] or "AnyLabeling import failed.")
+                trace = result[2] or ""
+            else:
+                exc = RuntimeError(f"Process exited with code {exit_code}")
+                trace = ""
+
+            self.root.after(0, lambda: self._on_step_failed(run_label, exc, trace))
 
         self.worker_thread = threading.Thread(target=task, daemon=True)
         self.worker_thread.start()
@@ -1689,6 +2073,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--anylabeling-root",
+        dest="anylabeling_root",
+        help=(
+            "Folder of AnyLabeling (labelme-schema) annotation JSONs for "
+            "--import-gt-from-anylabeling. Defaults to the dataset itself, i.e. one JSON per "
+            "extracted frame in <dataset>/<view>/origin/ next to the frame it annotates."
+        ),
+    )
+    parser.add_argument(
+        "--anylabeling-mask-labels",
+        dest="anylabeling_mask_labels",
+        help="Comma-separated polygon labels to rasterize (e.g. 'fish'); default is all labels.",
+    )
+    parser.add_argument(
+        "--keep-model-segmasks",
+        action="store_true",
+        dest="keep_model_segmasks",
+        help=(
+            "Import only the keypoints and leave the masks as predict_masks_yolo already "
+            "produced them. Requires the 'masks' step to have already run."
+        ),
+    )
+    parser.add_argument(
+        "--import-gt-from-anylabeling",
+        action="store_true",
+        dest="import_gt_from_anylabeling",
+        help=(
+            "Import masks and keypoints from AnyLabeling annotations instead of running the "
+            "segmentation/pose networks, then exit. This is not a pipeline step: it replaces "
+            "'masks' and 'keypoints' rather than joining them, so it is requested with this "
+            "flag rather than through --steps. Implies --headless."
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help=(
@@ -1758,6 +2176,12 @@ def update_config_from_args(config: PipelineConfig, args: argparse.Namespace) ->
         raise ConfigError(
             "ground_truth_dataset is required when reconstruct_from_gt is enabled."
         )
+    if getattr(args, "anylabeling_root", None):
+        config.anylabeling_root = args.anylabeling_root
+    if getattr(args, "anylabeling_mask_labels", None):
+        config.anylabeling_mask_labels = args.anylabeling_mask_labels
+    if getattr(args, "keep_model_segmasks", False):
+        config.keep_model_segmasks = True
     return config
 
 
@@ -1790,6 +2214,12 @@ def main() -> None:
         config = load_config(Path(args.config))
 
     config = update_config_from_args(config, args)
+
+    if getattr(args, "import_gt_from_anylabeling", False):
+        # Handled before the step machinery, and never routed through it: the import is not a
+        # member of VALID_STEPS, so there is no --steps spelling of it to keep consistent.
+        run_anylabeling_import(config)
+        return
 
     if args.headless:
         # Headless batch execution. Steps are validated up front and reordered into
