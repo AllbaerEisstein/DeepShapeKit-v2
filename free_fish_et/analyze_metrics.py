@@ -151,6 +151,11 @@ class MetricSpec:
     # have one value per (run, frame), so 'which view' is not a question that can
     # be asked of them. Figures keyed by view are skipped for such a metric.
     view_axis: bool = True
+    # What one member of a sub-divided metric is called, for the figure titles and
+    # file names. 'keypoint' for the per-keypoint metrics, 'bone group' for the
+    # per-bone-group MPJPE: the second axis of a measure is structural, so calling
+    # a bone group a keypoint would misname it in every title it appears in.
+    member_noun: str = "keypoint"
 
 
 # Registry order is report order: reconstruction quality first, then the
@@ -324,25 +329,94 @@ METRIC_REGISTRY: Dict[str, MetricSpec] = {
         orientation="lower is better",
         view_axis=False,
     ),
-    "MPJPE_3d_keypoint_bl": MetricSpec(
-        label="MPJPE (keypoint centroids) [body lengths]",
-        description=(
-            "Mean per-frame Euclidean error over configured keypoint centroids, divided by the "
-            "per-frame GT body length. This is the keypoint-centroid MPJPE variant."
-        ),
-        orientation="lower is better",
-        view_axis=False,
-    ),
-    "MPJPE_3d_joint_bl": MetricSpec(
-        label="MPJPE (bone heads) [body lengths]",
-        description=(
-            "Mean per-frame Euclidean error over real armature bone heads, divided by the per-frame "
-            "GT body length. This is the skeleton-joint MPJPE variant."
-        ),
-        orientation="lower is better",
-        view_axis=False,
-    ),
+    # MPJPE_3d_{keypoint,joint}[_root_relative|_pa]_bl[_by_bone_group]: see
+    # _mpjpe_registry_entries() below, appended to this dict after it is built.
 }
+
+
+# --------------------------------------------------------------------------
+# MPJPE registry entries (generated: see _mpjpe_registry_entries)
+# --------------------------------------------------------------------------
+#
+# synthetic_data_generator_ui.py's _mpjpe_block computes each MPJPE variant under
+# three alignment terms -- global (no alignment removed), root_relative
+# (translation removed) and pa (a similarity transform removed) -- for each of
+# two point sets -- keypoint centroids and bone heads -- and, when the template
+# defines bone groups, a further breakdown of each of those by bone group. That
+# is 2 point sets x 3 terms x 2 granularities = 12 MetricSpec entries, differing
+# only in which point set, which term, and whether it is grouped; they are
+# generated here rather than written out by hand so the twelve descriptions stay
+# in lockstep with each other and with _mpjpe_block instead of drifting apart
+# under independent edits.
+
+# (metric-key infix, prose label, JSON key under 'mpjpe') for each point set.
+_MPJPE_ITEMS: Tuple[Tuple[str, str], ...] = (
+    ("keypoint", "keypoint centroids"),
+    ("joint", "bone heads"),
+)
+
+# (metric-key infix, prose label, what the term isolates) for each alignment term,
+# in _mpjpe_block's own order.
+_MPJPE_TERMS: Tuple[Tuple[str, str, str], ...] = (
+    ("", "global", "with no alignment removed"),
+    (
+        "_root_relative", "root-relative",
+        "with each set's own translation removed, isolating orientation and articulation error",
+    ),
+    (
+        "_pa", "Procrustes-aligned",
+        "with a similarity transform (Kabsch/Umeyama, scale included) removed, isolating "
+        "residual articulation and shape error; null wherever the point configuration is too "
+        "close to one dimension for the rotation to be stable",
+    ),
+)
+
+
+def _mpjpe_registry_entries() -> Dict[str, MetricSpec]:
+    """
+    The 12 MPJPE entries: {keypoint centroids, bone heads} x {global,
+    root-relative, Procrustes-aligned} x {whole fish, per bone group}.
+
+    Both granularities read a per-frame series -- the whole-fish ones from
+    THREE_D_NESTED_SCALARS, the per-bone-group ones one level finer from
+    THREE_D_GROUP_SCALARS -- and are otherwise ordinary view_axis=False metrics:
+    synthetic_data_generator_ui.py's _mpjpe_block writes each frame's own
+    per-group mean beside its whole-block one, so this script pools raw
+    per-frame values here exactly like every other metric.
+    """
+    entries: Dict[str, MetricSpec] = {}
+    for item_infix, item_label in _MPJPE_ITEMS:
+        for term_infix, term_label, term_text in _MPJPE_TERMS:
+            whole_key = f"MPJPE_3d_{item_infix}{term_infix}_bl"
+            entries[whole_key] = MetricSpec(
+                label=f"MPJPE ({item_label}, {term_label}) [body lengths]",
+                description=(
+                    f"Mean per-frame Euclidean error over {item_label}, {term_text}, divided by "
+                    "the per-frame GT body length."
+                ),
+                orientation="lower is better",
+                view_axis=False,
+            )
+            entries[f"{whole_key}_by_bone_group"] = MetricSpec(
+                label=f"MPJPE per bone group ({item_label}, {term_label}) [body lengths]",
+                description=(
+                    f"{whole_key} restricted to one bone group's {item_label}, {term_text}: "
+                    "per frame, the mean over just that group's items, divided by the same "
+                    "frame's GT body length. The bone groups are the template's own partition "
+                    "of the skeleton -- the body parts the optimizer schedules its stages on -- "
+                    "so this says which part of the fish a view combination failed on, which "
+                    f"{whole_key} above cannot. Groups may overlap and are unequally sized, so "
+                    f"the measure pooled over all of them is a pool of group values, not "
+                    f"{whole_key}."
+                ),
+                orientation="lower is better",
+                view_axis=False,
+                member_noun="bone group",
+            )
+    return entries
+
+
+METRIC_REGISTRY.update(_mpjpe_registry_entries())
 
 
 def spec_for(metric: str) -> MetricSpec:
@@ -406,7 +480,12 @@ RUN_KEY_PATTERN = re.compile(r"^k(\d+)__")
 #     them into the flat per-frame arrays the rest of this script expects; the
 #     precomputed "summary" in the file is deliberately ignored, because this
 #     script pools raw frame values across runs and would otherwise be averaging
-#     averages over unequal frame counts.
+#     averages over unequal frame counts. The per-bone-group MPJPE entries
+#     (THREE_D_GROUP_SCALARS) read one level finer than THREE_D_NESTED_SCALARS but
+#     are the same shape of thing: synthetic_data_generator_ui.py's _mpjpe_block
+#     writes each frame's OWN per-group mean beside its whole-block one, so this
+#     script pools those raw per-frame values exactly like every other metric,
+#     never a Blender-side pre-average.
 #
 # UNITS: every 3D length is read in GT BODY LENGTHS, never metres. A metre depends
 # on how large the fish was modelled and is not comparable across scenes, nor with
@@ -723,10 +802,12 @@ THREE_D_KEYPOINTS: Dict[str, Tuple[str, str]] = {
     "keypoint_distance_3d_bl": ("keypoint_distances", "per_keypoint_bl"),
 }
 
-
 # Batch MPVE/MPJPE are stored using the same nested metric blocks as the
 # standalone evaluators. These sources flatten the relevant per-frame scalar
-# into the same Sample shape used by the rest of the analyzer.
+# into the same Sample shape used by the rest of the analyzer. The batch
+# operator adds body_length_normalised to every frame of both MPJPE blocks with
+# all three alignment terms (global/root_relative/pa), so each of the six
+# whole-fish MPJPE entries in _mpjpe_registry_entries() reads one of them here.
 # Path format:
 #   (metric block, optional sub-block, frame field path...)
 THREE_D_NESTED_SCALARS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
@@ -734,14 +815,30 @@ THREE_D_NESTED_SCALARS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
         ("mpve",),
         ("variants", "body_length_normalised", "mean"),
     ),
-    "MPJPE_3d_keypoint_bl": (
-        ("mpjpe", "keypoint"),
-        ("body_length_normalised", "global"),
-    ),
-    "MPJPE_3d_joint_bl": (
-        ("mpjpe", "joint"),
-        ("body_length_normalised", "global"),
-    ),
+    **{
+        f"MPJPE_3d_{item_infix}{term_infix}_bl": (
+            ("mpjpe", item_infix),
+            ("body_length_normalised", term),
+        )
+        for item_infix, _item_label in _MPJPE_ITEMS
+        for term_infix, term in (("", "global"), ("_root_relative", "root_relative"), ("_pa", "pa"))
+    },
+}
+
+# metric -> (item kind, alignment term) of the per-bone-group MPJPE entries. The
+# item kind ("keypoint" or "joint") and term ("global"/"root_relative"/"pa")
+# together address one frame of synthetic_data_generator_ui.py's
+# run["mpjpe"][item_kind]["frames"][i]["body_length_normalised"]["per_group"][term],
+# one level finer than THREE_D_NESTED_SCALARS reads -- _mpjpe_block writes this
+# frame-wise, beside the frame's whole-block value, so it is read the same way:
+# one Sample per (run, frame, group), pooled here rather than inside Blender. The
+# group name enters the Sample on the KEYPOINT axis, so every by-keypoint
+# grouping, summary, CSV row and figure applies to a bone group unchanged;
+# MetricSpec.member_noun is what keeps the titles from calling it a keypoint.
+THREE_D_GROUP_SCALARS: Dict[str, Tuple[str, str]] = {
+    f"MPJPE_3d_{item_infix}{term_infix}_bl_by_bone_group": (item_infix, term)
+    for item_infix, _item_label in _MPJPE_ITEMS
+    for term_infix, term in (("", "global"), ("_root_relative", "root_relative"), ("_pa", "pa"))
 }
 
 
@@ -795,6 +892,9 @@ def iter_3d_samples(
     n_runs = 0
     n_blocked = 0
     no_stamp = []
+    group_missing: Dict[str, List[str]] = defaultdict(list)
+    group_present: Dict[str, int] = defaultdict(int)
+    group_partial: Dict[str, List[str]] = defaultdict(list)
     for run_key, run in collected.items():
         n_views = parse_n_views(run_key)
         if n_views is None:
@@ -868,6 +968,47 @@ def iter_3d_samples(
                 value = _nested_value(frame, field_path)
                 yield Sample(metric_name, None, VIEW_3D, n_views, _to_float(value))
 
+        for metric, (item_kind, term) in THREE_D_GROUP_SCALARS.items():
+            if wanted_metrics is not None and metric not in wanted_metrics:
+                continue
+            metric_name = sys.intern(metric)
+
+            payload = run.get("mpjpe")
+            payload = payload.get(item_kind) if isinstance(payload, dict) else None
+            if not isinstance(payload, dict) or not isinstance(payload.get("frames"), list):
+                # MPJPE's keypoint/joint block may legitimately be absent (for
+                # example when the configured keypoint list is empty), so this
+                # is a quiet absence rather than a malformed-file warning, same
+                # as THREE_D_NESTED_SCALARS treats it.
+                continue
+
+            matched = missing = 0
+            for frame in payload["frames"]:
+                if not isinstance(frame, dict):
+                    continue
+                if exclude_blocked and _3d_blocked(frame):
+                    continue
+                per_group = _nested_value(frame, ("body_length_normalised", "per_group", term))
+                if not isinstance(per_group, dict):
+                    # A generator that predates the per-bone-group patch, or a
+                    # template with no bone groups defined, writes no per_group
+                    # table on this frame: absent, not a fault.
+                    missing += 1
+                    continue
+                matched += 1
+                for group, value in per_group.items():
+                    yield Sample(metric_name, sys.intern(str(group)), VIEW_3D, n_views,
+                                 _to_float(value))
+
+            if matched:
+                group_present[metric] += 1
+                if missing:
+                    group_partial[metric].append(
+                        f"{run_key} ({missing} of {matched + missing} frame(s))"
+                    )
+            elif missing:
+                group_missing[metric].append(run_key)
+
     if collected:
         log(f"Read {n_runs} 3D run(s).")
         if n_blocked:
@@ -879,6 +1020,20 @@ def iter_3d_samples(
                 f"whether any of their frames were blocked: {', '.join(no_stamp[:3])}"
                 f"{' ...' if len(no_stamp) > 3 else ''}. Their per-frame rows are used as-is, "
                 f"which may pool unfiltered 3D values beside filtered 2D ones."
+            )
+        for metric, missing in group_missing.items():
+            present = group_present[metric]
+            if present and missing:
+                warn(
+                    f"{metric}: {len(missing)} of {present + len(missing)} 3D run(s) carry no "
+                    f"per-bone-group table on any frame, e.g. {missing[0]}; only the runs that "
+                    "have one contribute to it."
+                )
+        for metric, partial in group_partial.items():
+            warn(
+                f"{metric}: {len(partial)} run(s) carry a per-bone-group table on only some of "
+                f"their frames, e.g. {partial[0]}; the frames that have one are pooled as they "
+                "are, which may rest on fewer frames than the run's whole-fish MPJPE does."
             )
 
 
@@ -1337,6 +1492,13 @@ class Style:
     # Draw values outside their group's 1.5 x IQR fence? Affects the figures
     # only; metrics_summary.json / .csv always cover every finite value.
     drop_fliers: bool = False
+    # Keep the single 'all runs pooled' box of the GROUPING_OVERALL figures? When
+    # False their colour groups are laid out on their own x axis instead, as in
+    # the per-#views and per-view figures.
+    overall_pooling: bool = True
+    # Break the y axis of a box figure when one group sits far outside the rest,
+    # instead of letting it compress every other box into a few pixels.
+    dynamic_y_axis: bool = False
     value_labels: bool = True
     captions: bool = True
     _palettes: Dict[str, List[RGB]] = field(default_factory=dict)
@@ -1423,32 +1585,49 @@ def _view_label(view: str, n_samples: Optional[int] = None) -> str:
     return label if n_samples is None else f"{label}\nn = {n_samples}"
 
 
-def _axis_cosmetics(ax: Axes, ylabel: str, xlabel: str = "") -> None:
+def _axis_cosmetics(ax: AxesLike, ylabel: str, xlabel: str = "") -> None:
     ax.set_ylabel(ylabel)
     if xlabel:
         ax.set_xlabel(xlabel)
-    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
-    ax.grid(axis="y", which="major")
+    for panel in _panels_of(ax):
+        panel.yaxis.set_minor_locator(AutoMinorLocator(2))
+        panel.grid(axis="y", which="major")
 
 
 def _figure_width(n_positions: int, per_position: float, minimum: float) -> float:
     return max(minimum, per_position * n_positions)
 
 
-def _label_headroom(ax: Axes, style: Style, fraction: float = 0.14, below: float = 0.0) -> None:
-    """Room around the drawn data for the mean/median labels and the title."""
+def _label_headroom(ax: AxesLike, style: Style, fraction: float = 0.14, below: float = 0.0) -> None:
+    """
+    Room around the drawn data for the mean/median labels and the title. Each
+    panel of a broken axis gets its own, since each carries labels of its own;
+    the lower panel's headroom stops at the upper panel's floor, so widening it
+    can narrow the break but can never make the two panels show the same values.
+    """
     if not style.value_labels:
         return
-    low, high = ax.get_ylim()
-    span = high - low
-    ax.set_ylim(low - below * span, high + fraction * span)
+    panels = _panels_of(ax)  # upper panel first
+    ceiling: Optional[float] = None
+    for index, panel in enumerate(panels):
+        low, high = panel.get_ylim()
+        span = high - low
+        new_high = high + fraction * span
+        if ceiling is not None:
+            new_high = min(new_high, ceiling)
+        # `below` is room under the figure's data, so only the lowest panel gets it.
+        new_low = low - (below * span if index == len(panels) - 1 else 0.0)
+        panel.set_ylim(new_low, new_high)
+        ceiling = new_low
 
 
 CAPTION_FONT_SIZE = 6.5
 CAPTION_CHARS_PER_INCH = 21  # at CAPTION_FONT_SIZE, close enough for wrapping
 
 
-def _save(fig: Figure, ax: Axes, out_path: Path, title: str, caption: str, style: Style) -> None:
+def _save(
+    fig: Figure, ax: AxesLike, out_path: Path, title: str, caption: str, style: Style
+) -> None:
     """
     Title above the axes, caption beneath the figure, as in a paper. The caption
     is anchored to the drawn extent of the figure rather than to the axes box,
@@ -1504,13 +1683,22 @@ def _for_display(values: Sequence[float], style: Style) -> List[float]:
     return [v for v in values if low <= v <= high]
 
 
+def _whisker_span(values: Sequence[float]) -> Optional[Tuple[float, float]]:
+    """
+    Lower and upper whisker cap of one group, i.e. the vertical extent _draw_boxes
+    actually draws for it. None for an empty group, which draws nothing.
+    """
+    if not values:
+        return None
+    low, high = iqr_fence(values)
+    inside = [v for v in values if low <= v <= high] or list(values)
+    return (min(inside), max(inside))
+
+
 def _whisker_top(values: Sequence[float]) -> float:
     """Upper whisker cap: the largest value inside the fence, as drawn."""
-    if not values:
-        return float("nan")
-    low, high = iqr_fence(values)
-    inside = [v for v in values if low <= v <= high]
-    return max(inside) if inside else max(values)
+    span = _whisker_span(values)
+    return float("nan") if span is None else span[1]
 
 
 def _format_value(value: float) -> str:
@@ -1519,7 +1707,7 @@ def _format_value(value: float) -> str:
 
 
 def _annotate_stats(
-    ax: Axes,
+    ax: AxesLike,
     position: float,
     anchor: float,
     stats: Dict[str, float],
@@ -1557,7 +1745,7 @@ def _thin(values: Sequence[float], limit: int, rng: random.Random) -> List[float
 
 
 def _draw_boxes(
-    ax: Axes,
+    ax: AxesLike,
     positions: Sequence[float],
     datasets: Sequence[Sequence[float]],
     color: RGB,
@@ -1595,7 +1783,7 @@ def _draw_boxes(
 
 
 def _draw_strip(
-    ax: Axes,
+    ax: AxesLike,
     position: float,
     groups: Sequence[Tuple[Any, List[float]]],
     colors: Sequence[RGB],
@@ -1626,7 +1814,7 @@ def _draw_strip(
 
 
 def _draw_group_boxes(
-    ax: Axes,
+    ax: AxesLike,
     position: float,
     groups: Sequence[Tuple[Any, List[float]]],
     colors: Sequence[RGB],
@@ -1653,7 +1841,7 @@ def _draw_group_boxes(
 
 
 def _draw_distribution(
-    ax: Axes,
+    ax: AxesLike,
     position: float,
     groups: Sequence[Tuple[Any, List[float]]],
     colors: Sequence[RGB],
@@ -1668,8 +1856,262 @@ def _draw_distribution(
     return _draw_strip(ax, position, groups, colors, rng, style, offset, width)
 
 
+# --------------------------------------------------------------------------
+# Broken y axis (--dynamic-y-axis)
+# --------------------------------------------------------------------------
+#
+# One group whose values sit far above the rest -- the two-view combinations of an
+# MPJPE, typically -- stretches a linear axis until every other box collapses into
+# a band a few pixels high, and the figure then answers nothing about the groups it
+# was drawn to compare. The answer here is a broken axis rather than a log scale:
+# these metrics are read as body-length ratios, a log axis distorts exactly that
+# reading, and an error of 0 is a legitimate value it cannot place at all.
+#
+# The break is proposed only when the groups really do fall into two clusters, so
+# a figure never silently gains an axis break because one whisker was long. It is
+# taken on the extent as DRAWN (whisker caps, --drop-fliers already applied), for
+# the same reason the annotations are anchored there: what is crushed is what is
+# on the page, not what is in the summary.
+
+DYNAMIC_Y_MIN_GAP_SHARE = 0.30  # empty band, as a share of the full drawn range
+DYNAMIC_Y_MAX_BULK_SHARE = 0.45  # what the crushed cluster may occupy, same unit
+DYNAMIC_Y_PAD_SHARE = 0.10  # slack around a panel, as a share of that panel's range
+DYNAMIC_Y_MIN_PAD_SHARE = 0.005  # floor under that slack, as a share of the whole range
+DYNAMIC_Y_HEIGHT_RATIOS = (1.0, 2.0)  # upper (the outlier) : lower (the rest)
+DYNAMIC_Y_HSPACE = 0.06
+DYNAMIC_Y_FIGURE_SCALE = 1.15  # the second panel needs a little more paper
+BREAK_MARK_SIZE = 7.0  # length of the axis cut marks, in points
+BREAK_WAVE_HEIGHT = 0.012  # amplitude of a box's cut mark, in axes fractions
+
+
+class YSplit(NamedTuple):
+    """The y limits of the lower and of the upper panel of a broken y axis."""
+
+    bottom: Tuple[float, float]
+    top: Tuple[float, float]
+
+
+# A drawing surface: a bare Axes for the figures that never break, or the
+# SplitAxes below, which stands in for one.
+AxesLike = Any
+
+
+def _panels_of(ax: AxesLike) -> List[Axes]:
+    """The concrete Axes behind a drawing surface, upper panel first."""
+    return list(ax.panels) if isinstance(ax, SplitAxes) else [ax]
+
+
+def _padded(low: float, high: float, total: float) -> Tuple[float, float]:
+    """
+    One panel's limits: its own range plus a slack proportional to that range, not
+    to the whole. The point of the break is that the two panels have their own
+    scales, and a slack taken from the full range would reintroduce the outlier's
+    magnitude into the panel that was split off from it. The floor keeps a panel
+    whose group is a single value from collapsing to zero height.
+    """
+    pad = max(DYNAMIC_Y_PAD_SHARE * (high - low), DYNAMIC_Y_MIN_PAD_SHARE * total)
+    return (low - pad, high + pad)
+
+
+def detect_y_split(
+    datasets: Sequence[Sequence[float]],
+    style: Style,
+    spanning: Sequence[Sequence[float]] = (),
+) -> Optional[YSplit]:
+    """
+    The two panels a broken y axis would need, or None to keep one linear axis.
+
+    `datasets` are the groups whose separation decides the break -- the per-group
+    boxes, which are what a far-out group crushes -- while `spanning` only widens
+    the panels. A summary box pooling every group straddles the break by
+    construction, so letting it vote would close the very gap it is meant to
+    bridge; it is drawn across the break instead, with a cut mark on it.
+    """
+    if not style.dynamic_y_axis:
+        return None
+    spans = [s for s in (_whisker_span(d) for d in datasets) if s is not None]
+    if len(spans) < 2:
+        return None
+    outer = spans + [s for s in (_whisker_span(d) for d in spanning) if s is not None]
+    low = min(s[0] for s in outer)
+    high = max(s[1] for s in outer)
+    total = high - low
+    if not math.isfinite(total) or total <= 0.0:
+        return None
+
+    best: Optional[Tuple[float, float, float]] = None  # (gap, bulk top, outlier floor)
+    for cut in sorted({s[0] for s in spans})[1:]:
+        bulk_top = max(s[1] for s in spans if s[0] < cut)
+        gap = cut - bulk_top
+        if gap <= 0.0 or gap / total < DYNAMIC_Y_MIN_GAP_SHARE:
+            continue
+        if (bulk_top - low) / total > DYNAMIC_Y_MAX_BULK_SHARE:
+            continue
+        if best is None or gap > best[0]:
+            best = (gap, bulk_top, cut)
+    if best is None:
+        return None
+    _gap, bulk_top, outlier_floor = best
+    return YSplit(_padded(low, bulk_top, total), _padded(outlier_floor, high, total))
+
+
+def _draw_axis_break(top: Axes, bottom: Axes) -> None:
+    """The two diagonal cuts that say the y axis is not continuous."""
+    marks = {
+        "marker": [(-1.0, -0.6), (1.0, 0.6)],
+        "markersize": BREAK_MARK_SIZE,
+        "linestyle": "none",
+        "color": "black",
+        "markeredgecolor": "black",
+        "markeredgewidth": 0.9,
+        "clip_on": False,
+    }
+    top.plot([0.0], [0.0], transform=top.transAxes, **marks)
+    bottom.plot([0.0], [1.0], transform=bottom.transAxes, **marks)
+
+
+def _mark_spanning_box(ax: Axes, centre: float, width: float, at_top: bool) -> None:
+    """
+    A wave across one box where the break cuts it, so a whisker that continues in
+    the other panel is never read as a whisker that ended there. x is in data
+    coordinates and y in axes fractions, which puts the wave on the panel edge
+    whatever the panel's limits are.
+    """
+    steps = 9
+    edge = 1.0 if at_top else 0.0
+    xs = [centre - width / 2.0 + width * i / (steps - 1) for i in range(steps)]
+    ys = [edge + (BREAK_WAVE_HEIGHT if i % 2 else -BREAK_WAVE_HEIGHT) for i in range(steps)]
+    transform = ax.get_xaxis_transform()
+    # White underlay first: the cut has to read as a cut, not as another whisker.
+    ax.plot(xs, ys, transform=transform, color="white", linewidth=2.6,
+            solid_capstyle="butt", clip_on=False, zorder=6)
+    ax.plot(xs, ys, transform=transform, color="black", linewidth=0.8,
+            solid_capstyle="butt", clip_on=False, zorder=7)
+
+
+class SplitAxes:
+    """
+    The drawing surface of a box figure: one Axes, or the two stacked, x-sharing
+    Axes of a broken y axis, upper panel first.
+
+    It carries the part of the Axes interface the box primitives use, so
+    `_draw_boxes`, `_draw_strip` and `_annotate_stats` draw through it unchanged:
+    every artist goes to both panels and each panel's y limits clip it, which is
+    what makes a box that spans the break appear in each, while the ticks, the
+    legend, the title and each annotation are routed to the one panel they belong
+    on. With no split it is a thin pass-through, so there is one code path.
+    """
+
+    def __init__(self, fig: Figure, panels: Sequence[Axes], split: Optional[YSplit]) -> None:
+        self.fig = fig
+        self.panels: List[Axes] = list(panels)
+        self.split = split
+
+    @property
+    def top(self) -> Axes:
+        return self.panels[0]
+
+    @property
+    def bottom(self) -> Axes:
+        return self.panels[-1]
+
+    def panel_at(self, value: float) -> Axes:
+        """The panel a value belongs on; the lower one for anything in the gap."""
+        if self.split is None or value is None or math.isnan(value):
+            return self.bottom
+        threshold = 0.5 * (self.split.bottom[1] + self.split.top[0])
+        return self.top if value >= threshold else self.bottom
+
+    # -- the Axes interface the primitives call --------------------------------
+
+    def boxplot(self, datasets: Sequence[Sequence[float]], **kwargs: Any) -> Any:
+        result = None
+        for panel in self.panels:
+            result = panel.boxplot(datasets, **kwargs)
+        self._mark_spanning(datasets, kwargs.get("positions") or [], kwargs.get("widths"))
+        return result
+
+    def scatter(self, *args: Any, **kwargs: Any) -> None:
+        for panel in self.panels:
+            panel.scatter(*args, **kwargs)
+
+    def annotate(self, text: str, xy: Tuple[float, float], **kwargs: Any) -> None:
+        self.panel_at(xy[1]).annotate(text, xy, **kwargs)
+
+    def legend(self, *args: Any, **kwargs: Any) -> None:
+        self.top.legend(*args, **kwargs)
+
+    def set_title(self, title: str, **kwargs: Any) -> None:
+        self.top.set_title(title, **kwargs)
+
+    def set_xticks(self, ticks: Sequence[float]) -> None:
+        self.bottom.set_xticks(ticks)
+
+    def set_xticklabels(self, labels: Sequence[str]) -> None:
+        self.bottom.set_xticklabels(labels)
+
+    def set_xlim(self, *args: Any, **kwargs: Any) -> None:
+        self.bottom.set_xlim(*args, **kwargs)
+
+    def set_xlabel(self, label: str) -> None:
+        self.bottom.set_xlabel(label)
+
+    def set_ylabel(self, label: str) -> None:
+        # One label for the pair, on the lower and larger panel: a figure-level
+        # label would be centred over both, but it is placed in figure coordinates
+        # and so has to be kept clear of the tick labels by hand, which cannot be
+        # done reliably before the ticks are known. An axes label is positioned
+        # against the rendered ticks by matplotlib itself.
+        self.bottom.set_ylabel(label)
+
+    # -- break marks -----------------------------------------------------------
+
+    def _mark_spanning(
+        self, datasets: Sequence[Sequence[float]], positions: Sequence[float], widths: Any
+    ) -> None:
+        """Cut every box whose whiskers cross the break, in both panels."""
+        if self.split is None:
+            return
+        if not isinstance(widths, (list, tuple)):
+            widths = [widths if widths else BOX_WIDTH] * len(datasets)
+        for values, position, width in zip(datasets, positions, widths):
+            span = _whisker_span(values)
+            if span is None or span[0] >= self.split.bottom[1] or span[1] <= self.split.top[0]:
+                continue
+            _mark_spanning_box(self.top, position, width, at_top=False)
+            _mark_spanning_box(self.bottom, position, width, at_top=True)
+
+
+def _make_axes(figsize: Tuple[float, float], split: Optional[YSplit]) -> Tuple[Figure, SplitAxes]:
+    """
+    The figure and its drawing surface: one Axes, or the two panels of a broken y
+    axis with the outlier range on top, their limits set and the cuts drawn.
+    """
+    if split is None:
+        fig, ax = plt.subplots(figsize=figsize)
+        return fig, SplitAxes(fig, [ax], None)
+
+    fig, (top, bottom) = plt.subplots(
+        2, 1,
+        sharex=True,
+        figsize=(figsize[0], figsize[1] * DYNAMIC_Y_FIGURE_SCALE),
+        gridspec_kw={
+            "height_ratios": list(DYNAMIC_Y_HEIGHT_RATIOS),
+            "hspace": DYNAMIC_Y_HSPACE,
+        },
+    )
+    top.set_ylim(*split.top)
+    bottom.set_ylim(*split.bottom)
+    # The break replaces the spine between the panels; the x axis stays on the
+    # lower one only, so the two never look like two independent figures.
+    top.spines["bottom"].set_visible(False)
+    top.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    _draw_axis_break(top, bottom)
+    return fig, SplitAxes(fig, [top, bottom], split)
+
+
 def _distribution_legend(
-    ax: Axes, title: str, labels: Sequence[str], colors: Sequence[RGB], style: Style
+    ax: AxesLike, title: str, labels: Sequence[str], colors: Sequence[RGB], style: Style
 ) -> None:
     """Colour key for the distribution, plus the box's median and mean symbols."""
     boxes = style.distribution_style == DISTRIBUTION_BOXES
@@ -1803,13 +2245,20 @@ def fig_box_per_view(table, spec, block, style, rng) -> FigureResult:
     n_values = n_views_of(table)
     colors = style.palette("n_views", len(n_values))
     stats = block[GROUPING_PER_VIEW]
+    cells = {(view, k): _finite(table.get((view, k), [])) for view in views for k in n_values}
+    summaries = {view: _for_display(pooled(table, view=view), style) for view in views}
+    split = detect_y_split(
+        [_for_display(values, style) for values in cells.values()],
+        style,
+        spanning=list(summaries.values()),
+    )
 
-    fig, ax = plt.subplots(figsize=(_figure_width(len(views), 1.30, 5.2), 3.8))
+    fig, ax = _make_axes((_figure_width(len(views), 1.30, 5.2), 3.8), split)
     drawn = total = 0
     for position, view in enumerate(views):
-        shown = _for_display(pooled(table, view=view), style)
+        shown = summaries[view]
         _draw_boxes(ax, [position], [shown], style.primary)
-        groups = [(k, _finite(table.get((view, k), []))) for k in n_values]
+        groups = [(k, cells[(view, k)]) for k in n_values]
         d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
         _annotate_stats(ax, position, _whisker_top(shown), stats[view], style)
@@ -1829,8 +2278,14 @@ def fig_box_per_view_and_n_views(table, spec, block, style, rng) -> FigureResult
     span = 0.84
     step = span / max(len(n_values), 1)
 
+    split = detect_y_split(
+        [_for_display(_finite(table.get((view, k), [])), style)
+         for view in views for k in n_values],
+        style,
+    )
+
     width = _figure_width(len(views) * max(len(n_values), 1), 0.48, 5.6)
-    fig, ax = plt.subplots(figsize=(width, max(3.8, min(width * 0.36, 5.4))))
+    fig, ax = _make_axes((width, max(3.8, min(width * 0.36, 5.4))), split)
     # In box mode the cell box already is the group box, so the band beside it
     # would only duplicate it: the cell boxes are then simply centred.
     as_boxes = style.distribution_style == DISTRIBUTION_BOXES
@@ -1872,13 +2327,20 @@ def fig_box_vs_n_views(table, spec, block, style, rng) -> FigureResult:
     n_values = n_views_of(table)
     colors = style.palette("view", len(views))
     stats = block[GROUPING_PER_N]
+    cells = {(view, k): _finite(table.get((view, k), [])) for view in views for k in n_values}
+    summaries = {k: _for_display(pooled(table, n_views=k), style) for k in n_values}
+    split = detect_y_split(
+        [_for_display(values, style) for values in cells.values()],
+        style,
+        spanning=list(summaries.values()),
+    )
 
-    fig, ax = plt.subplots(figsize=(_figure_width(len(n_values), 1.2, 4.6), 3.8))
+    fig, ax = _make_axes((_figure_width(len(n_values), 1.2, 4.6), 3.8), split)
     drawn = total = 0
     for position, k in enumerate(n_values):
-        shown = _for_display(pooled(table, n_views=k), style)
+        shown = summaries[k]
         _draw_boxes(ax, [position], [shown], style.primary)
-        groups = [(view, _finite(table.get((view, k), []))) for view in views]
+        groups = [(view, cells[(view, k)]) for view in views]
         d, t = _draw_distribution(ax, position, groups, colors, rng, style)
         drawn, total = drawn + d, total + t
         _annotate_stats(ax, position, _whisker_top(shown), stats[str(k)], style)
@@ -1904,8 +2366,15 @@ def _fig_box_overall(table, spec, block, style, rng, colour_by: str) -> FigureRe
         legend_title = "view"
     colors = style.palette(colour_by, len(keys))
 
-    fig, ax = plt.subplots(figsize=(3.6, 3.6))
+    if not style.overall_pooling and style.distribution_style == DISTRIBUTION_BOXES:
+        return _fig_box_per_group(spec, block, style, colour_by, keys, groups, colors, legend_title)
+
     shown = _for_display(pooled(table), style)
+    split = detect_y_split(
+        [_for_display(values, style) for _key, values in groups], style, spanning=[shown]
+    )
+
+    fig, ax = _make_axes((3.6, 3.6), split)
     _draw_boxes(ax, [0.0], [shown], style.primary, width=0.26)
     drawn, total = _draw_distribution(ax, 0.0, groups, colors, rng, style)
     _annotate_stats(ax, 0.0, _whisker_top(shown), block[GROUPING_OVERALL], style)
@@ -1916,6 +2385,56 @@ def _fig_box_overall(table, spec, block, style, rng, colour_by: str) -> FigureRe
     _distribution_legend(ax, legend_title, labels, colors, style)
     _label_headroom(ax, style)
     return fig, ax, 1, drawn, total
+
+
+def _fig_box_per_group(
+    spec: MetricSpec,
+    block: Dict[str, Any],
+    style: Style,
+    colour_by: str,
+    keys: Sequence[Any],
+    groups: Sequence[Tuple[Any, List[float]]],
+    colors: Sequence[RGB],
+    legend_title: str,
+) -> FigureResult:
+    """
+    The --no-overall-pooling form of _fig_box_overall: the box over all runs is
+    dropped and the groups that were narrow boxes beside it take the x axis, one
+    box at its own position, laid out and labelled as fig_box_vs_n_views and
+    fig_box_per_view lay theirs out. Only the pooled box goes -- the groups are
+    the same values, split the same way, so the figure stays comparable to the
+    pooled one it replaces.
+    """
+    if colour_by == "n_views":
+        stats = block[GROUPING_PER_N]
+        group_stats = [stats[str(k)] for k in keys]
+        tick_labels = [f"{k}\nn = {stats[str(k)]['n_samples']}" for k in keys]
+        xlabel = "number of views in the reconstruction"
+        figsize = (_figure_width(len(keys), 1.2, 4.6), 3.8)
+    else:
+        stats = block[GROUPING_PER_VIEW]
+        group_stats = [stats[view] for view in keys]
+        tick_labels = [_view_label(view, stats[view]["n_samples"]) for view in keys]
+        xlabel = "view"
+        figsize = (_figure_width(len(keys), 1.30, 5.2), 3.8)
+
+    drawable = [_for_display(values, style) for _key, values in groups]
+    split = detect_y_split(drawable, style)
+
+    fig, ax = _make_axes(figsize, split)
+    for position, (shown, color, cell_stats) in enumerate(zip(drawable, colors, group_stats)):
+        if not shown:
+            continue
+        _draw_boxes(ax, [position], [shown], color)
+        _annotate_stats(ax, position, _whisker_top(shown), cell_stats, style)
+    ax.set_xticks(list(range(len(keys))))
+    ax.set_xticklabels(tick_labels)
+    _axis_cosmetics(ax, spec.label, xlabel)
+    _distribution_legend(ax, legend_title, [str(k) for k in keys], colors, style)
+    _label_headroom(ax, style)
+    # A box represents every value behind it, as in _draw_group_boxes.
+    total = sum(len(values) for _key, values in groups)
+    return fig, ax, len(keys), total, total
 
 
 def fig_box_overall_by_n_views(table, spec, block, style, rng) -> FigureResult:
@@ -1956,6 +2475,10 @@ class FigureKind:
     grouping: str
     point_colouring: str
     boxes_overrides: Optional[Dict[str, str]] = None
+    # Replaces the texts again when --no-overall-pooling drops the pooled box of a
+    # GROUPING_OVERALL figure and lays its groups out on their own x axis. Applied
+    # after boxes_overrides, since that layout only exists in the boxes style.
+    unpooled_overrides: Optional[Dict[str, str]] = None
     # Only these react to --distribution-style and --drop-fliers; the mean/median
     # summaries do not, and must not claim in their caption that they do.
     draws_distribution: bool = False
@@ -1977,6 +2500,12 @@ class FigureKind:
         }
         if style.distribution_style == DISTRIBUTION_BOXES and self.boxes_overrides:
             fields.update(self.boxes_overrides)
+        if (
+            style.distribution_style == DISTRIBUTION_BOXES
+            and not style.overall_pooling
+            and self.unpooled_overrides
+        ):
+            fields.update(self.unpooled_overrides)
         return {key: value.format(**tokens) for key, value in fields.items()}
 
 
@@ -2080,6 +2609,14 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
                     "size beside it splitting the same values.",
             "plot_kind": "box plot (IQR) with a box per group",
         },
+        unpooled_overrides={
+            "filename_kind": "box_iqr_with_{file}_per_number_of_views__"
+                             "{noun}_coloured_by_number_of_views",
+            "what": "One box per combination size, each pooling every run, view and frame of "
+                    "that size, on an axis of combination sizes; the box over all runs "
+                    "together is not drawn.",
+            "point_colouring": "{noun} coloured by #views",
+        },
     ),
     FigureKind(
         "box_iqr_with_{file}_all_runs_pooled__{noun}_coloured_by_view",
@@ -2095,6 +2632,12 @@ FIGURE_KINDS: Tuple[FigureKind, ...] = (
             "what": "The same pooled box, with one box per view beside it splitting the same "
                     "values by view.",
             "plot_kind": "box plot (IQR) with a box per group",
+        },
+        unpooled_overrides={
+            "filename_kind": "box_iqr_with_{file}_per_view__{noun}_coloured_by_view",
+            "what": "One box per view, each pooling every run and frame that included it, on an "
+                    "axis of views; the box over all runs together is not drawn.",
+            "point_colouring": "{noun} coloured by view",
         },
     ),
 )
@@ -2172,8 +2715,14 @@ def plot_measure(
 
     table = cells[(metric, keypoint)]
     spec = spec_for(metric)
-    stem = slugify(metric) if keypoint is None else f"{slugify(metric)}__keypoint_{slugify(keypoint)}"
-    subject = spec.label if keypoint is None else f"{spec.label}, keypoint '{keypoint}'"
+    # A keypoint metric's second axis is a keypoint, the per-bone-group MPJPE's is a
+    # bone group; both travel on the same field, so the noun comes from the spec.
+    member = spec.member_noun
+    stem = (
+        slugify(metric) if keypoint is None
+        else f"{slugify(metric)}__{slugify(member)}_{slugify(keypoint)}"
+    )
+    subject = spec.label if keypoint is None else f"{spec.label}, {member} '{keypoint}'"
 
     rows: List[Dict[str, Any]] = []
     for kind in FIGURE_KINDS:
@@ -2398,6 +2947,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-overall-pooling",
+        action="store_true",
+        help=(
+            "In the two 'distribution over all runs' figures, drop the single pooled box and put "
+            "the groups that flanked it on their own x axis -- one box per number of views, or "
+            "one per view -- laid out and labelled like the per-#views and per-view figures. "
+            f"Applies to --distribution-style={DISTRIBUTION_BOXES}, the style that draws those "
+            "groups as boxes; the figure names and captions follow the change."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-y-axis",
+        action="store_true",
+        help=(
+            "Break the y axis of a box figure when one group's box and whiskers sit far outside "
+            "the rest -- two views against three or more in an MPJPE, say -- instead of letting "
+            "it compress every other box into a band a few pixels high. The outlier range is "
+            "drawn in a small upper panel and the rest in a larger lower one, both linear, with "
+            "a cut mark on the axis and on every box that spans the break. The break is only "
+            "taken when the groups really do fall into two well separated clusters."
+        ),
+    )
+    parser.add_argument(
         "--no-value-labels",
         action="store_true",
         help="Do not print the mean and median next to each box and line marker.",
@@ -2507,6 +3079,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_points=args.max_points_per_group,
         distribution_style=args.distribution_style,
         drop_fliers=args.drop_fliers,
+        overall_pooling=not args.no_overall_pooling,
+        dynamic_y_axis=args.dynamic_y_axis,
         value_labels=not args.no_value_labels,
         captions=not args.no_captions,
     )

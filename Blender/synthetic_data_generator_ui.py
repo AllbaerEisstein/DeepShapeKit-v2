@@ -5092,6 +5092,38 @@ def _recon_stats(values, labels=None, label_key="argmax", weights=None):
     return out
 
 
+def _recon_group_summary(items, per_item_mean, flat_values, label_key="argmax",
+                         count_key="n_items"):
+    """Aggregate one group of items: MEAN OF THE PER-ITEM MEANS, plus a flat pool beside it.
+
+    The headline number deliberately averages the per-item means rather than pooling every
+    raw sample: a flat pool weights a group by how many items (and how many valid frames)
+    it happens to contain, so a 12-bone tail group would silently dominate a 2-bone jaw
+    group and "group error" would stop meaning "how badly this body part is fitted".
+    The flat pool is still reported, as pooled_mean/pooled_median, because it is the right
+    number for the *sample* question ("what does a randomly drawn error in this group look
+    like") and the gap between the two is the group's per-item imbalance.
+
+    `per_item_mean` maps item name -> that item's already-frame-aggregated mean (None/NaN
+    for an item that never produced a value); `flat_values` is the raw (frames x items)
+    slice for the same group. Both go through _recon_stats/_recon_num, so an empty group is
+    null with n=0, never a silent 0.
+
+    `count_key` keeps the caller's vocabulary ("n_bones", "n_keypoints") in the output.
+    """
+    items = list(items)
+    st = _recon_stats([per_item_mean.get(x) for x in items],
+                      labels=items, label_key=label_key)
+    a = (np.asarray(flat_values, dtype=np.float64).ravel()
+         if flat_values is not None else np.zeros(0))
+    flat = a[np.isfinite(a)] if a.size else a
+    st["pooled_mean"] = _recon_num(flat.mean() if flat.size else None)
+    st["pooled_median"] = _recon_num(np.median(flat) if flat.size else None)
+    st[f"{count_key}_with_data"] = st.pop("n")
+    st[count_key] = len(items)
+    return st
+
+
 def _recon_coverage(requested, valid, skipped, blocked_records=()):
     """Coverage rho = n_valid / n_frames, plus every skipped frame WITH its reason.
 
@@ -5487,6 +5519,47 @@ def _recon_bone_group_table(mesh_info, order, virtual, report=None):
     return groups, membership
 
 
+def _recon_keypoint_group_table(mesh_info, order, report=None):
+    """{group: [keypoints]} from get_mesh_json()["bone_groups"][i]["keypoints_names"].
+
+    Sibling of _recon_bone_group_table: same source, same `group_{i:02d}` naming, same
+    non-partition semantics (a keypoint listed in two UI groups belongs to both, and is
+    counted in both -- groups answer "how well is this body part fitted", which is not a
+    quantity that has to sum to anything). Keeping the index scheme identical is the point:
+    group_03 means the same template group in the bone-rotation, joint-MPJPE and
+    keypoint-MPJPE files, so the three can be read side by side.
+
+    There is no keypoint analogue of __virtual__: virtual bones are an LBS chain artefact,
+    keypoints are all real vertex groups. Keypoints in no group land in __ungrouped__ so
+    that the per_group dict covers `order` exactly once -- an aggregation that quietly
+    dropped them would report a body-part breakdown that does not add up to the block.
+
+    ASSUMPTION: a group whose "keypoints_names" is absent or empty (bone-only group, the
+    common case for a fin-chain group) contributes NO keypoint group. It is skipped rather
+    than emitted empty, mirroring the `if not names: continue` in the bone table; the
+    consequence is that the keypoint per_group key set is a subset of the bone one, and a
+    reader must not assume group_XX exists in both files.
+    """
+    groups, membership = {}, {k: [] for k in order}
+    for i, g in enumerate(mesh_info.get("bone_groups", []) or []):
+        names = [k for k in (g.get("keypoints_names") or []) if k in membership]
+        if not names:
+            continue
+        name = f"group_{i:02d}"
+        groups[name] = names
+        for k in names:
+            membership[k].append(name)
+    ungrouped = [k for k in order if not membership[k]]
+    if ungrouped:
+        groups[_RECON_UNGROUPED] = ungrouped
+        for k in ungrouped:
+            membership[k].append(_RECON_UNGROUPED)
+        if report:
+            report({'WARNING'}, f"{len(ungrouped)} keypoint(s) belong to no bone group; "
+                                f"aggregated under '{_RECON_UNGROUPED}'.")
+    return groups, membership
+
+
 def _recon_heads_world(P, bones, arm_matrix_world):
     """(len(bones), 3) world-space bone heads from the armature-space pose matrices.
 
@@ -5604,17 +5677,43 @@ def _recon_eval_pass(context, ctx, want, opts, report=None):
 
     order = tree = virtual = rest_R = rest_head = None
     bones_all, bones_real, groups, membership, rest_np, priors = [], [], {}, {}, None, {}
+    joint_groups, joint_membership = {}, {}
+    kpt_groups, kpt_membership = {}, {k: [] for k in kpt_list}
     ts_by_frame, roundtrip = {}, {"performed": False, "reason": "not requested",
                                   "max_abs_err": None, "tolerance": None,
                                   "n_frames_checked": 0, "verified_armature": None}
+
+    # mesh_info is needed by the bone tables AND (new) by the keypoint group table, which
+    # is wanted even on an armature-free run where the joint block is skipped entirely.
+    # Hoisted out of `if pose_ok` for that reason; still fatal in the pose_ok path, where
+    # the rest tables cannot be built without it, but downgraded to a warning otherwise so
+    # a template read failure cannot take the keypoint MPJPE block down with it.
+    mesh_info = None
     if pose_ok:
         mesh_info = get_mesh_json(context)
+    elif 'mpjpe' in want and kpt_list:
+        try:
+            mesh_info = get_mesh_json(context)
+        except Exception as exc:
+            warnings.append(f"bone_groups unavailable ({exc}); keypoint MPJPE is reported "
+                            f"without a per-group breakdown.")
+
+    if pose_ok:
         order, tree, virtual, rest_R, rest_head, _rest_len = _pts_rest_tables(mesh_info, src_arm)
         bones_all = list(order)
         bones_real = [b for b in order if b not in virtual]
         groups, membership = _recon_bone_group_table(mesh_info, order, virtual, report)
+        # A SECOND table keyed on bones_real, not a reuse of `groups`: the MPJPE joint block
+        # is named by bones_real, so a group list carrying a virtual bone would index a name
+        # the block does not have. virtual=set() here because virtual bones are already
+        # absent from the key set, which also means __virtual__ never appears. report=None
+        # so the "belongs to no bone group" warning is emitted once, by the call above.
+        joint_groups, joint_membership = _recon_bone_group_table(mesh_info, bones_real,
+                                                                 set(), None)
         priors = mesh_info.get("bone_priors", {}) or {}
         rest_np = np.stack([_recon_mat3(rest_R[b]) for b in bones_all])
+    if mesh_info is not None and kpt_list and 'mpjpe' in want:
+        kpt_groups, kpt_membership = _recon_keypoint_group_table(mesh_info, kpt_list, report)
 
         # Precondition: a bone-name mismatch would make the metric measure a convention
         # mismatch instead of reconstruction error.
@@ -5682,7 +5781,9 @@ def _recon_eval_pass(context, ctx, want, opts, report=None):
                  "root_reference": ("armature_root_bone_head" if pose_ok else "mesh_centroid"),
                  "root_reference_secondary": "mesh_centroid"},
         "mpjpe": {"keypoint": [], "joint": [], "kpt_names": kpt_list,
-                  "joint_names": bones_real, "joint_available": pose_ok},
+                  "joint_names": bones_real, "joint_available": pose_ok,
+                  "kpt_groups": kpt_groups, "kpt_membership": kpt_membership,
+                  "joint_groups": joint_groups, "joint_membership": joint_membership},
         "bone": {"names": bones_all, "real": bones_real,
                  "virtual": sorted(virtual) if virtual else [],
                  "groups": groups, "membership": membership,
@@ -6139,16 +6240,34 @@ def _mpve_build(res, p, ctx, lo, hi, opts):
 
 # --- MPJPE -------------------------------------------------------------------
 
-def _mpjpe_block(entries, names, frames, tau_bl):
-    """One of the two MPJPE blocks (keypoint centroids / bone heads)."""
+def _mpjpe_block(entries, names, frames, tau_bl, groups=None, membership=None,
+                 item_kind="item", warn=None):
+    """One of the two MPJPE blocks (keypoint centroids / bone heads).
+
+    `groups`/`membership` are the body-part table for this block's item type (keypoint
+    groups from bone_groups[i]["keypoints_names"], joint groups from ["bone_names"]).
+    `item_kind` drives the vocabulary only -- "keypoint" -> argmax_keypoint / n_keypoints /
+    keypoint_names, "bone" -> argmax_bone / n_bones / bone_names -- matching the label keys
+    _recon_point_frame_stats already writes into these entries.
+    """
     out = {"names": list(names), "n_items": len(names)}
+    label_key = f"argmax_{item_kind}"
+    count_key = f"n_{item_kind}s"
+    names_key = f"{item_kind}_names"
+    idx_of = {n: i for i, n in enumerate(names)}
     for term in ("global", "root_relative", "pa"):
-        pooled = (np.concatenate([e["_err"][term] for e in entries]) if entries else None)
+        # (n_frames, n_items) once per term: `pooled` is its C-order ravel, i.e. exactly the
+        # previous np.concatenate over the per-frame vectors, and the per-item column slice
+        # and the per-group multi-column slice both come off the same array.
+        E = (np.stack([np.asarray(e["_err"][term], dtype=np.float64) for e in entries])
+             if entries else np.zeros((0, len(names)), dtype=np.float64))
+        pooled = E.ravel() if entries else None
         per_item = {}
         for i, name in enumerate(names):
-            vals = [e["_err"][term][i] for e in entries]
-            st = _recon_stats(vals, labels=frames, label_key="argmax_frame")
+            st = _recon_stats(E[:, i], labels=frames, label_key="argmax_frame")
             st["n_valid_frames"] = st.pop("n")
+            if membership is not None:
+                st["groups"] = list(membership.get(name, []))
             per_item[name] = st
         block = {
             "overall": _recon_sequence_summary([e[term]["mean"] for e in entries],
@@ -6158,6 +6277,39 @@ def _mpjpe_block(entries, names, frames, tau_bl):
                 [e[term]["pck"] for e in entries if e[term]["pck"] is not None])
                 if any(e[term]["pck"] is not None for e in entries) else None),
         }
+        if groups:
+            means = {n: per_item[n]["mean"] for n in names}
+            per_group = {}
+            group_idx = {g: [idx_of[x] for x in items if x in idx_of] for g, items in groups.items()}
+            for g, items in groups.items():
+                idx = group_idx[g]
+                arr = E[:, idx] if (idx and E.size) else np.zeros(0)
+                st = _recon_group_summary(items, means, arr, label_key=label_key,
+                                          count_key=count_key)
+                st[names_key] = list(items)
+                per_group[g] = st
+                # Coverage, same style as the rest of this section: an empty group is a null
+                # aggregate, and the reader is told once (on `global`) rather than three times.
+                if warn and term == "global" and not st[f"{count_key}_with_data"]:
+                    warn(f"MPJPE {item_kind} group '{g}' has no valid samples; its per_group "
+                         f"aggregates are null.")
+            block["per_group"] = per_group
+            # FRAME-WISE per-group means: mean over one group's items, for one frame -- the
+            # ingredient `per_group` above pools away by averaging it over frames as well.
+            # Written onto each frame's OWN entry, beside its "mean" (all items) and its
+            # "per_item" breakdown built below, so the frame stays the unit of aggregation
+            # and a consumer pools these itself instead of only ever seeing the one
+            # sequence-level number this file would otherwise reduce them to. NaN on a
+            # frame where a group's items were all invalid, exactly as "mean" already is.
+            with np.errstate(invalid="ignore"):
+                frame_group_means = {
+                    g: (np.nanmean(E[:, idx], axis=1) if idx else np.full(E.shape[0], np.nan))
+                    for g, idx in group_idx.items()
+                }
+            for i, e in enumerate(entries):
+                e[term]["per_group"] = {
+                    g: _recon_num(values[i]) for g, values in frame_group_means.items()
+                }
         if term == "pa":
             deg = [e["frame"] for e in entries if e["pa_degenerate"]]
             block["degenerate_frames"] = deg
@@ -6175,6 +6327,8 @@ def _mpjpe_block(entries, names, frames, tau_bl):
     }
     out["pck"] = {"tau_body_lengths": tau_bl,
                   "definition": "fraction of items within tau = tau_body_lengths * L_body(f)"}
+    if groups:
+        out["groups"] = {g: list(v) for g, v in groups.items()}
     out["frames"] = [{k: v for k, v in e.items() if k != "_err"} for e in entries]
     return out
 
@@ -6185,14 +6339,30 @@ def _mpjpe_build(res, p, ctx, lo, hi, opts):
     data = {"meta": None, "summary": {}, "keypoint": None, "joint": None}
     kpt_entries = res["mpjpe"]["keypoint"]
     joint_entries = res["mpjpe"]["joint"]
+    warn = res["warnings"].append          # meta reads res["warnings"] after the blocks
     if kpt_entries:
         data["keypoint"] = _mpjpe_block(kpt_entries, res["mpjpe"]["kpt_names"],
-                                        [e["frame"] for e in kpt_entries], tau_bl)
+                                        [e["frame"] for e in kpt_entries], tau_bl,
+                                        groups=res["mpjpe"].get("kpt_groups"),
+                                        membership=res["mpjpe"].get("kpt_membership"),
+                                        item_kind="keypoint", warn=warn)
     if joint_entries:
         data["joint"] = _mpjpe_block(joint_entries, res["mpjpe"]["joint_names"],
-                                     [e["frame"] for e in joint_entries], tau_bl)
+                                     [e["frame"] for e in joint_entries], tau_bl,
+                                     groups=res["mpjpe"].get("joint_groups"),
+                                     membership=res["mpjpe"].get("joint_membership"),
+                                     item_kind="bone", warn=warn)
     else:
         data["joint"] = {"reason": "no reconstruction armature; joint block not computed"}
+
+    def _group_means(block):
+        """{group: {term: mean}} -- the same shape _bone_rot_build's summary uses."""
+        if not block or "per_group" not in block.get("global", {}):
+            return None
+        return {g: {t: block[t]["per_group"][g]["mean"]
+                    for t in ("global", "root_relative", "pa")}
+                for g in block["global"]["per_group"]}
+
     data["summary"] = {
         "keypoint": {t: (data["keypoint"][t]["overall"] if data["keypoint"] else None)
                      for t in ("global", "root_relative", "pa")},
@@ -6201,11 +6371,24 @@ def _mpjpe_build(res, p, ctx, lo, hi, opts):
         "coverage": _recon_coverage(res["requested"], frames, res["skipped"],
                                      res.get("blocked_records", ())),
     }
+    # Additive: the three term keys above are untouched, per_group sits beside them.
+    data["summary"]["keypoint"]["per_group"] = _group_means(data["keypoint"])
+    data["summary"]["joint"]["per_group"] = (_group_means(data["joint"])
+                                             if joint_entries else None)
+
     data["meta"] = _recon_meta_base(
         MPJPE_SCHEMA, "mean_per_joint_position_error_world_space_l2", p, ctx, lo, hi,
         aggregation_order=("item -> frame -> sequence: the per-frame value is the mean over "
                            "the K valid items; the sequence value is the mean AND median of "
-                           "those per-frame means; pooled_* are over all (frame, item) samples"),
+                           "those per-frame means; pooled_* are over all (frame, item) samples. "
+                           "<term>.per_group (sequence-level, under keypoint/joint.<term>) is "
+                           "item -> frame -> group: the mean of the per-item means, not a flat "
+                           "pool (which would weight large groups by item count); its pooled_* "
+                           "are that flat pool, reported separately. frames[].<term>.per_group "
+                           "is the frame-level counterpart one step earlier in that chain -- "
+                           "item -> group, for that one frame, not yet aggregated over frames -- "
+                           "so a consumer can pool it over runs itself instead of only ever "
+                           "seeing this file's own sequence mean"),
         extra={
             "terms": {
                 "global": "no alignment removed; isolates global localisation error (theta)",
@@ -6220,6 +6403,24 @@ def _mpjpe_build(res, p, ctx, lo, hi, opts):
                 "action": "pa is null with pa_degenerate: true, never a meaningless number",
                 "why": "K ~ 6-10 points on a frequently near-straight fish is close to a 1-D "
                        "configuration, where the rotation is unstable",
+            },
+            # ONE bone_groups block for both sections: the group *identity* (source, index
+            # scheme, overlap policy, ungrouped bucket) is a property of the template, not of
+            # the item type, so duplicating it per block would invite the two copies to drift.
+            # The only per-block difference is which field of the group is read, recorded here.
+            "bone_groups": {
+                "source": "get_mesh_json()['bone_groups']",
+                "overlapping": True,
+                "ungrouped_bucket": _RECON_UNGROUPED,
+                "keypoint_block_field": "keypoints_names",
+                "joint_block_field": "bone_names",
+                "group_naming": "group_{i:02d} over bone_groups; the same index denotes the "
+                                "same template group in the bone_rotation_error file",
+                "virtual_bucket": None,
+                "note": ("no __virtual__ bucket: the joint set is bones_real (virtual bones are "
+                         "excluded upstream) and keypoints have no virtual analogue. A group "
+                         "with no keypoints_names contributes no keypoint group, so the two "
+                         "per_group key sets need not coincide"),
             },
             "root_relative_reference": {
                 "keypoint": "centroid of each set's valid keypoints",
@@ -6282,17 +6483,16 @@ def _bone_rot_build(res, p, ctx, lo, hi, opts):
         per_bone[name] = item
 
     def group_summary(bones, key):
-        """Mean of the per-bone means (NOT a flat pool, which weights big groups by count)."""
-        vals = [per_bone[x][key]["mean"] for x in bones]
-        st = _recon_stats(vals, labels=list(bones), label_key="argmax_bone")
+        """Mean of the per-bone means (NOT a flat pool, which weights big groups by count).
+
+        Delegates to _recon_group_summary so the keypoint/joint MPJPE per_group blocks use
+        byte-identical semantics; the only bone-specific part left here is the (frames x
+        bones) column slice that supplies the flat pool.
+        """
         idx = [names.index(x) for x in bones]
         arr = (G if key == "global" else L)[:, idx] if idx else np.zeros(0)
-        flat = arr[np.isfinite(arr)] if arr.size else arr
-        st["pooled_mean"] = _recon_num(flat.mean() if flat.size else None)
-        st["pooled_median"] = _recon_num(np.median(flat) if flat.size else None)
-        st["n_bones_with_data"] = st.pop("n")
-        st["n_bones"] = len(bones)
-        return st
+        return _recon_group_summary(bones, {x: per_bone[x][key]["mean"] for x in bones},
+                                    arr, label_key="argmax_bone", count_key="n_bones")
 
     per_group = {}
     for g, bl_names in b["groups"].items():
@@ -6780,6 +6980,15 @@ def _batch_3d_metrics_one(context, rec_obj, n_samples, seed, with_kpts, report=N
                 stats = frame_entry.get(term)
                 mean_m = stats.get("mean") if isinstance(stats, dict) else None
                 frame_entry["body_length_normalised"][term] = _bl_norm(mean_m, l_body)
+                # Same normalisation, one level finer: mpjpe_block now writes each frame's
+                # OWN per-group mean (metres) beside its whole-block one; carried through
+                # here so a per-bone-group MPJPE is body-length-comparable exactly like the
+                # whole-fish one is, and analyze_metrics.py needs nothing extra to read it.
+                per_group_m = stats.get("per_group") if isinstance(stats, dict) else None
+                if per_group_m:
+                    frame_entry["body_length_normalised"].setdefault("per_group", {})[term] = {
+                        g: _bl_norm(v, l_body) for g, v in per_group_m.items()
+                    }
 
     entry["mpve"] = mpve_data
     entry["mpjpe"] = mpjpe_data
